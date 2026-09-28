@@ -703,6 +703,7 @@ impl Daemon {
                     Err(e) => Response::err(format!("save config: {e}")),
                 }
             }
+            Request::Config => Response::ok(serde_json::to_value(&*self.config.lock().await).unwrap()),
             Request::Keys => Response::ok(serde_json::to_value(self.config.lock().await.keys.clone()).unwrap()),
             Request::SetKeyBinding { key, action, command } => {
                 if let Err(r) = self.write_guard().await { return r; }
@@ -1935,5 +1936,14 @@ mod tests {
         let r = sys_rig(true, "");
         assert!(r.d.handle(Request::SetKeepOn { on: true }).await.ok);
         assert!(std::fs::read_to_string(r.dir.path().join("config.toml")).unwrap().contains("keep_on = true"));
+    }
+
+    #[tokio::test]
+    async fn config_request_returns_current_settings() {
+        let r = sys_rig(false, "[system]\nrefresh_ac = 240.0\n[lighting]\nkeep_on = true\n");
+        let v = r.d.handle(Request::Config).await.data.unwrap();
+        assert_eq!(v["system"]["refresh_ac"], 240.0);
+        assert_eq!(v["lighting"]["keep_on"], true);
+        assert_eq!(v["keys"]["fan"], "cycle_mode");
     }
 }

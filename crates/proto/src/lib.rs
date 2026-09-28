@@ -444,6 +444,8 @@ pub enum Request {
     SetSourceProfile { ac: Option<Profile>, battery: Option<Profile> },
     SetSourceRefresh { ac: Option<f32>, battery: Option<f32> },
     Keys,
+    /// armouryd's saved settings (read-only view for the UI).
+    Config,
     /// Never dim the keyboard backlight when idle.
     SetKeepOn { on: bool },
     SetKeyBinding { key: HotKey, action: KeyAction, #[serde(default)] command: Option<String> },
