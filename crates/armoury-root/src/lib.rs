@@ -2,6 +2,16 @@ pub const SUPPORT_FILE: &str = "/usr/share/asusd/aura_support.ron";
 pub const AURA_CFG_DIR: &str = "/etc/asusd";
 pub const STATE_DIR: &str = "/var/lib/omarchy-armoury";
 pub const BOARD_NAME: &str = "/sys/class/dmi/id/board_name";
+pub const NO_TURBO: &str = "/sys/devices/system/cpu/intel_pstate/no_turbo";
+
+/// `cpu-boost on|off` → value for intel_pstate/no_turbo.
+pub fn no_turbo_value(state: &str) -> Result<&'static str, String> {
+    match state {
+        "on" => Ok("0"),
+        "off" => Ok("1"),
+        other => Err(format!("cpu-boost takes on|off, got {other:?}")),
+    }
+}
 
 pub struct Fix {
     pub device: &'static str,
@@ -281,5 +291,12 @@ mod host_tests {
             Some("/var/cache/pacman/pkg/asusctl-6.4.0-2-x86_64.pkg.tar.zst")
         );
         assert_eq!(cached_package("", "x86_64"), None);
+    }
+
+    #[test]
+    fn cpu_boost_arg() {
+        assert_eq!(no_turbo_value("on"), Ok("0"));
+        assert_eq!(no_turbo_value("off"), Ok("1"));
+        assert!(no_turbo_value("1; rm -rf /").is_err());
     }
 }

@@ -21,6 +21,8 @@ enum Cmd {
     Handback,
     /// Reinstall the packaged aura_support.ron (used by uninstall)
     AsusdSupportRestore,
+    /// Turn CPU turbo boost on or off
+    CpuBoost { state: String },
 }
 
 fn systemctl(args: &[&str]) -> anyhow::Result<()> {
@@ -130,6 +132,9 @@ fn main() {
         Cmd::Takeover => takeover(&mut RealHost),
         Cmd::Handback => handback(&mut RealHost),
         Cmd::AsusdSupportRestore => asusd_support_restore(),
+        Cmd::CpuBoost { state } => no_turbo_value(&state)
+            .map_err(anyhow::Error::msg)
+            .and_then(|v| std::fs::write(NO_TURBO, v).context("write no_turbo")),
     };
     if let Err(e) = r {
         eprintln!("armoury-root: {e:#}");
