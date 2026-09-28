@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-use armoury_proto::{ControlMode, Epp, Fan, FanCurve, ModeSettings, Profile, Request, Response, Snapshot, socket_path};
+use armoury_proto::{ControlMode, Epp, Fan, FanCurve, GpuMode, GpuStep, GpuSwitchResult, ModeSettings, Profile, Request, Response, Snapshot, socket_path};
 use clap::{Parser, Subcommand};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -120,6 +120,33 @@ enum UvAction {
 enum GpuAction {
     /// Processes keeping the dGPU awake
     Users,
+    /// Show what switching to a mode would do, without doing it
+    Plan {
+        #[arg(value_parser = parse_gpu_mode)]
+        mode: GpuMode,
+    },
+    /// Switch GPU mode (integrated|hybrid|ultimate); a reboot finishes it
+    Set {
+        #[arg(value_parser = parse_gpu_mode)]
+        mode: GpuMode,
+    },
+}
+
+fn parse_gpu_mode(s: &str) -> Result<GpuMode, String> {
+    match s {
+        "integrated" | "eco" => Ok(GpuMode::Integrated),
+        "hybrid" | "standard" => Ok(GpuMode::Hybrid),
+        "ultimate" => Ok(GpuMode::AsusMuxDgpu),
+        _ => Err(format!("unknown GPU mode {s:?} (integrated|hybrid|ultimate)")),
+    }
+}
+
+fn describe_step(step: &GpuStep) -> String {
+    match step {
+        GpuStep::OmarchyToggle { to } => format!("run Omarchy's GPU toggle to {to:?} (it asks to confirm, then reboots)"),
+        GpuStep::Supergfx { to } => format!("supergfxd switches to {to:?}; reboot to finish"),
+        GpuStep::FirstOfTwo { first, then } => format!("two steps: 1) {} 2) after reboot, switch to {then:?}", describe_step(first)),
+    }
 }
 
 fn parse_lock(s: &str) -> Result<u32, String> {
@@ -234,6 +261,21 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Cmd::Undervolt { action: UvAction::Probe } => {
             let v = call(&Request::ProbeUndervolt)?;
             println!("{}", if v["unlocked"] == true { "unlocked" } else { "locked" });
+        }
+        Cmd::Gpu { action: GpuAction::Plan { mode } } => {
+            let step: GpuStep = serde_json::from_value(call(&Request::PlanGpuMode { mode })?)?;
+            println!("{}", describe_step(&step));
+        }
+        Cmd::Gpu { action: GpuAction::Set { mode } } => {
+            if mode == GpuMode::Integrated {
+                let s: Snapshot = serde_json::from_value(call(&Request::Status)?)?;
+                if !s.gpu.users.is_empty() {
+                    let names: Vec<String> = s.gpu.users.iter().map(|u| u.name.clone()).collect();
+                    eprintln!("note: these processes use the dGPU and will lose it: {}", names.join(", "));
+                }
+            }
+            let r: GpuSwitchResult = serde_json::from_value(call(&Request::SetGpuMode { mode })?)?;
+            println!("{}", r.message);
         }
         Cmd::Gpu { action: GpuAction::Users } => {
             let s: Snapshot = serde_json::from_value(call(&Request::Status)?)?;
@@ -360,5 +402,13 @@ mod tests {
         s.gpu.nvidia = Some(armoury_proto::NvStatus { core_mhz: 1500, mem_mhz: 7000, temp_c: 62, power_w: 35.2, pstate: "Zero".into(), core_offset: 50, ..Default::default() });
         s.gpu.users = vec![armoury_proto::GpuUser { pid: 1, name: "a".into() }];
         assert!(summary(&s).contains("dGPU       active · 1500/7000 MHz · 62°C · 35.2 W · offset +50 · 1 user"), "{}", summary(&s));
+    }
+
+    #[test]
+    fn gpu_mode_names() {
+        assert_eq!(parse_gpu_mode("ultimate"), Ok(armoury_proto::GpuMode::AsusMuxDgpu));
+        assert_eq!(parse_gpu_mode("integrated"), Ok(armoury_proto::GpuMode::Integrated));
+        assert_eq!(parse_gpu_mode("hybrid"), Ok(armoury_proto::GpuMode::Hybrid));
+        assert!(parse_gpu_mode("vfio").is_err());
     }
 }
