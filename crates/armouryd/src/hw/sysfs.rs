@@ -7,6 +7,16 @@ pub const GPU_MUX: &str = "sys/devices/platform/asus-nb-wmi/gpu_mux_mode";
 pub const DGPU_DISABLE: &str = "sys/devices/platform/asus-nb-wmi/dgpu_disable";
 pub const PLATFORM_PROFILE: &str = "sys/firmware/acpi/platform_profile";
 pub const POWER_SUPPLY_DIR: &str = "sys/class/power_supply";
+pub const HWMON_DIR: &str = "sys/class/hwmon";
+pub const PROFILE_CHOICES: &str = "sys/firmware/acpi/platform_profile_choices";
+pub const NO_TURBO: &str = "sys/devices/system/cpu/intel_pstate/no_turbo";
+
+/// Path of the hwmon directory whose `name` is `name` (hwmon numbering is not stable).
+pub fn find_hwmon(sys: &dyn Sysfs, name: &str) -> Option<String> {
+    sys.list(HWMON_DIR).into_iter()
+        .map(|h| format!("{HWMON_DIR}/{h}"))
+        .find(|p| sys.read(&format!("{p}/name")).as_deref() == Some(name))
+}
 
 pub struct RealSysfs {
     root: PathBuf,

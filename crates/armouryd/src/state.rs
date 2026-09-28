@@ -1,5 +1,5 @@
 use crate::hw::{Gfx, Services, Sysfs, sysfs, with_retry};
-use armoury_proto::{BatteryState, ControlMode, GpuMode, GpuPower, GpuState, Snapshot};
+use armoury_proto::{BatteryState, ControlMode, GpuMode, GpuPower, GpuState, PerfState, Profile, Snapshot};
 
 pub async fn collect(sys: &dyn Sysfs, gfx: &dyn Gfx, svc: &dyn Services, control: ControlMode) -> Snapshot {
     Snapshot {
@@ -9,7 +9,7 @@ pub async fn collect(sys: &dyn Sysfs, gfx: &dyn Gfx, svc: &dyn Services, control
         platform_profile: sys.read(sysfs::PLATFORM_PROFILE),
         gpu: gpu_state(sys, gfx).await,
         battery: battery_state(sys),
-        perf: Default::default(),
+        perf: perf_state(sys),
         asusd_running: svc.unit_active("asusd.service", false).await,
         ghelper_running: svc.is_running("ghelper").await,
     }
@@ -44,10 +44,28 @@ fn battery_state(sys: &dyn Sysfs) -> BatteryState {
     }
 }
 
+pub fn perf_state(sys: &dyn Sysfs) -> PerfState {
+    let num = |p: String| sys.read(&p).and_then(|v| v.parse::<i64>().ok());
+    let coretemp = sysfs::find_hwmon(sys, "coretemp");
+    let asus = sysfs::find_hwmon(sys, "asus");
+    let battery = sys.list(sysfs::POWER_SUPPLY_DIR).into_iter()
+        .find(|n| sys.read(&format!("{}/{n}/type", sysfs::POWER_SUPPLY_DIR)).as_deref() == Some("Battery"));
+    PerfState {
+        profile: sys.read(sysfs::PLATFORM_PROFILE).as_deref().and_then(Profile::from_sysfs),
+        choices: sys.read(sysfs::PROFILE_CHOICES).unwrap_or_default().split_whitespace().filter_map(Profile::from_sysfs).collect(),
+        cpu_temp_c: coretemp.and_then(|h| num(format!("{h}/temp1_input"))).map(|m| m as f32 / 1000.0),
+        cpu_fan_rpm: asus.as_ref().and_then(|h| num(format!("{h}/fan1_input"))).map(|v| v as u32),
+        gpu_fan_rpm: asus.as_ref().and_then(|h| num(format!("{h}/fan2_input"))).map(|v| v as u32),
+        power_draw_w: battery.and_then(|b| num(format!("{}/{b}/power_now", sysfs::POWER_SUPPLY_DIR))).map(|uw| uw as f32 / 1_000_000.0),
+        cpu_boost: sys.read(sysfs::NO_TURBO).map(|v| v == "0"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hw::fake::{FakeGfx, FakeServices, FakeSysfs};
+    use armoury_proto::Profile;
 
     fn machine() -> FakeSysfs {
         FakeSysfs::with(&[
@@ -61,6 +79,14 @@ mod tests {
             ("sys/class/power_supply/BAT0/capacity", "80"),
             ("sys/class/power_supply/BAT0/status", "Not charging"),
             ("sys/class/power_supply/BAT0/charge_control_end_threshold", "80"),
+            ("sys/firmware/acpi/platform_profile_choices", "quiet balanced performance"),
+            ("sys/class/hwmon/hwmon8/name", "coretemp"),
+            ("sys/class/hwmon/hwmon8/temp1_input", "72000"),
+            ("sys/class/hwmon/hwmon9/name", "asus"),
+            ("sys/class/hwmon/hwmon9/fan1_input", "3300"),
+            ("sys/class/hwmon/hwmon9/fan2_input", "5200"),
+            ("sys/class/power_supply/BAT0/power_now", "18250000"),
+            ("sys/devices/system/cpu/intel_pstate/no_turbo", "0"),
         ])
     }
 
@@ -108,5 +134,16 @@ mod tests {
         let s = collect(&FakeSysfs::default(), &FakeGfx::default(), &FakeServices::default(), ControlMode::Observe).await;
         assert_eq!(s.keystone, None);
         assert_eq!(s.battery, BatteryState::default());
+    }
+
+    #[tokio::test]
+    async fn perf_readings() {
+        let s = collect(&machine(), &FakeGfx::default(), &FakeServices::default(), ControlMode::Observe).await;
+        assert_eq!(s.perf.profile, Some(Profile::Performance));
+        assert_eq!(s.perf.choices, vec![Profile::Quiet, Profile::Balanced, Profile::Performance]);
+        assert_eq!(s.perf.cpu_temp_c, Some(72.0));
+        assert_eq!((s.perf.cpu_fan_rpm, s.perf.gpu_fan_rpm), (Some(3300), Some(5200)));
+        assert_eq!(s.perf.power_draw_w, Some(18.25));
+        assert_eq!(s.perf.cpu_boost, Some(true));
     }
 }
