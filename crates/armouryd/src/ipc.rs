@@ -10,7 +10,7 @@ use crate::hw::{Asusd, Aura, Gfx, Nvidia, Services, Sysfs, with_retry};
 use crate::state::collect;
 use anyhow::{Context, bail};
 use crate::features::gpu::plan_switch;
-use armoury_proto::{Toggle, ControlMode, Event, GpuMode, GpuStep, GpuSwitchResult, ModeSettings, Profile, Request, Response, Snapshot, UndervoltState};
+use armoury_proto::{HotKey, KeyAction, Toggle, ControlMode, Event, GpuMode, GpuStep, GpuSwitchResult, ModeSettings, Profile, Request, Response, Snapshot, UndervoltState};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -100,6 +100,61 @@ impl Daemon {
     }
 
     pub async fn clamshell_holding(&self) -> bool { self.clamshell.lock().await.holding() }
+
+    /// Omarchy's on-screen display.
+    async fn osd(&self, msg: &str) {
+        let osd = self.omarchy_bin().join("omarchy-osd");
+        if let Err(e) = self.svc.run(&[&osd.to_string_lossy(), "-m", msg]).await { eprintln!("armouryd: osd: {e:#}"); }
+    }
+
+    /// ROG key / Fn+F5. Ignored in observe mode (G-Helper owns the keys then).
+    pub async fn on_hotkey(&self, key: HotKey) {
+        if self.mode.get() != ControlMode::Active { return; }
+        let (action, command) = {
+            let k = self.config.lock().await.keys.clone();
+            match key { HotKey::Rog => (k.rog, k.rog_command), HotKey::Fan => (k.fan, k.fan_command) }
+        };
+        match action {
+            KeyAction::None => {}
+            KeyAction::CycleMode => {
+                let r = self.handle(Request::NextProfile).await;
+                let mode = self.refresh().await.perf.profile.map(|p| match p {
+                    Profile::Quiet => "Silent", Profile::Balanced => "Balanced", Profile::Performance => "Turbo",
+                }).unwrap_or("Unknown");
+                self.osd(&if r.ok { format!("{mode} mode") } else { format!("{mode} mode (settings failed)") }).await;
+            }
+            KeyAction::CycleBrightness => {
+                let next = (self.refresh().await.lighting.brightness.unwrap_or(0) + 1) % 4;
+                if self.handle(Request::SetBrightness { level: next }).await.ok {
+                    self.osd(&format!("Keyboard {}", ["off", "low", "medium", "high"][next as usize])).await;
+                }
+            }
+            KeyAction::CycleEffect => {
+                if let Ok((mode, _, modes, _)) = with_retry(|| self.aura.info()).await {
+                    let codes: Vec<u32> = modes.into_iter().filter(|c| armoury_proto::AuraMode::from_code(*c).is_some()).collect();
+                    if let Some(pos) = codes.iter().position(|c| *c == mode.0).or(Some(0)) {
+                        let next = codes.get((pos + 1) % codes.len().max(1)).copied().unwrap_or(0);
+                        let mut raw = mode.clone();
+                        raw.0 = next;
+                        if with_retry(|| self.aura.set_mode_data(raw.clone())).await.is_ok() {
+                            let name = armoury_proto::AuraMode::from_code(next).map(|m| format!("{m:?}")).unwrap_or_default();
+                            self.osd(&format!("Lighting: {name}")).await;
+                        }
+                    }
+                }
+            }
+            KeyAction::OpenWindow => {
+                let shell = self.omarchy_bin().join("omarchy-shell");
+                if self.svc.run(&[&shell.to_string_lossy(), "shell", "summon", "asus.armoury.window", "{}"]).await.is_err() {
+                    self.osd("Armoury window: coming with the UI").await;
+                }
+            }
+            KeyAction::Command => match command {
+                Some(cmd) => if let Err(e) = self.svc.run(&["sh", "-c", &cmd]).await { eprintln!("armouryd: key command: {e:#}"); },
+                None => eprintln!("armouryd: key action 'command' has no command configured"),
+            },
+        }
+    }
 
     fn omarchy_bin(&self) -> PathBuf {
         PathBuf::from(std::env::var("OMARCHY_PATH").unwrap_or_else(|_| "/usr/share/omarchy".into())).join("bin")
@@ -631,7 +686,22 @@ impl Daemon {
             Request::SetChargeLimit { .. } | Request::OneShotCharge | Request::SetRefresh { .. } | Request::SetGamma { .. }
             | Request::SetToggle { .. } | Request::SetSleepMode { .. } | Request::SetSourceProfile { .. }
             | Request::SetSourceRefresh { .. } => self.system_request(req).await,
-            Request::Keys | Request::SetKeyBinding { .. } => Response::err("not implemented"),
+            Request::Keys => Response::ok(serde_json::to_value(self.config.lock().await.keys.clone()).unwrap()),
+            Request::SetKeyBinding { key, action, command } => {
+                if let Err(r) = self.write_guard().await { return r; }
+                if action == KeyAction::Command && command.as_deref().is_none_or(|c| c.trim().is_empty()) {
+                    return Response::err("action 'command' needs --command \"…\"");
+                }
+                let mut cfg = self.config.lock().await;
+                match key {
+                    HotKey::Rog => { cfg.keys.rog = action; if command.is_some() { cfg.keys.rog_command = command; } }
+                    HotKey::Fan => { cfg.keys.fan = action; if command.is_some() { cfg.keys.fan_command = command; } }
+                }
+                match cfg.save(&self.config_path) {
+                    Ok(()) => Response::ok(serde_json::to_value(cfg.keys.clone()).unwrap()),
+                    Err(e) => Response::err(format!("save config: {e}")),
+                }
+            }
             Request::PlanGpuMode { mode } => match plan_switch(&self.refresh().await.gpu, mode) {
                 Ok(step) => Response::ok(serde_json::to_value(step).unwrap()),
                 Err(e) => Response::err(e),
@@ -1769,5 +1839,58 @@ mod tests {
         r.d.tick().await;
         assert!(!r.d.clamshell_holding().await, "no second inhibitor of our own");
         assert!(r.d.handle(Request::Status).await.data.unwrap()["system"]["clamshell"] == true, "state from Omarchy's status");
+    }
+
+    fn svc_calls(r: &SysRig) -> Vec<String> { r.svc.calls.lock().unwrap().clone() }
+
+    #[tokio::test]
+    async fn keys_ignored_in_observe() {
+        let r = sys_rig(false, "");
+        r.d.on_hotkey(armoury_proto::HotKey::Fan).await;
+        assert!(r.asusd.calls.lock().unwrap().is_empty() && svc_calls(&r).is_empty());
+    }
+
+    #[tokio::test]
+    async fn fan_key_cycles_mode_with_osd() {
+        let r = sys_rig(true, "");
+        r.d.on_hotkey(armoury_proto::HotKey::Fan).await;
+        assert!(r.asusd.calls.lock().unwrap().contains(&"next_profile".to_string()));
+        assert!(svc_calls(&r).iter().any(|c| c.contains("omarchy-osd -m")), "{:?}", svc_calls(&r));
+    }
+
+    #[tokio::test]
+    async fn rog_key_falls_back_to_osd_until_the_ui_exists() {
+        let r = sys_rig(true, "");
+        *r.svc.fail_on.lock().unwrap() = Some("summon".into());
+        r.d.on_hotkey(armoury_proto::HotKey::Rog).await;
+        assert!(svc_calls(&r).iter().any(|c| c.contains("omarchy-osd") && c.contains("coming with the UI")), "{:?}", svc_calls(&r));
+    }
+
+    #[tokio::test]
+    async fn failing_key_command_does_not_break_the_daemon() {
+        let r = sys_rig(true, "[keys]\nrog = \"command\"\nrog_command = \"false\"\n");
+        *r.svc.fail_on.lock().unwrap() = Some("sh -c false".into());
+        r.d.on_hotkey(armoury_proto::HotKey::Rog).await;
+        assert!(svc_calls(&r).iter().any(|c| c.contains("sh -c false")));
+        assert!(r.d.handle(Request::Ping).await.ok);
+    }
+
+    #[tokio::test]
+    async fn key_binding_saved() {
+        let r = sys_rig(true, "");
+        let req: Request = serde_json::from_value(serde_json::json!({"cmd":"set_key_binding","key":"rog","action":"cycle_mode"})).unwrap();
+        assert!(r.d.handle(req).await.ok);
+        assert!(std::fs::read_to_string(r.dir.path().join("config.toml")).unwrap().contains("rog = \"cycle_mode\""));
+        let v = r.d.handle(Request::Keys).await.data.unwrap();
+        assert_eq!(v["rog"], "cycle_mode");
+        let bad: Request = serde_json::from_value(serde_json::json!({"cmd":"set_key_binding","key":"fan","action":"command"})).unwrap();
+        assert!(r.d.handle(bad).await.error.unwrap().contains("command"));
+    }
+
+    #[tokio::test]
+    async fn brightness_key_cycles() {
+        let r = light_rig(true, FakeAura::default(), "[keys]\nrog = \"cycle_brightness\"\n");
+        r.d.on_hotkey(armoury_proto::HotKey::Rog).await; // at 3 → 0
+        assert_eq!(acalls(&r).last().unwrap(), "set_brightness 0");
     }
 }

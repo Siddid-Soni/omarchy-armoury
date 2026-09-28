@@ -25,5 +25,9 @@ async fn main() -> anyhow::Result<()> {
     .with_aura(Box::new(AuraClient::new().await?));
     eprintln!("armouryd: {:?} mode, socket {}", daemon.control.lock().await.mode(), armoury_proto::socket_path().display());
     tokio::spawn(daemon.clone().poll_loop(Duration::from_secs(2)));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    tokio::spawn(armouryd::features::keys::run_reader(tx));
+    let keys = daemon.clone();
+    tokio::spawn(async move { while let Some(k) = rx.recv().await { keys.on_hotkey(k).await; } });
     daemon.serve(listener).await
 }
