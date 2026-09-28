@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-use armoury_proto::{ControlMode, Request, Response, Snapshot, socket_path};
+use armoury_proto::{ControlMode, Epp, Fan, FanCurve, ModeSettings, Profile, Request, Response, Snapshot, socket_path};
 use clap::{Parser, Subcommand};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -26,6 +26,89 @@ enum Cmd {
     Handback,
     /// Stream state changes as JSON lines
     Watch,
+    /// Show or change the performance mode
+    Profile {
+        #[command(subcommand)]
+        action: Option<ProfileAction>,
+    },
+    /// Show or edit a mode's fan curves
+    Fan {
+        #[arg(value_parser = parse_profile)]
+        profile: Profile,
+        #[command(subcommand)]
+        action: Option<FanAction>,
+    },
+    /// Show or edit a mode's power limits, EPP and CPU boost
+    Mode {
+        #[arg(value_parser = parse_profile)]
+        profile: Profile,
+        #[command(subcommand)]
+        action: Option<ModeAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfileAction {
+    Set {
+        #[arg(value_parser = parse_profile)]
+        profile: Profile,
+    },
+    Next,
+}
+
+#[derive(Subcommand)]
+enum FanAction {
+    /// 8 points as TEMP:PERCENT, e.g. 40:0,50:10,60:20,70:30,80:40,90:60,95:80,97:100
+    Set {
+        #[arg(value_parser = parse_fan)]
+        fan: Fan,
+        points: String,
+    },
+    Reset,
+}
+
+#[derive(Subcommand)]
+enum ModeAction {
+    Set {
+        #[arg(long)]
+        pl1: Option<i32>,
+        #[arg(long)]
+        pl2: Option<i32>,
+        #[arg(long)]
+        nv_boost: Option<i32>,
+        #[arg(long)]
+        nv_temp: Option<i32>,
+        #[arg(long, value_parser = parse_epp)]
+        epp: Option<Epp>,
+        #[arg(long, value_parser = ["on", "off"])]
+        cpu_boost: Option<String>,
+    },
+}
+
+fn parse_profile(s: &str) -> Result<Profile, String> {
+    Profile::from_sysfs(s).ok_or_else(|| format!("unknown mode {s} (quiet|balanced|performance)"))
+}
+
+fn parse_fan(s: &str) -> Result<Fan, String> {
+    serde_json::from_value(serde_json::json!(s)).map_err(|_| format!("unknown fan {s} (cpu|gpu|mid)"))
+}
+
+fn parse_epp(s: &str) -> Result<Epp, String> {
+    serde_json::from_value(serde_json::json!(s))
+        .map_err(|_| format!("unknown EPP {s} (default|performance|balance_performance|balance_power|power)"))
+}
+
+fn parse_curve(fan: Fan, s: &str) -> Result<FanCurve, String> {
+    let pts: Vec<&str> = s.split(',').map(str::trim).collect();
+    if pts.len() != 8 { return Err(format!("need exactly 8 TEMP:PERCENT points, got {}", pts.len())); }
+    let mut temps = [0u8; 8];
+    let mut percent = [0u8; 8];
+    for (i, p) in pts.iter().enumerate() {
+        let (t, v) = p.split_once(':').ok_or_else(|| format!("point {p:?} is not TEMP:PERCENT"))?;
+        temps[i] = t.trim_end_matches('c').parse().map_err(|_| format!("bad temperature in {p:?}"))?;
+        percent[i] = v.trim_end_matches('%').parse().map_err(|_| format!("bad percent in {p:?}"))?;
+    }
+    Ok(FanCurve { fan, temps, percent, enabled: true })
 }
 
 fn read_timeout(req: &Request) -> std::time::Duration {
@@ -62,8 +145,16 @@ fn summary(s: &Snapshot) -> String {
         (Some(c), None) => format!("{c}%"),
         _ => "-".into(),
     };
+    let perf = {
+        let p = &s.perf;
+        let mut parts = vec![p.profile.map(|m| m.sysfs().to_string()).unwrap_or_else(|| "-".into())];
+        if let Some(t) = p.cpu_temp_c { parts.push(format!("CPU {t:.0}°C")); }
+        if let (Some(c), Some(g)) = (p.cpu_fan_rpm, p.gpu_fan_rpm) { parts.push(format!("fans {c}/{g} rpm")); }
+        if let Some(w) = p.power_draw_w { parts.push(format!("{w:.1} W")); }
+        parts.join(" · ")
+    };
     format!(
-        "Model      {}\nControl    {control}\nProfile    {}\nGPU        {gpu}{pending}\nKeystone   {keystone}\nBattery    {battery}\nasusd      {}\nG-Helper   {}\n",
+        "Model      {}\nControl    {control}\nProfile    {}\nMode       {perf}\nGPU        {gpu}{pending}\nKeystone   {keystone}\nBattery    {battery}\nasusd      {}\nG-Helper   {}\n",
         opt(s.model.clone()),
         opt(s.platform_profile.clone()),
         if s.asusd_running { "running" } else { "stopped" },
@@ -84,6 +175,39 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let mut s = connect()?;
             writeln!(s, "{}", serde_json::to_string(&Request::Subscribe)?)?;
             for line in BufReader::new(s).lines().skip(1) { println!("{}", line?); }
+        }
+        Cmd::Profile { action } => {
+            let req = match action {
+                None => Request::Status,
+                Some(ProfileAction::Set { profile }) => Request::SetProfile { profile },
+                Some(ProfileAction::Next) => Request::NextProfile,
+            };
+            let s: Snapshot = serde_json::from_value(call(&req)?)?;
+            println!("{}", s.perf.profile.map(|p| p.sysfs()).unwrap_or("-"));
+        }
+        Cmd::Fan { profile, action } => {
+            let req = match action {
+                None => Request::FanCurves { profile },
+                Some(FanAction::Set { fan, points }) => {
+                    Request::SetFanCurve { profile, curve: parse_curve(fan, &points).map_err(anyhow::Error::msg)? }
+                }
+                Some(FanAction::Reset) => Request::ResetFanCurves { profile },
+            };
+            let curves: Vec<FanCurve> = serde_json::from_value(call(&req)?)?;
+            for c in curves {
+                let pts: Vec<String> = c.temps.iter().zip(c.percent).map(|(t, p)| format!("{t}:{p}")).collect();
+                println!("{:?} {} {}", c.fan, if c.enabled { "on " } else { "off" }, pts.join(","));
+            }
+        }
+        Cmd::Mode { profile, action } => {
+            let req = match action {
+                None => Request::ModeSettings { profile },
+                Some(ModeAction::Set { pl1, pl2, nv_boost, nv_temp, epp, cpu_boost }) => Request::SetModeSettings {
+                    profile,
+                    settings: ModeSettings { pl1, pl2, nv_boost, nv_temp, epp, cpu_boost: cpu_boost.map(|v| v == "on") },
+                },
+            };
+            println!("{}", serde_json::to_string_pretty(&call(&req)?)?);
         }
     }
     Ok(())
@@ -120,5 +244,26 @@ mod tests {
     fn read_timeouts() {
         assert_eq!(read_timeout(&Request::Status), std::time::Duration::from_secs(10));
         assert_eq!(read_timeout(&Request::Takeover), std::time::Duration::from_secs(180));
+    }
+
+    #[test]
+    fn parse_curve_points() {
+        let c = parse_curve(armoury_proto::Fan::Gpu, "40:0,50:10%,60:20,70:30,80:40,90:60,95:80,97:100").unwrap();
+        assert_eq!(c.temps, [40, 50, 60, 70, 80, 90, 95, 97]);
+        assert_eq!(c.percent[1], 10);
+        assert!(c.enabled);
+        assert!(parse_curve(armoury_proto::Fan::Cpu, "40:0,50:10").unwrap_err().contains("8"));
+        assert!(parse_curve(armoury_proto::Fan::Cpu, "a:b,1:1,1:1,1:1,1:1,1:1,1:1,1:1").is_err());
+    }
+
+    #[test]
+    fn summary_has_perf_line() {
+        let mut s = Snapshot::default();
+        s.perf.profile = Some(armoury_proto::Profile::Performance);
+        s.perf.cpu_temp_c = Some(72.0);
+        s.perf.cpu_fan_rpm = Some(3300);
+        s.perf.gpu_fan_rpm = Some(5200);
+        s.perf.power_draw_w = Some(18.25);
+        assert!(summary(&s).contains("Mode       performance · CPU 72°C · fans 3300/5200 rpm · 18.2 W"), "{}", summary(&s));
     }
 }
