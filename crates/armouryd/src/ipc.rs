@@ -5,7 +5,7 @@ use crate::features::limits::{self, Bounds, Limit};
 use crate::features::perf::{HwCtx, apply_mode, apply_nv, nv_is_stock};
 use crate::features::lighting::{effect_from_raw, effect_to_raw, power_from_raw, set_zone, validate_effect};
 use crate::features::clamshell::Clamshell;
-use crate::hw::hypr::{Hypr, RealHypr, lua_monitor, lua_touchpad};
+use crate::hw::hypr::{Hypr, RealHypr, lua_monitor};
 use crate::hw::{Asusd, Aura, Gfx, Nvidia, Services, Sysfs, with_retry};
 use crate::state::collect;
 use anyhow::{Context, bail};
@@ -42,7 +42,10 @@ pub struct Daemon {
     light: std::sync::Mutex<LightState>,
     hypr: Box<dyn Hypr>,
     clamshell: Mutex<Clamshell>,
-    touchpad_on: std::sync::Mutex<Option<bool>>,
+    /// Home directory (Omarchy's toggle state and ~/.local/bin tools live under it).
+    home: PathBuf,
+    /// Last clamshell state reported by Omarchy's lid toggle.
+    lid_awake: std::sync::Mutex<Option<bool>>,
     sys_src: std::sync::Mutex<SysSource>,
     state_dir: PathBuf,
     last_reapply: std::sync::Mutex<tokio::time::Instant>,
@@ -64,7 +67,8 @@ impl Daemon {
             light: std::sync::Mutex::new(LightState::default()),
             hypr: Box::new(RealHypr),
             clamshell: Mutex::new(Clamshell::systemd_inhibit()),
-            touchpad_on: std::sync::Mutex::new(None),
+            home: std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default(),
+            lid_awake: std::sync::Mutex::new(None),
             sys_src: std::sync::Mutex::new(SysSource::default()),
             state_dir, last_reapply: std::sync::Mutex::new(tokio::time::Instant::now()),
         })
@@ -89,12 +93,35 @@ impl Daemon {
         Arc::new(d)
     }
 
+    pub fn with_home(self: Arc<Self>, home: PathBuf) -> Arc<Self> {
+        let mut d = Arc::try_unwrap(self).ok().expect("with_home before the daemon is shared");
+        d.home = home;
+        Arc::new(d)
+    }
+
     pub async fn clamshell_holding(&self) -> bool { self.clamshell.lock().await.holding() }
 
-    /// The built-in panel (eDP) or, failing that, the first output.
+    fn omarchy_bin(&self) -> PathBuf {
+        PathBuf::from(std::env::var("OMARCHY_PATH").unwrap_or_else(|_| "/usr/share/omarchy".into())).join("bin")
+    }
+
+    /// Omarchy's "lid closed stays awake on AC" toggle, when installed. It owns the
+    /// inhibitor (and suspends on unplug with the lid closed), so armouryd defers to it.
+    fn lid_tool(&self) -> Option<PathBuf> {
+        [self.home.join(".local/bin/omarchy-toggle-lid-ac"), self.omarchy_bin().join("omarchy-toggle-lid-ac")]
+            .into_iter().find(|p| p.exists())
+    }
+
+    /// Omarchy persists a disabled touchpad here and re-applies it on every Hyprland reload.
+    fn touchpad_enabled(&self) -> bool {
+        !self.home.join(".local/state/omarchy/toggles/hypr/touchpad-disabled-name").exists()
+    }
+
+    /// The built-in panel. Never another output: with the lid closed Omarchy disables eDP
+    /// and the first listed monitor would be an external one.
     async fn panel(&self) -> anyhow::Result<armoury_proto::DisplayInfo> {
         let mons = self.hypr.monitors().await?;
-        mons.iter().find(|m| m.output.starts_with("eDP")).or(mons.first()).cloned().context("no display found")
+        mons.into_iter().find(|m| m.output.starts_with("eDP")).context("the built-in panel is not active (lid closed?)")
     }
 
     async fn set_refresh(&self, hz: f32) -> anyhow::Result<()> {
@@ -108,8 +135,13 @@ impl Daemon {
     async fn follow_system(&self, snap: &Snapshot) {
         let cfg = self.config.lock().await.system.clone();
         let on_ac = snap.lighting.on_ac;
-        self.clamshell.lock().await.update(cfg.clamshell, on_ac == Some(true)).await;
-        let (prev, sleep_applied) = { let s = self.sys_src.lock().unwrap(); (s.on_ac, s.sleep_applied) };
+        let own_clamshell = cfg.clamshell && self.lid_tool().is_none();
+        self.clamshell.lock().await.update(own_clamshell, on_ac == Some(true)).await;
+        let now = tokio::time::Instant::now();
+        let (prev, sleep_applied, retry_at, last_check) = {
+            let s = self.sys_src.lock().unwrap();
+            (s.on_ac, s.sleep_applied, s.retry_at, s.last_check)
+        };
         if !sleep_applied {
             if let Some(m) = cfg.sleep_mode.filter(|m| snap.system.mem_sleep != Some(*m)) {
                 if let Err(e) = self.svc.run(&[PKEXEC, ROOT_HELPER, "mem-sleep", m.kernel()]).await { eprintln!("armouryd: sleep mode: {e:#}"); }
@@ -117,14 +149,31 @@ impl Daemon {
             self.sys_src.lock().unwrap().sleep_applied = true;
         }
         let Some(ac) = on_ac else { return };
-        if prev == Some(ac) { return; }
-        if let Some(hz) = if ac { cfg.refresh_ac } else { cfg.refresh_battery } {
+        let desired = if ac { cfg.refresh_ac } else { cfg.refresh_battery };
+        if retry_at.is_some_and(|t| now < t) { return; }
+        if prev == Some(ac) {
+            // a Hyprland config reload resets the monitor rule: re-check once a minute
+            let due = last_check.is_none_or(|t| now.duration_since(t) >= REFRESH_RECHECK);
+            if !due { return; }
+            self.sys_src.lock().unwrap().last_check = Some(now);
+            let Some(hz) = desired else { return };
             if let Err(e) = self.set_refresh(hz).await {
                 eprintln!("armouryd: refresh rate: {e:#}");
-                return; // retry next tick
+                self.sys_src.lock().unwrap().retry_at = Some(now + REFRESH_RECHECK);
+            }
+            return;
+        }
+        if let Some(hz) = desired {
+            if let Err(e) = self.set_refresh(hz).await {
+                eprintln!("armouryd: refresh rate: {e:#}");
+                self.sys_src.lock().unwrap().retry_at = Some(now + REFRESH_RECHECK);
+                return; // flip stays unrecorded, retried after the backoff
             }
         }
-        self.sys_src.lock().unwrap().on_ac = Some(ac);
+        let mut s = self.sys_src.lock().unwrap();
+        s.on_ac = Some(ac);
+        s.retry_at = None;
+        s.last_check = Some(now);
     }
 
     async fn system_request(&self, req: Request) -> Response {
@@ -146,12 +195,17 @@ impl Daemon {
                 Request::SetToggle { toggle, on } => {
                     match toggle {
                         Toggle::Touchpad => {
-                            let name = self.hypr.touchpad().await.context("no touchpad found")?;
-                            self.hypr.eval(&lua_touchpad(&name, on)).await?;
-                            *self.touchpad_on.lock().unwrap() = Some(on);
+                            // Omarchy's tool escapes the device name and persists the state across reloads
+                            let tool = self.omarchy_bin().join("omarchy-toggle-input-device");
+                            self.svc.run(&[&tool.to_string_lossy(), "touchpad", if on { "on" } else { "off" }]).await?;
                         }
                         Toggle::BootSound => with_retry(|| self.asusd.armoury_set_value("boot_sound", on as i32)).await?,
                         Toggle::PanelOd => with_retry(|| self.asusd.armoury_set_value("panel_overdrive", on as i32)).await?,
+                        Toggle::Clamshell if self.lid_tool().is_some() => {
+                            let tool = self.lid_tool().unwrap();
+                            self.svc.run(&[&tool.to_string_lossy(), if on { "on" } else { "off" }]).await?;
+                            *self.lid_awake.lock().unwrap() = Some(on);
+                        }
                         Toggle::Clamshell => {
                             let mut cfg = self.config.lock().await;
                             cfg.system.clamshell = on;
@@ -528,8 +582,17 @@ impl Daemon {
         s.perf.undervolt = self.uv.lock().unwrap().map(|unlocked| UndervoltState { unlocked });
         s.apply_error = self.apply_error.lock().unwrap().clone();
         s.gpu.armoury_pending = self.gpu_record();
-        s.system.touchpad = *self.touchpad_on.lock().unwrap();
-        s.system.clamshell = self.config.lock().await.system.clamshell;
+        s.system.touchpad = Some(self.touchpad_enabled());
+        s.system.clamshell = match self.lid_tool() {
+            Some(tool) => {
+                if gpu_detail {
+                    let awake = self.svc.output(&[&tool.to_string_lossy(), "status"]).await.is_ok_and(|o| o.trim() == "awake");
+                    *self.lid_awake.lock().unwrap() = Some(awake);
+                }
+                self.lid_awake.lock().unwrap().unwrap_or(false)
+            }
+            None => self.config.lock().await.system.clamshell,
+        };
         if gpu_detail { s.display = self.hypr.monitors().await.unwrap_or_default(); }
         s
     }
@@ -711,7 +774,13 @@ struct SysSource {
     on_ac: Option<bool>,
     /// Sleep mode re-applied this active run.
     sleep_applied: bool,
+    /// Refresh-rate backoff after a failure (Hyprland unreachable, panel off).
+    retry_at: Option<tokio::time::Instant>,
+    /// Last time the applied refresh rate was re-checked.
+    last_check: Option<tokio::time::Instant>,
 }
+
+const REFRESH_RECHECK: Duration = Duration::from_secs(60);
 
 /// Keyboard lighting bookkeeping (active mode).
 #[derive(Default)]
@@ -1547,7 +1616,8 @@ mod tests {
         let d = Daemon::new(Box::new(sys.clone()), Box::new(FakeGfx::default()), Box::new(svc.clone()),
             Box::new(asusd.clone()), ctl, dir.path().join("config.toml"), Box::new(FakeNvidia::default()))
             .with_hypr(Box::new(hypr.clone()))
-            .with_clamshell(crate::features::clamshell::Clamshell::new(vec!["sleep".into(), "30".into()]));
+            .with_clamshell(crate::features::clamshell::Clamshell::new(vec!["sleep".into(), "30".into()]))
+            .with_home(dir.path().join("home"));
         SysRig { d, sys, asusd, svc, hypr, dir }
     }
 
@@ -1607,11 +1677,10 @@ mod tests {
     async fn toggles_route_to_the_right_backend() {
         let r = sys_rig(true, "");
         assert!(r.d.handle(sreq(serde_json::json!({"cmd":"set_toggle","toggle":"touchpad","on":false}))).await.ok);
-        assert!(r.hypr.evals.lock().unwrap()[0].contains("enabled = false"));
+        assert!(r.svc.calls.lock().unwrap().iter().any(|c| c.ends_with("omarchy-toggle-input-device touchpad off")));
         assert!(r.d.handle(sreq(serde_json::json!({"cmd":"set_toggle","toggle":"panel_od","on":false}))).await.ok);
         assert!(r.d.handle(sreq(serde_json::json!({"cmd":"set_toggle","toggle":"boot_sound","on":true}))).await.ok);
         assert_eq!(*r.asusd.calls.lock().unwrap(), ["armoury_set_value panel_overdrive 0", "armoury_set_value boot_sound 1"]);
-        assert_eq!(r.d.refresh().await.system.touchpad, Some(false));
     }
 
     #[tokio::test]
@@ -1637,5 +1706,67 @@ mod tests {
         let r = sys_rig(false, "");
         assert!(r.d.handle(Request::SetChargeLimit { percent: 80 }).await.error.unwrap().contains("observe"));
         assert!(r.d.handle(Request::SetRefresh { hz: 60.0 }).await.error.unwrap().contains("observe"));
+    }
+
+    fn omarchy_home(r: &SysRig) -> std::path::PathBuf { r.dir.path().join("home") }
+
+    #[tokio::test]
+    async fn refresh_only_targets_the_builtin_panel() {
+        let r = sys_rig(true, "");
+        r.hypr.monitors.lock().unwrap()[0].output = "HDMI-A-1".into(); // lid closed: eDP disabled
+        let e = r.d.handle(Request::SetRefresh { hz: 60.0 }).await.error.unwrap();
+        assert!(e.contains("built-in"), "{e}");
+        assert!(r.hypr.evals.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_reasserted_after_hyprland_reload() {
+        let r = sys_rig(true, "[system]\nrefresh_ac = 60.0\n");
+        r.d.tick().await;
+        assert_eq!(r.hypr.evals.lock().unwrap().len(), 1);
+        r.hypr.monitors.lock().unwrap()[0].refresh_hz = 240.0; // config reload put it back
+        tokio::time::advance(Duration::from_secs(61)).await;
+        r.d.tick().await;
+        assert_eq!(r.hypr.evals.lock().unwrap().len(), 2, "{:?}", r.hypr.evals.lock().unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_failure_backs_off() {
+        let r = sys_rig(true, "[system]\nrefresh_ac = 60.0\n");
+        *r.hypr.fail.lock().unwrap() = true;
+        for _ in 0..5 { r.d.tick().await; }
+        assert_eq!(*r.hypr.attempts.lock().unwrap(), 1, "no retry inside the backoff");
+        *r.hypr.fail.lock().unwrap() = false;
+        tokio::time::advance(Duration::from_secs(61)).await;
+        r.d.tick().await;
+        assert_eq!(r.hypr.evals.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn touchpad_goes_through_omarchy_and_reads_its_state() {
+        let r = sys_rig(true, "");
+        assert!(r.d.handle(Request::SetToggle { toggle: armoury_proto::Toggle::Touchpad, on: false }).await.ok);
+        assert!(r.svc.calls.lock().unwrap().iter().any(|c| c.ends_with("/bin/omarchy-toggle-input-device touchpad off")), "{:?}", r.svc.calls.lock().unwrap());
+        assert!(r.hypr.evals.lock().unwrap().is_empty(), "no hand-built Lua for the touchpad");
+        let state = omarchy_home(&r).join(".local/state/omarchy/toggles/hypr");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("touchpad-disabled-name"), "asue1403:00-04f3:319a-touchpad\n").unwrap();
+        assert_eq!(r.d.refresh().await.system.touchpad, Some(false));
+        std::fs::remove_file(state.join("touchpad-disabled-name")).unwrap();
+        assert_eq!(r.d.refresh().await.system.touchpad, Some(true));
+    }
+
+    #[tokio::test]
+    async fn clamshell_delegates_to_omarchy_lid_toggle() {
+        let r = sys_rig(true, "");
+        let bin = omarchy_home(&r).join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("omarchy-toggle-lid-ac"), "#!/bin/sh\n").unwrap();
+        r.svc.outputs.lock().unwrap().insert("omarchy-toggle-lid-ac status".into(), "awake\n".into());
+        assert!(r.d.handle(Request::SetToggle { toggle: armoury_proto::Toggle::Clamshell, on: false }).await.ok);
+        assert!(r.svc.calls.lock().unwrap().iter().any(|c| c.ends_with("omarchy-toggle-lid-ac off")));
+        r.d.tick().await;
+        assert!(!r.d.clamshell_holding().await, "no second inhibitor of our own");
+        assert!(r.d.handle(Request::Status).await.data.unwrap()["system"]["clamshell"] == true, "state from Omarchy's status");
     }
 }

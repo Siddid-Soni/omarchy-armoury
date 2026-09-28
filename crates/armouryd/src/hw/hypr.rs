@@ -6,8 +6,6 @@ use tokio::process::Command;
 #[async_trait::async_trait]
 pub trait Hypr: Send + Sync {
     async fn monitors(&self) -> anyhow::Result<Vec<DisplayInfo>>;
-    /// The built-in touchpad's Hyprland device name.
-    async fn touchpad(&self) -> Option<String>;
     async fn eval(&self, lua: &str) -> anyhow::Result<()>;
     /// hyprsunset gamma, percent.
     async fn gamma(&self, pct: u8) -> anyhow::Result<()>;
@@ -16,7 +14,6 @@ pub trait Hypr: Send + Sync {
 #[async_trait::async_trait]
 impl<T: Hypr + ?Sized> Hypr for std::sync::Arc<T> {
     async fn monitors(&self) -> anyhow::Result<Vec<DisplayInfo>> { (**self).monitors().await }
-    async fn touchpad(&self) -> Option<String> { (**self).touchpad().await }
     async fn eval(&self, lua: &str) -> anyhow::Result<()> { (**self).eval(lua).await }
     async fn gamma(&self, pct: u8) -> anyhow::Result<()> { (**self).gamma(pct).await }
 }
@@ -36,12 +33,19 @@ pub fn parse_monitors(json: &str) -> anyhow::Result<Vec<DisplayInfo>> {
             refresh_hz: m["refreshRate"].as_f64()? as f32,
             rates,
             scale: m["scale"].as_f64().unwrap_or(1.0) as f32,
+            x: m["x"].as_i64().unwrap_or(0) as i32,
+            y: m["y"].as_i64().unwrap_or(0) as i32,
+            transform: m["transform"].as_u64().unwrap_or(0) as u32,
         })
     }).collect())
 }
 
-/// Lua that switches `m` to `hz` at its current resolution and scale; `hz` must be an available rate.
+/// Lua that switches `m` to `hz`, keeping its resolution, scale, position and transform;
+/// `hz` must be an available rate. Output names go into Lua, so only Omarchy's safe set is allowed.
 pub fn lua_monitor(m: &DisplayInfo, hz: f32) -> Result<String, String> {
+    if m.output.is_empty() || !m.output.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
+        return Err(format!("refusing unexpected output name {:?}", m.output));
+    }
     let rate = m.rates.iter().copied().find(|r| (r - hz).abs() < 0.5).ok_or_else(|| {
         let mut rs: Vec<u32> = m.rates.iter().map(|r| r.round() as u32).collect();
         rs.sort();
@@ -49,17 +53,31 @@ pub fn lua_monitor(m: &DisplayInfo, hz: f32) -> Result<String, String> {
         format!("{hz} Hz is not available on {} (available: {})", m.output, rs.join(", "))
     })?;
     let mode = if (rate - rate.round()).abs() < 0.01 { format!("{}", rate.round()) } else { format!("{rate:.2}") };
-    Ok(format!(r#"hl.monitor({{ output = "{}", mode = "{}x{}@{mode}", position = "auto", scale = {} }})"#, m.output, m.width, m.height, m.scale))
+    let scale = format!("{:.6}", m.scale).trim_end_matches('0').trim_end_matches('.').to_string();
+    Ok(format!(
+        r#"hl.monitor({{ output = "{}", mode = "{}x{}@{mode}", position = "{}x{}", scale = {scale}, transform = {} }})"#,
+        m.output, m.width, m.height, m.x, m.y, m.transform
+    ))
 }
 
-pub fn lua_touchpad(name: &str, on: bool) -> String {
-    format!(r#"hl.device({{ name = "{name}", enabled = {on} }})"#)
+/// Newest running Hyprland instance from `hyprctl instances -j`.
+pub fn pick_instance(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    v.as_array()?.iter().max_by_key(|i| i["time"].as_u64().unwrap_or(0))?["instance"].as_str().map(String::from)
 }
 
 pub struct RealHypr;
 
+/// Runs hyprctl against the live Hyprland. armouryd starts before the session exports
+/// HYPRLAND_INSTANCE_SIGNATURE and outlives Hyprland restarts, so the instance is looked
+/// up on every call (`hyprctl instances` works without it).
 async fn hyprctl(args: &[&str]) -> anyhow::Result<String> {
-    let out = tokio::time::timeout(crate::hw::CALL_TIMEOUT, Command::new("hyprctl").args(args).kill_on_drop(true).output())
+    let mut cmd = Command::new("hyprctl");
+    let instances = tokio::time::timeout(crate::hw::CALL_TIMEOUT, Command::new("hyprctl").args(["instances", "-j"]).kill_on_drop(true).output()).await;
+    if let Ok(Ok(o)) = instances {
+        if let Some(sig) = pick_instance(&String::from_utf8_lossy(&o.stdout)) { cmd.env("HYPRLAND_INSTANCE_SIGNATURE", sig); }
+    }
+    let out = tokio::time::timeout(crate::hw::CALL_TIMEOUT, cmd.args(args).kill_on_drop(true).output())
         .await
         .map_err(|_| anyhow::anyhow!("hyprctl timed out"))??;
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -74,10 +92,6 @@ async fn hyprctl(args: &[&str]) -> anyhow::Result<String> {
 impl Hypr for RealHypr {
     async fn monitors(&self) -> anyhow::Result<Vec<DisplayInfo>> { parse_monitors(&hyprctl(&["monitors", "-j"]).await?) }
 
-    async fn touchpad(&self) -> Option<String> {
-        let v: serde_json::Value = serde_json::from_str(&hyprctl(&["devices", "-j"]).await.ok()?).ok()?;
-        v["mice"].as_array()?.iter().filter_map(|m| m["name"].as_str()).find(|n| n.ends_with("-touchpad")).map(String::from)
-    }
 
     async fn eval(&self, lua: &str) -> anyhow::Result<()> {
         let out = hyprctl(&["eval", lua]).await?;
@@ -97,7 +111,7 @@ mod tests {
     use super::*;
 
     // captured from this machine: hyprctl monitors -j
-    const MONITORS: &str = r#"[{"name": "eDP-1", "width": 2560, "height": 1440, "refreshRate": 240.00301, "scale": 1.6, "availableModes": ["2560x1440@240.00Hz", "2560x1440@60.00Hz"]}]"#;
+    const MONITORS: &str = r#"[{"name": "eDP-1", "width": 2560, "height": 1440, "refreshRate": 240.00301, "scale": 1.6, "x": 0, "y": 0, "transform": 0, "availableModes": ["2560x1440@240.00Hz", "2560x1440@60.00Hz"]}]"#;
 
     #[test]
     fn parses_monitors() {
@@ -111,8 +125,17 @@ mod tests {
     #[test]
     fn lua_for_refresh_and_touchpad() {
         let m = &parse_monitors(MONITORS).unwrap()[0];
-        assert_eq!(lua_monitor(m, 60.0).unwrap(), r#"hl.monitor({ output = "eDP-1", mode = "2560x1440@60", position = "auto", scale = 1.6 })"#);
+        assert_eq!(lua_monitor(m, 60.0).unwrap(), r#"hl.monitor({ output = "eDP-1", mode = "2560x1440@60", position = "0x0", scale = 1.6, transform = 0 })"#);
         assert!(lua_monitor(m, 144.0).unwrap_err().contains("60, 240"));
-        assert_eq!(lua_touchpad("asue1403:00-04f3:319a-touchpad", false), r#"hl.device({ name = "asue1403:00-04f3:319a-touchpad", enabled = false })"#);
+        let mut evil = m.clone();
+        evil.output = "eDP-1\"}) os.execute(\"id\") --".into();
+        assert!(lua_monitor(&evil, 60.0).unwrap_err().contains("name"));
+    }
+
+    #[test]
+    fn picks_newest_instance() {
+        let j = r#"[{"instance":"old_1","time":100,"pid":1,"wl_socket":"wayland-0"},{"instance":"new_2","time":200,"pid":2,"wl_socket":"wayland-1"}]"#;
+        assert_eq!(pick_instance(j).as_deref(), Some("new_2"));
+        assert_eq!(pick_instance("[]"), None);
     }
 }

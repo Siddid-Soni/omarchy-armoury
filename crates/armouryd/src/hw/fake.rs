@@ -167,6 +167,8 @@ pub struct FakeHypr {
     pub evals: Mutex<Vec<String>>,
     pub gamma: Mutex<Vec<u8>>,
     pub sunset_running: bool,
+    pub fail: Mutex<bool>,
+    pub attempts: Mutex<u32>,
 }
 
 impl Default for FakeHypr {
@@ -175,10 +177,13 @@ impl Default for FakeHypr {
         Self {
             monitors: Mutex::new(vec![armoury_proto::DisplayInfo {
                 output: "eDP-1".into(), width: 2560, height: 1440, refresh_hz: 240.0, rates: vec![240.0, 60.0], scale: 1.6,
+                x: 0, y: 0, transform: 0,
             }]),
             evals: Mutex::new(Vec::new()),
             gamma: Mutex::new(Vec::new()),
             sunset_running: true,
+            fail: Mutex::new(false),
+            attempts: Mutex::new(0),
         }
     }
 }
@@ -186,8 +191,9 @@ impl Default for FakeHypr {
 #[async_trait::async_trait]
 impl super::hypr::Hypr for FakeHypr {
     async fn monitors(&self) -> anyhow::Result<Vec<armoury_proto::DisplayInfo>> { Ok(self.monitors.lock().unwrap().clone()) }
-    async fn touchpad(&self) -> Option<String> { Some("asue1403:00-04f3:319a-touchpad".into()) }
     async fn eval(&self, lua: &str) -> anyhow::Result<()> {
+        *self.attempts.lock().unwrap() += 1;
+        if *self.fail.lock().unwrap() { anyhow::bail!("fake Hyprland unreachable"); }
         self.evals.lock().unwrap().push(lua.to_string());
         // mirror a refresh change so later reads see it
         if let Some(hz) = lua.split('@').nth(1).and_then(|s| s.split('"').next()).and_then(|s| s.parse::<f32>().ok()) {

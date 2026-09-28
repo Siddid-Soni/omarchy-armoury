@@ -140,6 +140,12 @@ pub struct DisplayInfo {
     pub refresh_hz: f32,
     pub rates: Vec<f32>,
     pub scale: f32,
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+    #[serde(default)]
+    pub transform: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
