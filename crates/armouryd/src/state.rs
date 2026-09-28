@@ -1,5 +1,5 @@
 use crate::hw::{Gfx, Nvidia, Services, Sysfs, sysfs, with_retry};
-use armoury_proto::{BatteryState, ControlMode, GpuMode, GpuPower, GpuState, LightingState, PerfState, Profile, Snapshot};
+use armoury_proto::{BatteryInfo, SleepMode, SystemState, BatteryState, ControlMode, GpuMode, GpuPower, GpuState, LightingState, PerfState, Profile, Snapshot};
 
 /// `gpu_detail` reads NVIDIA status and dGPU users. Only for explicit requests: polling
 /// NVML every 2 s kept the dGPU from ever runtime-suspending (measured on the G533ZW).
@@ -12,9 +12,9 @@ pub async fn collect(sys: &dyn Sysfs, gfx: &dyn Gfx, svc: &dyn Services, nv: &dy
         gpu: gpu_state(sys, gfx, nv, gpu_detail).await,
         battery: battery_state(sys),
         perf: perf_state(sys),
-        battery_info: Default::default(),
+        battery_info: battery_info(sys),
         display: Vec::new(),
-        system: Default::default(),
+        system: system_state(sys),
         lighting: LightingState {
             brightness: sys.read(sysfs::KBD_BRIGHTNESS).and_then(|v| v.parse().ok()),
             on_ac: on_ac(sys),
@@ -66,6 +66,52 @@ fn battery_state(sys: &dyn Sysfs) -> BatteryState {
         capacity: attr("capacity").and_then(|v| v.parse().ok()),
         status: attr("status"),
         charge_limit: attr("charge_control_end_threshold").and_then(|v| v.parse().ok()),
+    }
+}
+
+pub fn battery_info(sys: &dyn Sysfs) -> BatteryInfo {
+    let Some(bat) = sys.list(sysfs::POWER_SUPPLY_DIR).into_iter()
+        .find(|n| sys.read(&format!("{}/{n}/type", sysfs::POWER_SUPPLY_DIR)).as_deref() == Some("Battery"))
+    else { return BatteryInfo::default() };
+    let num = |a: &str| sys.read(&format!("{}/{bat}/{a}", sysfs::POWER_SUPPLY_DIR)).and_then(|v| v.parse::<f64>().ok());
+    let volts = num("voltage_now").map(|uv| uv / 1e6);
+    let design_v = num("voltage_min_design").map(|uv| uv / 1e6).or(volts);
+    // energy_* is µWh; charge_* (µAh) needs a voltage
+    let wh = |e: &str, c: &str| num(e).map(|v| v / 1e6).or_else(|| Some(num(c)? / 1e6 * design_v?));
+    let full = wh("energy_full", "charge_full");
+    let design = wh("energy_full_design", "charge_full_design");
+    let now = wh("energy_now", "charge_now");
+    let draw = num("power_now").map(|uw| uw / 1e6).or_else(|| Some(num("current_now")? / 1e6 * volts?));
+    let status = sys.read(&format!("{}/{bat}/status", sysfs::POWER_SUPPLY_DIR));
+    let time_left = match (status.as_deref(), now, draw) {
+        (Some("Discharging"), Some(n), Some(d)) if d > 0.5 => Some((n / d * 60.0).round() as u32),
+        _ => None,
+    };
+    BatteryInfo {
+        capacity: num("capacity").map(|v| v as u8),
+        status,
+        health_pct: full.zip(design).filter(|(_, d)| *d > 0.0).map(|(f, d)| (f / d * 100.0) as f32),
+        full_wh: full.map(|v| v as f32),
+        design_wh: design.map(|v| v as f32),
+        cycles: num("cycle_count").map(|v| v as u32).filter(|c| *c > 0),
+        voltage_v: volts.map(|v| v as f32),
+        draw_w: draw.map(|v| v as f32),
+        time_left_min: time_left,
+        charge_limit: num("charge_control_end_threshold").map(|v| v as u8),
+    }
+}
+
+pub fn system_state(sys: &dyn Sysfs) -> SystemState {
+    let flag = |p: &str| sys.read(p).map(|v| v == "1");
+    let sleep = sys.read(sysfs::MEM_SLEEP).unwrap_or_default();
+    SystemState {
+        boot_sound: flag(sysfs::BOOT_SOUND),
+        panel_od: flag(sysfs::PANEL_OD),
+        mem_sleep: sleep.split_whitespace().find(|w| w.starts_with('[')).and_then(|w| SleepMode::from_kernel(w.trim_matches(['[', ']']))),
+        sleep_modes: sleep.split_whitespace().filter_map(|w| SleepMode::from_kernel(w.trim_matches(['[', ']']))).collect(),
+        // no webcam on this model; any bound UVC device counts
+        camera_present: sys.list(sysfs::UVC_DRIVER).iter().any(|e| e.chars().next().is_some_and(|c| c.is_ascii_digit())),
+        ..Default::default()
     }
 }
 
@@ -230,5 +276,36 @@ mod tests {
         sys.files.lock().unwrap().insert("sys/class/power_supply/ADP0/online".into(), "0".into());
         let s = collect(&sys, &FakeGfx::default(), &FakeServices::default(), &FakeNvidia::default(), ControlMode::Observe, false).await;
         assert_eq!(s.lighting.on_ac, Some(false));
+    }
+
+    #[tokio::test]
+    async fn battery_and_system_readings() {
+        let sys = machine();
+        {
+            let mut f = sys.files.lock().unwrap();
+            // this machine's BAT0 (energy_* in µWh)
+            f.insert("sys/class/power_supply/BAT0/energy_full".into(), "64137000".into());
+            f.insert("sys/class/power_supply/BAT0/energy_full_design".into(), "90005000".into());
+            f.insert("sys/class/power_supply/BAT0/energy_now".into(), "32000000".into());
+            f.insert("sys/class/power_supply/BAT0/cycle_count".into(), "0".into());
+            f.insert("sys/class/power_supply/BAT0/voltage_now".into(), "15920000".into());
+            f.insert("sys/class/power_supply/BAT0/status".into(), "Discharging".into());
+            f.insert("sys/class/power_supply/BAT0/power_now".into(), "16000000".into());
+            f.insert("sys/power/mem_sleep".into(), "[s2idle] deep".into());
+            f.insert("sys/devices/platform/asus-nb-wmi/boot_sound".into(), "0".into());
+            f.insert("sys/devices/platform/asus-nb-wmi/panel_od".into(), "1".into());
+        }
+        let s = collect(&sys, &FakeGfx::default(), &FakeServices::default(), &FakeNvidia::default(), ControlMode::Observe, false).await;
+        let b = s.battery_info;
+        assert_eq!(b.health_pct.map(|h| h.round()), Some(71.0));
+        assert_eq!(b.design_wh.map(|w| w.round()), Some(90.0));
+        assert_eq!(b.cycles, None, "firmware reports 0");
+        assert_eq!(b.voltage_v.map(|v| (v * 10.0).round()), Some(159.0));
+        assert_eq!(b.time_left_min, Some(120), "32 Wh at 16 W");
+        assert_eq!(b.charge_limit, Some(80));
+        assert_eq!(s.system.mem_sleep, Some(armoury_proto::SleepMode::S2idle));
+        assert_eq!(s.system.sleep_modes, vec![armoury_proto::SleepMode::S2idle, armoury_proto::SleepMode::Deep]);
+        assert_eq!((s.system.boot_sound, s.system.panel_od), (Some(false), Some(true)));
+        assert!(!s.system.camera_present);
     }
 }
