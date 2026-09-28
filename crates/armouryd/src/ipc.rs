@@ -44,10 +44,11 @@ impl Daemon {
 
     /// One poll: refresh, then (active only) apply the mode's settings when the
     /// profile changed from any source, and re-apply on the configured interval.
-    pub async fn tick(&self) {
+    /// Returns the errors from any apply done in this tick.
+    pub async fn tick(&self) -> Vec<String> {
         let snap = self.refresh().await;
-        if self.mode.get() != ControlMode::Active { return; }
-        let Some(profile) = snap.perf.profile else { return };
+        if self.mode.get() != ControlMode::Active { return Vec::new(); }
+        let Some(profile) = snap.perf.profile else { return Vec::new() };
         let mut applied = self.applied.lock().await;
         let (settings, secs) = {
             let cfg = self.config.lock().await;
@@ -55,12 +56,15 @@ impl Daemon {
         };
         let due = secs > 0 && self.last_reapply.lock().unwrap().elapsed() >= Duration::from_secs(secs as u64);
         if *applied != Some(profile) || due {
-            for e in apply_mode(profile, &settings, &*self.asusd, &*self.svc).await {
+            let errs = apply_mode(profile, &settings, &*self.asusd, &*self.svc).await;
+            for e in &errs {
                 eprintln!("armouryd: apply {}: {e}", profile.sysfs());
             }
             *applied = Some(profile);
             *self.last_reapply.lock().unwrap() = tokio::time::Instant::now();
+            return errs;
         }
+        Vec::new()
     }
 
     async fn write_guard(&self) -> Result<(), Response> {
@@ -85,7 +89,10 @@ impl Daemon {
 
     async fn snapshot_after(&self, r: anyhow::Result<()>) -> Response {
         if let Err(e) = r { return Response::err(format!("{e:#}")); }
-        self.tick().await;
+        let errs = self.tick().await;
+        if !errs.is_empty() {
+            return Response::err(format!("mode changed, but its settings failed: {}", errs.join("; ")));
+        }
         Response::ok(serde_json::to_value(self.refresh().await).unwrap())
     }
 
@@ -468,5 +475,21 @@ mod tests {
         tokio::time::advance(Duration::from_secs(6)).await;
         r.d.tick().await;
         assert!(r.asusd.calls.lock().unwrap().contains(&"armoury_set ppt_pl1_spl 60".to_string()));
+    }
+
+    #[tokio::test]
+    async fn set_profile_reports_apply_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "[modes.balanced]\npl1 = 45\npl2 = 65\n").unwrap();
+        let sys = Arc::new(FakeSysfs::with(&[("sys/firmware/acpi/platform_profile", "balanced")]));
+        let asusd = Arc::new(FakeAsusd::default());
+        *asusd.fail_on.lock().unwrap() = Some("set_ppt_group".into());
+        let mut ctl = Control::load(dir.path());
+        ctl.set(ControlMode::Active).unwrap();
+        let d = Daemon::new(Box::new(sys), Box::new(FakeGfx::default()), Box::new(FakeServices::default()),
+            Box::new(asusd), ctl, dir.path().join("config.toml"));
+        let resp = d.handle(Request::SetProfile { profile: Profile::Balanced }).await;
+        let err = resp.error.expect("apply failure must be reported");
+        assert!(err.contains("settings failed") && err.contains("enable tuning"), "{err}");
     }
 }

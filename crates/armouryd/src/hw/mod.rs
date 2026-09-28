@@ -40,6 +40,7 @@ pub trait Asusd: Send + Sync {
     async fn set_fan_curve(&self, profile: u32, curve: RawCurve) -> anyhow::Result<()>;
     async fn reset_fan_curves(&self, profile: u32) -> anyhow::Result<()>;
     async fn set_ppt_group(&self, enabled: bool) -> anyhow::Result<()>;
+    async fn set_fan_curves_enabled(&self, profile: u32, enabled: bool) -> anyhow::Result<()>;
     async fn armoury_range(&self, attr: &str) -> anyhow::Result<(i32, i32)>;
     async fn armoury_set(&self, attr: &str, value: i32) -> anyhow::Result<()>;
     async fn set_profile_epp(&self, profile: u32, epp: u32) -> anyhow::Result<()>;
@@ -58,6 +59,7 @@ impl<T: Asusd + ?Sized> Asusd for std::sync::Arc<T> {
     async fn set_fan_curve(&self, profile: u32, curve: RawCurve) -> anyhow::Result<()> { (**self).set_fan_curve(profile, curve).await }
     async fn reset_fan_curves(&self, profile: u32) -> anyhow::Result<()> { (**self).reset_fan_curves(profile).await }
     async fn set_ppt_group(&self, enabled: bool) -> anyhow::Result<()> { (**self).set_ppt_group(enabled).await }
+    async fn set_fan_curves_enabled(&self, profile: u32, enabled: bool) -> anyhow::Result<()> { (**self).set_fan_curves_enabled(profile, enabled).await }
     async fn armoury_range(&self, attr: &str) -> anyhow::Result<(i32, i32)> { (**self).armoury_range(attr).await }
     async fn armoury_set(&self, attr: &str, value: i32) -> anyhow::Result<()> { (**self).armoury_set(attr, value).await }
     async fn set_profile_epp(&self, profile: u32, epp: u32) -> anyhow::Result<()> { (**self).set_profile_epp(profile, epp).await }

@@ -7,7 +7,11 @@ use armoury_proto::{ModeSettings, Profile};
 pub async fn apply_mode(profile: Profile, s: &ModeSettings, asusd: &dyn Asusd, svc: &dyn Services) -> Vec<String> {
     let mut errors = Vec::new();
     if Limit::ALL.iter().any(|l| l.value(s).is_some()) {
-        // asusd only writes PPT values to hardware while its tuning group is enabled
+        // asusd only writes PPT values while the mode's tuning group is enabled,
+        // and refuses to enable tuning unless the mode's custom fan curves are on.
+        if let Err(e) = with_retry(|| asusd.set_fan_curves_enabled(profile.to_asusd(), true)).await {
+            errors.push(format!("enable fan curves: {e:#}"));
+        }
         if let Err(e) = with_retry(|| asusd.set_ppt_group(true)).await { errors.push(format!("enable tuning: {e:#}")); }
         for l in Limit::ALL {
             if let Some(v) = l.value(s) {
@@ -40,6 +44,7 @@ mod tests {
         let (a, s) = (FakeAsusd::default(), FakeServices::default());
         assert!(apply_mode(Profile::Performance, &full(), &a, &s).await.is_empty());
         assert_eq!(*a.calls.lock().unwrap(), [
+            "set_fan_curves_enabled 1 true",
             "set_ppt_group true",
             "armoury_set ppt_pl1_spl 120",
             "armoury_set ppt_pl2_sppt 150",
