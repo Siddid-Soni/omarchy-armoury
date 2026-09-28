@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-use armoury_proto::{AuraEffect, AuraMode, AuraZone, ControlMode, LightingInfo, ZonePower, Epp, Fan, FanCurve, GpuMode, GpuStep, GpuSwitchResult, ModeSettings, Profile, Request, Response, Snapshot, socket_path};
+use armoury_proto::{SleepMode, Toggle, AuraEffect, AuraMode, AuraZone, ControlMode, LightingInfo, ZonePower, Epp, Fan, FanCurve, GpuMode, GpuStep, GpuSwitchResult, ModeSettings, Profile, Request, Response, Snapshot, socket_path};
 use clap::{Parser, Subcommand};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -37,6 +37,33 @@ enum Cmd {
         profile: Profile,
         #[command(subcommand)]
         action: Option<FanAction>,
+    },
+    /// Battery info, charge limit, one-shot full charge
+    Battery {
+        #[command(subcommand)]
+        action: Option<BatteryAction>,
+    },
+    /// Refresh rate, Panel Overdrive, gamma
+    Display {
+        #[command(subcommand)]
+        action: Option<DisplayAction>,
+    },
+    /// Touchpad, boot sound, Panel Overdrive, clamshell
+    Toggle {
+        #[arg(value_parser = parse_toggle)]
+        what: Toggle,
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+    /// Suspend variant (s2idle|deep); kept across reboots
+    Sleep {
+        #[arg(value_parser = ["s2idle", "deep"])]
+        mode: String,
+    },
+    /// Per power source: performance mode (asusd switches it) and refresh rate
+    Auto {
+        #[command(subcommand)]
+        action: AutoAction,
     },
     /// Keyboard, lightbar and logo lighting
     Light {
@@ -118,6 +145,70 @@ enum ModeAction {
         #[arg(long, value_parser = parse_lock)]
         gpu_mem_lock: Option<u32>,
     },
+}
+
+#[derive(Subcommand)]
+enum BatteryAction {
+    /// Stop charging at this percent (20-100)
+    Limit { percent: u8 },
+    /// Charge to 100% once, then return to the limit
+    Oneshot,
+}
+
+#[derive(Subcommand)]
+enum DisplayAction {
+    /// Set the built-in panel's refresh rate
+    Refresh { hz: f32 },
+    /// Panel Overdrive on|off
+    Od {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+    /// Gamma percent via hyprsunset (20-100)
+    Gamma { percent: u8 },
+}
+
+#[derive(Subcommand)]
+enum AutoAction {
+    /// Mode asusd switches to on AC / on battery
+    Profile {
+        #[arg(long, value_parser = parse_profile)]
+        ac: Option<Profile>,
+        #[arg(long, value_parser = parse_profile)]
+        battery: Option<Profile>,
+    },
+    /// Refresh rate on AC / on battery
+    Refresh {
+        #[arg(long)]
+        ac: Option<f32>,
+        #[arg(long)]
+        battery: Option<f32>,
+    },
+}
+
+fn parse_toggle(s: &str) -> Result<Toggle, String> {
+    match s {
+        "touchpad" => Ok(Toggle::Touchpad),
+        "bootsound" | "boot-sound" => Ok(Toggle::BootSound),
+        "od" | "overdrive" | "panel-od" => Ok(Toggle::PanelOd),
+        "clamshell" => Ok(Toggle::Clamshell),
+        _ => Err(format!("unknown toggle {s:?} (touchpad|bootsound|od|clamshell)")),
+    }
+}
+
+fn battery_lines(s: &Snapshot) -> String {
+    let b = &s.battery_info;
+    let mut out = String::new();
+    let opt = |v: Option<String>| v.unwrap_or_else(|| "-".into());
+    out += &format!("Charge     {} ({}), limit {}\n", opt(b.capacity.map(|c| format!("{c}%"))), opt(b.status.clone()), opt(b.charge_limit.map(|l| format!("{l}%"))));
+    if let (Some(h), Some(f), Some(d)) = (b.health_pct, b.full_wh, b.design_wh) {
+        out += &format!("Health     {h:.0}% ({f:.1} of {d:.1} Wh)\n");
+    }
+    if let Some(c) = b.cycles { out += &format!("Cycles     {c}\n"); }
+    if let Some(v) = b.voltage_v { out += &format!("Voltage    {v:.2} V\n"); }
+    if let Some(w) = b.draw_w.filter(|w| *w > 0.0) { out += &format!("Draw       {w:.1} W\n"); }
+    if let Some(m) = b.time_left_min { out += &format!("Remaining  {}h {:02}m\n", m / 60, m % 60); }
+    out
 }
 
 #[derive(Subcommand)]
@@ -333,6 +424,31 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             writeln!(s, "{}", serde_json::to_string(&Request::Subscribe)?)?;
             for line in BufReader::new(s).lines().skip(1) { println!("{}", line?); }
         }
+        Cmd::Battery { action: None } => {
+            let s: Snapshot = serde_json::from_value(call(&Request::Status)?)?;
+            print!("{}", battery_lines(&s));
+        }
+        Cmd::Battery { action: Some(BatteryAction::Limit { percent }) } => { call(&Request::SetChargeLimit { percent })?; }
+        Cmd::Battery { action: Some(BatteryAction::Oneshot) } => { call(&Request::OneShotCharge)?; println!("charging to 100% once"); }
+        Cmd::Display { action: None } => {
+            let s: Snapshot = serde_json::from_value(call(&Request::Status)?)?;
+            for d in &s.display {
+                let rates: Vec<String> = d.rates.iter().map(|r| format!("{}", r.round())).collect();
+                println!("{}  {}x{} @ {:.0} Hz (available {} Hz), scale {}", d.output, d.width, d.height, d.refresh_hz, rates.join("/"), d.scale);
+            }
+            let on = |v: Option<bool>| match v { Some(true) => "on", Some(false) => "off", None => "-" };
+            println!("Overdrive  {}", on(s.system.panel_od));
+        }
+        Cmd::Display { action: Some(DisplayAction::Refresh { hz }) } => { call(&Request::SetRefresh { hz })?; }
+        Cmd::Display { action: Some(DisplayAction::Od { state }) } => { call(&Request::SetToggle { toggle: Toggle::PanelOd, on: state == "on" })?; }
+        Cmd::Display { action: Some(DisplayAction::Gamma { percent }) } => { call(&Request::SetGamma { percent })?; }
+        Cmd::Toggle { what, state } => { call(&Request::SetToggle { toggle: what, on: state == "on" })?; }
+        Cmd::Sleep { mode } => {
+            let mode = if mode == "deep" { SleepMode::Deep } else { SleepMode::S2idle };
+            call(&Request::SetSleepMode { mode })?;
+        }
+        Cmd::Auto { action: AutoAction::Profile { ac, battery } } => { call(&Request::SetSourceProfile { ac, battery })?; }
+        Cmd::Auto { action: AutoAction::Refresh { ac, battery } } => { call(&Request::SetSourceRefresh { ac, battery })?; }
         Cmd::Light { action: None } => {
             let s: Snapshot = serde_json::from_value(call(&Request::Status)?)?;
             let names = ["off", "low", "med", "high"];
@@ -542,5 +658,20 @@ mod tests {
         assert!(parse_level("4").is_err());
         assert_eq!(parse_aura_mode("rainbow-wave"), Ok(armoury_proto::AuraMode::RainbowWave));
         assert!(parse_aura_mode("disco").is_err());
+    }
+
+    #[test]
+    fn battery_summary_line() {
+        let mut s = Snapshot::default();
+        s.battery_info = armoury_proto::BatteryInfo { capacity: Some(79), health_pct: Some(71.3), design_wh: Some(90.0), full_wh: Some(64.1), charge_limit: Some(80), status: Some("Not charging".into()), ..Default::default() };
+        assert!(battery_lines(&s).contains("Health     71% (64.1 of 90.0 Wh)"), "{}", battery_lines(&s));
+    }
+
+    #[test]
+    fn toggle_names() {
+        assert_eq!(parse_toggle("touchpad"), Ok(armoury_proto::Toggle::Touchpad));
+        assert_eq!(parse_toggle("od"), Ok(armoury_proto::Toggle::PanelOd));
+        assert_eq!(parse_toggle("bootsound"), Ok(armoury_proto::Toggle::BootSound));
+        assert!(parse_toggle("camera").is_err());
     }
 }
