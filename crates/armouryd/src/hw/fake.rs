@@ -119,6 +119,7 @@ pub struct FakeAura {
     pub modes: Vec<u32>,
     pub zones: Vec<u32>,
     pub missing: bool,
+    pub fail: Mutex<bool>,
 }
 
 impl Default for FakeAura {
@@ -132,6 +133,7 @@ impl Default for FakeAura {
             modes: vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12],
             zones: vec![1, 2, 0],
             missing: false,
+            fail: Mutex::new(false),
         }
     }
 }
@@ -153,6 +155,7 @@ impl super::Aura for FakeAura {
         Ok(())
     }
     async fn set_brightness(&self, level: u32) -> anyhow::Result<()> {
+        if *self.fail.lock().unwrap() { anyhow::bail!("fake asusd not ready"); }
         self.calls.lock().unwrap().push(format!("set_brightness {level}"));
         *self.brightness.lock().unwrap() = level;
         Ok(())

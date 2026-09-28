@@ -67,21 +67,48 @@ impl Daemon {
         Arc::new(d)
     }
 
-    /// Applies the stored AC/battery keyboard brightness when the power source changes.
+    /// Keeps keyboard brightness per power source. Between flips it tracks the level the
+    /// user actually has (Fn keys included); on a flip it stores that level for the old
+    /// source and applies the new source's. The flip only counts once handled, so a failed
+    /// write (asusd still starting after resume) is retried on the next tick.
     async fn follow_power_source(&self, snap: &Snapshot) {
         let Some(on_ac) = snap.lighting.on_ac else { return };
-        let target = {
+        let current = snap.lighting.brightness;
+        let (prev, idle, last) = {
             let mut l = self.light.lock().unwrap();
-            if l.on_ac == Some(on_ac) { return; }
-            l.on_ac = Some(on_ac);
-            if l.idle_saved.is_some() { return; } // resume will restore
-            let cfg = self.config.try_lock();
-            let Ok(cfg) = cfg else { return };
+            if l.on_ac == Some(on_ac) {
+                if l.idle_saved.is_none() { l.last_brightness = current; }
+                return;
+            }
+            (l.on_ac, l.idle_saved, l.last_brightness)
+        };
+        let target = {
+            let mut cfg = self.config.lock().await;
+            if let (Some(old), None, Some(level)) = (prev, idle, last) {
+                let slot = if old { &mut cfg.lighting.brightness_ac } else { &mut cfg.lighting.brightness_battery };
+                if *slot != Some(level) {
+                    *slot = Some(level);
+                    if let Err(e) = cfg.save(&self.config_path) { eprintln!("armouryd: save keyboard brightness: {e}"); }
+                }
+            }
             if on_ac { cfg.lighting.brightness_ac } else { cfg.lighting.brightness_battery }
         };
-        if let Some(t) = target.filter(|t| snap.lighting.brightness != Some(*t)) {
-            if let Err(e) = with_retry(|| self.aura.set_brightness(t as u32)).await { eprintln!("armouryd: keyboard brightness: {e:#}"); }
+        if idle.is_some() {
+            // dimmed: resume should bring back the new source's level
+            let mut l = self.light.lock().unwrap();
+            if target.is_some() { l.idle_saved = target; }
+            l.on_ac = Some(on_ac);
+            return;
         }
+        if let Some(t) = target.filter(|t| current != Some(*t)) {
+            if let Err(e) = with_retry(|| self.aura.set_brightness(t as u32)).await {
+                eprintln!("armouryd: keyboard brightness: {e:#}");
+                return; // retry next tick
+            }
+        }
+        let mut l = self.light.lock().unwrap();
+        l.on_ac = Some(on_ac);
+        l.last_brightness = target.or(current);
     }
 
     async fn lighting_request(&self, req: Request) -> Response {
@@ -127,18 +154,27 @@ impl Daemon {
                 Request::KbdIdle => {
                     if self.config.lock().await.lighting.keep_on { return Ok(serde_json::json!({"dimmed": false})); }
                     let current = self.refresh().await.lighting.brightness.unwrap_or(0);
-                    let first = {
+                    if current == 0 { return Ok(serde_json::json!({"dimmed": true})); }
+                    // save only the first level; dim whenever the backlight is on
+                    let saved_now = {
                         let mut l = self.light.lock().unwrap();
                         let first = l.idle_saved.is_none();
                         if first { l.idle_saved = Some(current); }
                         first
                     };
-                    if first && current > 0 { with_retry(|| self.aura.set_brightness(0)).await?; }
+                    if let Err(e) = with_retry(|| self.aura.set_brightness(0)).await {
+                        if saved_now { self.light.lock().unwrap().idle_saved = None; }
+                        return Err(e);
+                    }
                     Ok(serde_json::json!({"dimmed": true}))
                 }
                 Request::KbdResume => {
                     let saved = self.light.lock().unwrap().idle_saved.take();
-                    if let Some(level) = saved.filter(|l| *l > 0) { with_retry(|| self.aura.set_brightness(level as u32)).await?; }
+                    let current = self.refresh().await.lighting.brightness.unwrap_or(0);
+                    // a level set while dimmed (Fn key) wins over the saved one
+                    if let Some(level) = saved.filter(|l| *l > 0 && current == 0) {
+                        with_retry(|| self.aura.set_brightness(level as u32)).await?;
+                    }
                     Ok(serde_json::json!({"restored": saved}))
                 }
                 _ => unreachable!(),
@@ -541,6 +577,8 @@ struct LightState {
     on_ac: Option<bool>,
     /// Brightness before KbdIdle dimmed it.
     idle_saved: Option<u8>,
+    /// Level the user had at the last tick on the current source (not while dimmed).
+    last_brightness: Option<u8>,
 }
 
 /// Placeholder until main wires the asusd Aura client.
@@ -1288,5 +1326,65 @@ mod tests {
         assert!(r.d.handle(req(serde_json::json!({"cmd":"set_brightness","level":1}))).await.error.unwrap().contains("observe"));
         assert!(r.d.handle(Request::KbdIdle).await.error.unwrap().contains("observe"));
         assert_eq!(r.d.refresh().await.lighting.brightness, Some(3), "reads still work");
+    }
+
+    fn unplug(r: &LightRig, on: bool) { r.sys.files.lock().unwrap().insert("sys/class/power_supply/ADP0/online".into(), if on { "1" } else { "0" }.into()); }
+    fn stored(r: &LightRig) -> String { std::fs::read_to_string(r.dir.path().join("config.toml")).unwrap_or_default() }
+
+    #[tokio::test]
+    async fn flip_retried_after_failed_write() {
+        let r = light_rig(true, FakeAura::default(), "[lighting]\nbrightness_ac = 3\nbrightness_battery = 1\n");
+        r.d.tick().await;
+        *r.aura.fail.lock().unwrap() = true; // asusd still coming back after resume
+        unplug(&r, false);
+        r.d.tick().await;
+        *r.aura.fail.lock().unwrap() = false;
+        r.d.tick().await;
+        assert_eq!(acalls(&r).last().unwrap(), "set_brightness 1", "{:?}", acalls(&r));
+    }
+
+    #[tokio::test]
+    async fn idle_flip_resume_restores_new_source_level() {
+        let r = light_rig(true, FakeAura::default(), "[lighting]\nbrightness_ac = 3\nbrightness_battery = 1\n");
+        r.d.tick().await;
+        assert!(r.d.handle(Request::KbdIdle).await.ok);
+        set_brightness_sysfs(&r, "0");
+        unplug(&r, false);
+        r.d.tick().await;
+        assert!(r.d.handle(Request::KbdResume).await.ok);
+        assert_eq!(acalls(&r).last().unwrap(), "set_brightness 1", "{:?}", acalls(&r));
+    }
+
+    #[tokio::test]
+    async fn fn_key_level_remembered_per_source() {
+        let r = light_rig(true, FakeAura::default(), "[lighting]\nbrightness_ac = 3\n");
+        r.d.tick().await;
+        set_brightness_sysfs(&r, "1"); // Fn key on AC
+        r.d.tick().await;
+        unplug(&r, false);
+        r.d.tick().await;
+        assert!(stored(&r).contains("brightness_ac = 1"), "{}", stored(&r));
+        unplug(&r, true);
+        r.d.tick().await;
+        assert!(!acalls(&r).contains(&"set_brightness 3".to_string()), "must not jump back to 3: {:?}", acalls(&r));
+    }
+
+    #[tokio::test]
+    async fn failed_dim_does_not_stick() {
+        let r = light_rig(true, FakeAura::default(), "");
+        *r.aura.fail.lock().unwrap() = true;
+        assert!(!r.d.handle(Request::KbdIdle).await.ok);
+        *r.aura.fail.lock().unwrap() = false;
+        assert!(r.d.handle(Request::KbdIdle).await.ok);
+        assert_eq!(acalls(&r).last().unwrap(), "set_brightness 0");
+    }
+
+    #[tokio::test]
+    async fn resume_keeps_level_changed_while_dimmed() {
+        let r = light_rig(true, FakeAura::default(), "");
+        assert!(r.d.handle(Request::KbdIdle).await.ok);
+        set_brightness_sysfs(&r, "2"); // Fn press woke it
+        assert!(r.d.handle(Request::KbdResume).await.ok);
+        assert_eq!(acalls(&r), ["set_brightness 0"], "resume must not overwrite the user's choice");
     }
 }
