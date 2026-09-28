@@ -134,22 +134,30 @@ impl Daemon {
         Response::ok(serde_json::to_value(self.refresh().await).unwrap())
     }
 
-    /// Collects a fresh snapshot and publishes it to subscribers only if it changed.
+    /// Collects a fresh snapshot (no NVML) and publishes it to subscribers only if it changed.
     pub async fn refresh(&self) -> Snapshot {
-        let mode = self.mode.get();
-        let mut s = collect(&*self.sys, &*self.gfx, &*self.svc, &*self.nv, mode).await;
-        s.config_error = self.config_error.clone();
-        s.perf.undervolt = self.uv.lock().unwrap().map(|unlocked| UndervoltState { unlocked });
+        let s = self.snapshot(false).await;
         self.snap.send_if_modified(|cur| {
             if cur.as_ref() == Some(&s) { false } else { *cur = Some(s.clone()); true }
         });
         s
     }
 
+    async fn snapshot(&self, gpu_detail: bool) -> Snapshot {
+        let mode = self.mode.get();
+        let mut s = collect(&*self.sys, &*self.gfx, &*self.svc, &*self.nv, mode, gpu_detail).await;
+        s.config_error = self.config_error.clone();
+        s.perf.undervolt = self.uv.lock().unwrap().map(|unlocked| UndervoltState { unlocked });
+        s
+    }
+
     pub async fn handle(&self, req: Request) -> Response {
         match req {
             Request::Ping => Response::ok("pong".into()),
-            Request::Status => Response::ok(serde_json::to_value(self.refresh().await).unwrap()),
+            Request::Status => {
+                self.refresh().await;
+                Response::ok(serde_json::to_value(self.snapshot(true).await).unwrap())
+            }
             Request::Subscribe => Response::ok(serde_json::Value::Null),
             Request::Takeover | Request::Handback => {
                 let result = {
@@ -693,5 +701,17 @@ mod tests {
         r.d.tick().await;
         assert!(!r.svc.calls.lock().unwrap().iter().any(|c| c.contains("undervolt set")));
         assert_eq!(r.d.refresh().await.perf.undervolt, Some(armoury_proto::UndervoltState { unlocked: false }));
+    }
+
+    #[tokio::test]
+    async fn poll_never_reads_nvml() {
+        // measured: 2 s NVML polling kept the dGPU awake indefinitely
+        let r = rig_with_nv("", "locked\n");
+        *r.nv.active.lock().unwrap() = Some(true);
+        for _ in 0..3 { r.d.tick().await; }
+        assert_eq!(r.nv.status_reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let v = r.d.handle(Request::Status).await.data.unwrap();
+        assert_eq!(v["gpu"]["nvidia"]["core_mhz"], 1500, "explicit status still reports NVIDIA details");
+        assert_eq!(r.nv.status_reads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
