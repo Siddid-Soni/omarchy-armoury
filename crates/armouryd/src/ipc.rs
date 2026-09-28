@@ -374,17 +374,18 @@ mod tests {
         assert!(r.expect("status blocked by control lock").ok);
     }
 
-    struct Rig { d: Arc<Daemon>, sys: Arc<FakeSysfs>, asusd: Arc<FakeAsusd>, dir: tempfile::TempDir }
+    struct Rig { d: Arc<Daemon>, sys: Arc<FakeSysfs>, asusd: Arc<FakeAsusd>, svc: Arc<FakeServices>, dir: tempfile::TempDir }
 
     fn rig(active: bool) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let sys = Arc::new(FakeSysfs::with(&[("sys/firmware/acpi/platform_profile", "balanced")]));
         let asusd = Arc::new(FakeAsusd::default());
+        let svc = Arc::new(FakeServices::default());
         let mut ctl = Control::load(dir.path());
         if active { ctl.set(ControlMode::Active).unwrap(); }
-        let d = Daemon::new(Box::new(sys.clone()), Box::new(FakeGfx::default()), Box::new(FakeServices::default()),
+        let d = Daemon::new(Box::new(sys.clone()), Box::new(FakeGfx::default()), Box::new(svc.clone()),
             Box::new(asusd.clone()), ctl, dir.path().join("config.toml"));
-        Rig { d, sys, asusd, dir }
+        Rig { d, sys, asusd, svc, dir }
     }
 
     fn set_mode(profile: &str, pl1: i32, pl2: i32) -> Request {
@@ -398,7 +399,11 @@ mod tests {
         assert!(!resp.ok && resp.error.unwrap().contains("observe"));
         r.sys.files.lock().unwrap().insert("sys/firmware/acpi/platform_profile".into(), "performance".into());
         r.d.tick().await;
-        assert!(r.asusd.calls.lock().unwrap().is_empty());
+        assert!(r.asusd.calls.lock().unwrap().is_empty() && r.svc.calls.lock().unwrap().is_empty());
+    }
+
+    fn limit_calls(r: &Rig) -> Vec<String> {
+        r.svc.calls.lock().unwrap().iter().filter(|c| c.contains("set-limits")).cloned().collect()
     }
 
     #[tokio::test]
@@ -407,7 +412,7 @@ mod tests {
         r.d.tick().await; // first tick records current profile (nothing stored yet)
         let resp = r.d.handle(set_mode("balanced", 60, 80)).await;
         assert!(resp.ok, "{resp:?}");
-        assert!(r.asusd.calls.lock().unwrap().contains(&"armoury_set ppt_pl1_spl 60".to_string()));
+        assert!(limit_calls(&r)[0].ends_with("set-limits pl1=60 pl2=80"), "{:?}", limit_calls(&r));
         let text = std::fs::read_to_string(r.dir.path().join("config.toml")).unwrap();
         assert!(text.contains("pl1 = 60"), "{text}");
     }
@@ -417,7 +422,7 @@ mod tests {
         let r = rig(true);
         r.d.tick().await;
         assert!(r.d.handle(set_mode("performance", 120, 150)).await.ok);
-        assert!(!r.asusd.calls.lock().unwrap().iter().any(|c| c.contains("ppt")));
+        assert!(limit_calls(&r).is_empty());
     }
 
     #[tokio::test]
@@ -427,7 +432,7 @@ mod tests {
         assert!(r.d.handle(set_mode("performance", 120, 150)).await.ok);
         r.sys.files.lock().unwrap().insert("sys/firmware/acpi/platform_profile".into(), "performance".into()); // Fn+F5
         r.d.tick().await;
-        assert!(r.asusd.calls.lock().unwrap().contains(&"armoury_set ppt_pl2_sppt 150".to_string()));
+        assert!(limit_calls(&r)[0].ends_with("set-limits pl1=120 pl2=150"), "{:?}", limit_calls(&r));
     }
 
     #[tokio::test]
@@ -436,16 +441,16 @@ mod tests {
         let resp = r.d.handle(set_mode("balanced", 140, 100)).await;
         assert!(resp.error.unwrap().contains("PL1 must not exceed PL2"));
         assert!(!r.dir.path().join("config.toml").exists());
-        assert!(r.asusd.calls.lock().unwrap().is_empty());
+        assert!(limit_calls(&r).is_empty());
     }
 
     #[tokio::test]
     async fn failed_set_does_not_save() {
         let r = rig(true);
         r.d.tick().await;
-        *r.asusd.fail_on.lock().unwrap() = Some("ppt_pl1_spl".into());
+        *r.svc.fail_on.lock().unwrap() = Some("set-limits".into());
         let resp = r.d.handle(set_mode("balanced", 60, 80)).await;
-        assert!(!resp.ok && resp.error.unwrap().contains("PL1"));
+        assert!(!resp.ok && resp.error.unwrap().contains("power limits"));
         assert!(!r.dir.path().join("config.toml").exists());
     }
 
@@ -467,14 +472,14 @@ mod tests {
         let r = rig(true);
         r.d.tick().await;
         assert!(r.d.handle(set_mode("balanced", 60, 80)).await.ok);
-        r.asusd.calls.lock().unwrap().clear();
+        r.svc.calls.lock().unwrap().clear();
         r.d.config.lock().await.reapply_power_secs = 10;
         tokio::time::advance(Duration::from_secs(5)).await;
         r.d.tick().await;
-        assert!(r.asusd.calls.lock().unwrap().is_empty());
+        assert!(limit_calls(&r).is_empty());
         tokio::time::advance(Duration::from_secs(6)).await;
         r.d.tick().await;
-        assert!(r.asusd.calls.lock().unwrap().contains(&"armoury_set ppt_pl1_spl 60".to_string()));
+        assert_eq!(limit_calls(&r).len(), 1);
     }
 
     #[tokio::test]
@@ -482,14 +487,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.toml"), "[modes.balanced]\npl1 = 45\npl2 = 65\n").unwrap();
         let sys = Arc::new(FakeSysfs::with(&[("sys/firmware/acpi/platform_profile", "balanced")]));
-        let asusd = Arc::new(FakeAsusd::default());
-        *asusd.fail_on.lock().unwrap() = Some("set_ppt_group".into());
+        let svc = FakeServices::default();
+        *svc.fail_on.lock().unwrap() = Some("set-limits".into());
         let mut ctl = Control::load(dir.path());
         ctl.set(ControlMode::Active).unwrap();
-        let d = Daemon::new(Box::new(sys), Box::new(FakeGfx::default()), Box::new(FakeServices::default()),
-            Box::new(asusd), ctl, dir.path().join("config.toml"));
+        let d = Daemon::new(Box::new(sys), Box::new(FakeGfx::default()), Box::new(svc),
+            Box::new(FakeAsusd::default()), ctl, dir.path().join("config.toml"));
         let resp = d.handle(Request::SetProfile { profile: Profile::Balanced }).await;
         let err = resp.error.expect("apply failure must be reported");
-        assert!(err.contains("settings failed") && err.contains("enable tuning"), "{err}");
+        assert!(err.contains("settings failed") && err.contains("power limits"), "{err}");
     }
 }

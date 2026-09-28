@@ -4,7 +4,28 @@ pub const STATE_DIR: &str = "/var/lib/omarchy-armoury";
 pub const BOARD_NAME: &str = "/sys/class/dmi/id/board_name";
 pub const NO_TURBO: &str = "/sys/devices/system/cpu/intel_pstate/no_turbo";
 
-/// `cpu-boost on|off` → value for intel_pstate/no_turbo.
+/// `set-limits KEY=VALUE…` → (sysfs node, value) pairs, in argument order.
+/// Ranges are hard safety caps; armouryd applies the tighter model ranges.
+pub fn parse_limits(args: &[String]) -> Result<Vec<(&'static str, String)>, String> {
+    if args.is_empty() { return Err("set-limits: nothing to set".into()); }
+    args.iter().map(|a| {
+        let (k, v) = a.split_once('=').ok_or_else(|| format!("expected KEY=VALUE, got {a:?}"))?;
+        let int = |lo: i32, hi: i32| -> Result<String, String> {
+            v.parse::<i32>().ok().filter(|n| (lo..=hi).contains(n)).map(|n| n.to_string())
+                .ok_or_else(|| format!("{k} must be {lo}–{hi}, got {v:?}"))
+        };
+        Ok(match k {
+            "pl1" => ("/sys/devices/platform/asus-nb-wmi/ppt_pl1_spl", int(5, 250)?),
+            "pl2" => ("/sys/devices/platform/asus-nb-wmi/ppt_pl2_sppt", int(5, 250)?),
+            "nv_boost" => ("/sys/devices/platform/asus-nb-wmi/nv_dynamic_boost", int(0, 50)?),
+            "nv_temp" => ("/sys/devices/platform/asus-nb-wmi/nv_temp_target", int(60, 95)?),
+            "cpu_boost" => (NO_TURBO, no_turbo_value(v)?.to_string()),
+            other => return Err(format!("unknown limit {other:?}")),
+        })
+    }).collect()
+}
+
+/// `on|off` → value for intel_pstate/no_turbo.
 pub fn no_turbo_value(state: &str) -> Result<&'static str, String> {
     match state {
         "on" => Ok("0"),
@@ -294,9 +315,25 @@ mod host_tests {
     }
 
     #[test]
-    fn cpu_boost_arg() {
-        assert_eq!(no_turbo_value("on"), Ok("0"));
-        assert_eq!(no_turbo_value("off"), Ok("1"));
-        assert!(no_turbo_value("1; rm -rf /").is_err());
+    fn set_limits_maps_to_legacy_nodes() {
+        let args: Vec<String> = ["pl1=120", "pl2=150", "nv_boost=25", "nv_temp=87", "cpu_boost=off"].map(String::from).to_vec();
+        assert_eq!(parse_limits(&args).unwrap(), vec![
+            ("/sys/devices/platform/asus-nb-wmi/ppt_pl1_spl", "120".to_string()),
+            ("/sys/devices/platform/asus-nb-wmi/ppt_pl2_sppt", "150".to_string()),
+            ("/sys/devices/platform/asus-nb-wmi/nv_dynamic_boost", "25".to_string()),
+            ("/sys/devices/platform/asus-nb-wmi/nv_temp_target", "87".to_string()),
+            ("/sys/devices/system/cpu/intel_pstate/no_turbo", "1".to_string()),
+        ]);
+    }
+
+    #[test]
+    fn set_limits_rejects_bad_input() {
+        let bad = |a: &str| parse_limits(&[a.to_string()]).unwrap_err();
+        assert!(bad("pl1=900").contains("pl1"));
+        assert!(bad("pl1=abc").contains("pl1"));
+        assert!(bad("fan=3").contains("unknown"));
+        assert!(bad("cpu_boost=maybe").contains("on|off"));
+        assert!(bad("pl1").contains("KEY=VALUE"));
+        assert!(parse_limits(&[]).unwrap_err().contains("nothing"));
     }
 }

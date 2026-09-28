@@ -4,27 +4,22 @@ use crate::hw::{Asusd, Services, with_retry};
 use armoury_proto::{ModeSettings, Profile};
 
 /// Applies every setting that is Some; keeps going after failures and returns their messages.
+/// Power limits and CPU boost go through one root call to the asus-nb-wmi nodes:
+/// the asus-armoury firmware-attributes driver asusd uses cannot read or write
+/// PPT on every model (ENODEV on the G533ZW).
 pub async fn apply_mode(profile: Profile, s: &ModeSettings, asusd: &dyn Asusd, svc: &dyn Services) -> Vec<String> {
     let mut errors = Vec::new();
-    if Limit::ALL.iter().any(|l| l.value(s).is_some()) {
-        // asusd only writes PPT values while the mode's tuning group is enabled,
-        // and refuses to enable tuning unless the mode's custom fan curves are on.
-        if let Err(e) = with_retry(|| asusd.set_fan_curves_enabled(profile.to_asusd(), true)).await {
-            errors.push(format!("enable fan curves: {e:#}"));
-        }
-        if let Err(e) = with_retry(|| asusd.set_ppt_group(true)).await { errors.push(format!("enable tuning: {e:#}")); }
-        for l in Limit::ALL {
-            if let Some(v) = l.value(s) {
-                if let Err(e) = with_retry(|| asusd.armoury_set(l.attr(), v)).await { errors.push(format!("{}: {e:#}", l.label())); }
-            }
-        }
-    }
     if let Some(epp) = s.epp {
         if let Err(e) = with_retry(|| asusd.set_profile_epp(profile.to_asusd(), epp.to_asusd())).await { errors.push(format!("EPP: {e:#}")); }
     }
+    let mut args: Vec<String> = Limit::ALL.iter().filter_map(|l| Some(format!("{}={}", l.key(), l.value(s)?))).collect();
     if let Some(on) = s.cpu_boost {
-        let arg = if on { "on" } else { "off" };
-        if let Err(e) = svc.run(&[PKEXEC, ROOT_HELPER, "cpu-boost", arg]).await { errors.push(format!("CPU boost: {e:#}")); }
+        args.push(format!("cpu_boost={}", if on { "on" } else { "off" }));
+    }
+    if !args.is_empty() {
+        let mut argv = vec![PKEXEC, ROOT_HELPER, "set-limits"];
+        argv.extend(args.iter().map(String::as_str));
+        if let Err(e) = svc.run(&argv).await { errors.push(format!("power limits: {e:#}")); }
     }
     errors
 }
@@ -43,16 +38,10 @@ mod tests {
     async fn applies_everything_in_order() {
         let (a, s) = (FakeAsusd::default(), FakeServices::default());
         assert!(apply_mode(Profile::Performance, &full(), &a, &s).await.is_empty());
-        assert_eq!(*a.calls.lock().unwrap(), [
-            "set_fan_curves_enabled 1 true",
-            "set_ppt_group true",
-            "armoury_set ppt_pl1_spl 120",
-            "armoury_set ppt_pl2_sppt 150",
-            "armoury_set nv_dynamic_boost 25",
-            "armoury_set nv_temp_target 87",
-            "set_profile_epp 1 1",
+        assert_eq!(*a.calls.lock().unwrap(), ["set_profile_epp 1 1"]);
+        assert_eq!(*s.calls.lock().unwrap(), [
+            format!("{PKEXEC} {ROOT_HELPER} set-limits pl1=120 pl2=150 nv_boost=25 nv_temp=87 cpu_boost=off"),
         ]);
-        assert_eq!(*s.calls.lock().unwrap(), [format!("{PKEXEC} {ROOT_HELPER} cpu-boost off")]);
     }
 
     #[tokio::test]
@@ -65,11 +54,10 @@ mod tests {
     #[tokio::test]
     async fn apply_continues_after_error() {
         let (a, s) = (FakeAsusd::default(), FakeServices::default());
-        *a.fail_on.lock().unwrap() = Some("ppt_pl1_spl".into());
+        *s.fail_on.lock().unwrap() = Some("set-limits".into());
         let errs = apply_mode(Profile::Performance, &full(), &a, &s).await;
         assert_eq!(errs.len(), 1);
-        assert!(errs[0].contains("PL1"), "{errs:?}");
-        assert!(a.calls.lock().unwrap().iter().any(|c| c.contains("nv_temp_target")));
-        assert_eq!(s.calls.lock().unwrap().len(), 1);
+        assert!(errs[0].contains("power limits"), "{errs:?}");
+        assert_eq!(*a.calls.lock().unwrap(), ["set_profile_epp 1 1"], "EPP still applied");
     }
 }

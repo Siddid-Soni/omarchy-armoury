@@ -112,12 +112,7 @@ impl Asusd for FakeAsusd {
         Ok(())
     }
     async fn reset_fan_curves(&self, profile: u32) -> anyhow::Result<()> { self.record(format!("reset_fan_curves {profile}")) }
-    async fn set_ppt_group(&self, enabled: bool) -> anyhow::Result<()> { self.record(format!("set_ppt_group {enabled}")) }
-    async fn set_fan_curves_enabled(&self, profile: u32, enabled: bool) -> anyhow::Result<()> {
-        self.record(format!("set_fan_curves_enabled {profile} {enabled}"))
-    }
     async fn armoury_range(&self, _attr: &str) -> anyhow::Result<(i32, i32)> { Ok((-1, -1)) }
-    async fn armoury_set(&self, attr: &str, value: i32) -> anyhow::Result<()> { self.record(format!("armoury_set {attr} {value}")) }
     async fn set_profile_epp(&self, profile: u32, epp: u32) -> anyhow::Result<()> { self.record(format!("set_profile_epp {profile} {epp}")) }
 }
 
@@ -150,12 +145,12 @@ mod tests {
     async fn fake_asusd_records_and_fails() {
         use crate::hw::Asusd;
         let a = FakeAsusd::default();
-        a.armoury_set("ppt_pl1_spl", 120).await.unwrap();
-        *a.fail_on.lock().unwrap() = Some("pl2".into());
-        assert!(a.armoury_set("ppt_pl2_sppt", 150).await.is_err());
+        a.set_profile_epp(1, 1).await.unwrap();
+        *a.fail_on.lock().unwrap() = Some("epp 0".into());
+        assert!(a.set_profile_epp(0, 3).await.is_err());
         a.curves.lock().unwrap().insert(1, vec![("CPU".into(), [0; 8], [0; 8], true)]);
         assert_eq!(a.fan_curves(1).await.unwrap().len(), 1);
         assert_eq!(a.armoury_range("x").await.unwrap(), (-1, -1));
-        assert_eq!(a.calls.lock().unwrap()[0], "armoury_set ppt_pl1_spl 120");
+        assert_eq!(a.calls.lock().unwrap()[0], "set_profile_epp 1 1");
     }
 }
