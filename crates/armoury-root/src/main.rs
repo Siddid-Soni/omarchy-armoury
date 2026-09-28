@@ -31,6 +31,8 @@ enum Cmd {
         #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Kernel suspend variant: s2idle|deep (resets every boot; armouryd re-applies it)
+    MemSleep { mode: String },
     /// Intel CPU undervolt via the OC mailbox (MSR 0x150)
     Undervolt {
         #[command(subcommand)]
@@ -205,6 +207,8 @@ fn main() {
         Cmd::SetLimits { args } => set_limits(&args),
         Cmd::Undervolt { action } => undervolt(action),
         Cmd::NvClocks { args } => nv_clocks(&args),
+        Cmd::MemSleep { mode } => parse_mem_sleep(&mode).map_err(anyhow::Error::msg)
+            .and_then(|m| { require_active()?; std::fs::write(MEM_SLEEP, m).context("write /sys/power/mem_sleep") }),
     };
     if let Err(e) = r {
         eprintln!("armoury-root: {e:#}");

@@ -3,3 +3,4 @@ pub mod limits;
 pub mod perf;
 pub mod gpu;
 pub mod lighting;
+pub mod clamshell;

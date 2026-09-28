@@ -90,6 +90,11 @@ pub trait Asusd: Send + Sync {
     async fn set_fan_curves_enabled(&self, profile: u32, enabled: bool) -> anyhow::Result<()>;
     async fn armoury_range(&self, attr: &str) -> anyhow::Result<(i32, i32)>;
     async fn set_profile_epp(&self, profile: u32, epp: u32) -> anyhow::Result<()>;
+    async fn set_charge_limit(&self, percent: u8) -> anyhow::Result<()>;
+    async fn one_shot_charge(&self) -> anyhow::Result<()>;
+    /// asusd's own AC/battery profile switching: sets the profile for each given source and enables switching for it.
+    async fn set_source_profiles(&self, ac: Option<u32>, battery: Option<u32>) -> anyhow::Result<()>;
+    async fn armoury_set_value(&self, attr: &str, value: i32) -> anyhow::Result<()>;
 }
 
 #[async_trait::async_trait]
@@ -116,6 +121,10 @@ impl<T: Asusd + ?Sized> Asusd for std::sync::Arc<T> {
     async fn set_fan_curves_enabled(&self, profile: u32, enabled: bool) -> anyhow::Result<()> { (**self).set_fan_curves_enabled(profile, enabled).await }
     async fn armoury_range(&self, attr: &str) -> anyhow::Result<(i32, i32)> { (**self).armoury_range(attr).await }
     async fn set_profile_epp(&self, profile: u32, epp: u32) -> anyhow::Result<()> { (**self).set_profile_epp(profile, epp).await }
+    async fn set_charge_limit(&self, percent: u8) -> anyhow::Result<()> { (**self).set_charge_limit(percent).await }
+    async fn one_shot_charge(&self) -> anyhow::Result<()> { (**self).one_shot_charge().await }
+    async fn set_source_profiles(&self, ac: Option<u32>, battery: Option<u32>) -> anyhow::Result<()> { (**self).set_source_profiles(ac, battery).await }
+    async fn armoury_set_value(&self, attr: &str, value: i32) -> anyhow::Result<()> { (**self).armoury_set_value(attr, value).await }
 }
 
 /// Runs `f` up to twice, each attempt bounded by CALL_TIMEOUT (supergfxd can wedge).

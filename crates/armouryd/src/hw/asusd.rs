@@ -4,6 +4,27 @@ use crate::features::fan::RawCurve;
 #[zbus::proxy(interface = "xyz.ljones.Platform", default_service = "xyz.ljones.Asusd", default_path = "/xyz/ljones")]
 trait Platform {
     fn next_platform_profile(&self) -> zbus::Result<()>;
+    fn one_shot_full_charge(&self) -> zbus::Result<()>;
+    #[zbus(property)]
+    fn charge_control_end_threshold(&self) -> zbus::Result<u8>;
+    #[zbus(property)]
+    fn set_charge_control_end_threshold(&self, value: u8) -> zbus::Result<()>;
+    #[zbus(property)]
+    fn platform_profile_on_ac(&self) -> zbus::Result<u32>;
+    #[zbus(property)]
+    fn set_platform_profile_on_ac(&self, value: u32) -> zbus::Result<()>;
+    #[zbus(property)]
+    fn platform_profile_on_battery(&self) -> zbus::Result<u32>;
+    #[zbus(property)]
+    fn set_platform_profile_on_battery(&self, value: u32) -> zbus::Result<()>;
+    #[zbus(property)]
+    fn change_platform_profile_on_ac(&self) -> zbus::Result<bool>;
+    #[zbus(property)]
+    fn set_change_platform_profile_on_ac(&self, value: bool) -> zbus::Result<()>;
+    #[zbus(property)]
+    fn change_platform_profile_on_battery(&self) -> zbus::Result<bool>;
+    #[zbus(property)]
+    fn set_change_platform_profile_on_battery(&self, value: bool) -> zbus::Result<()>;
     #[zbus(property)]
     fn platform_profile(&self) -> zbus::Result<u32>;
     #[zbus(property)]
@@ -32,6 +53,10 @@ trait FanCurves {
 
 #[zbus::proxy(interface = "xyz.ljones.AsusArmoury", default_service = "xyz.ljones.Asusd")]
 trait Armoury {
+    #[zbus(property)]
+    fn current_value(&self) -> zbus::Result<i32>;
+    #[zbus(property)]
+    fn set_current_value(&self, value: i32) -> zbus::Result<()>;
     #[zbus(property)]
     fn min_value(&self) -> zbus::Result<i32>;
     #[zbus(property)]
@@ -79,6 +104,19 @@ impl Asusd for AsusdClient {
     async fn armoury_range(&self, attr: &str) -> anyhow::Result<(i32, i32)> {
         let a = self.armoury(attr).await?;
         Ok((a.min_value().await?, a.max_value().await?))
+    }
+    async fn set_charge_limit(&self, percent: u8) -> anyhow::Result<()> {
+        Ok(self.platform().await?.set_charge_control_end_threshold(percent).await?)
+    }
+    async fn one_shot_charge(&self) -> anyhow::Result<()> { Ok(self.platform().await?.one_shot_full_charge().await?) }
+    async fn set_source_profiles(&self, ac: Option<u32>, battery: Option<u32>) -> anyhow::Result<()> {
+        let p = self.platform().await?;
+        if let Some(v) = ac { p.set_platform_profile_on_ac(v).await?; p.set_change_platform_profile_on_ac(true).await?; }
+        if let Some(v) = battery { p.set_platform_profile_on_battery(v).await?; p.set_change_platform_profile_on_battery(true).await?; }
+        Ok(())
+    }
+    async fn armoury_set_value(&self, attr: &str, value: i32) -> anyhow::Result<()> {
+        Ok(self.armoury(attr).await?.set_current_value(value).await?)
     }
     async fn set_profile_epp(&self, profile: u32, epp: u32) -> anyhow::Result<()> {
         let p = self.platform().await?;

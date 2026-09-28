@@ -92,6 +92,12 @@ pub fn parse_nv_args(a: &[String]) -> Result<NvArgs, String> {
     })
 }
 
+pub const MEM_SLEEP: &str = "/sys/power/mem_sleep";
+
+pub fn parse_mem_sleep(s: &str) -> Result<&'static str, String> {
+    match s { "s2idle" => Ok("s2idle"), "deep" => Ok("deep"), other => Err(format!("mem-sleep takes s2idle|deep, got {other:?}")) }
+}
+
 /// `on|off` → value for intel_pstate/no_turbo.
 pub fn no_turbo_value(state: &str) -> Result<&'static str, String> {
     match state {
@@ -455,5 +461,12 @@ mod host_tests {
         assert!(a(&["0", "0", "50", "off"]).unwrap_err().contains("lock"));
         assert!(a(&["0", "0", "off"]).unwrap_err().contains("4"));
         assert!(a(&["x", "0", "off", "off"]).is_err());
+    }
+
+    #[test]
+    fn mem_sleep_arg() {
+        assert_eq!(parse_mem_sleep("deep"), Ok("deep"));
+        assert_eq!(parse_mem_sleep("s2idle"), Ok("s2idle"));
+        assert!(parse_mem_sleep("s2idle; reboot").is_err());
     }
 }

@@ -267,6 +267,12 @@ impl Asusd for FakeAsusd {
     }
     async fn armoury_range(&self, _attr: &str) -> anyhow::Result<(i32, i32)> { Ok((-1, -1)) }
     async fn set_profile_epp(&self, profile: u32, epp: u32) -> anyhow::Result<()> { self.record(format!("set_profile_epp {profile} {epp}")) }
+    async fn set_charge_limit(&self, percent: u8) -> anyhow::Result<()> { self.record(format!("set_charge_limit {percent}")) }
+    async fn one_shot_charge(&self) -> anyhow::Result<()> { self.record("one_shot_charge".into()) }
+    async fn set_source_profiles(&self, ac: Option<u32>, battery: Option<u32>) -> anyhow::Result<()> {
+        self.record(format!("set_source_profiles {ac:?} {battery:?}"))
+    }
+    async fn armoury_set_value(&self, attr: &str, value: i32) -> anyhow::Result<()> { self.record(format!("armoury_set_value {attr} {value}")) }
 }
 
 #[cfg(test)]
@@ -327,5 +333,16 @@ mod tests {
         a.set_brightness(1).await.unwrap();
         assert_eq!(*a.brightness.lock().unwrap(), 1);
         assert_eq!(a.calls.lock().unwrap()[0], "set_brightness 1");
+    }
+
+    #[tokio::test]
+    async fn fake_asusd_system_calls() {
+        use crate::hw::Asusd;
+        let a = FakeAsusd::default();
+        a.set_charge_limit(80).await.unwrap();
+        a.one_shot_charge().await.unwrap();
+        a.set_source_profiles(Some(1), None).await.unwrap();
+        a.armoury_set_value("panel_overdrive", 0).await.unwrap();
+        assert_eq!(*a.calls.lock().unwrap(), ["set_charge_limit 80", "one_shot_charge", "set_source_profiles Some(1) None", "armoury_set_value panel_overdrive 0"]);
     }
 }
