@@ -1,0 +1,142 @@
+import QtQuick
+import qs.Commons
+import qs.Ui
+
+Flickable {
+  id: root
+  property var client: null
+  property color fg: Color.foreground
+  property string fontFamily: Style.font.family
+
+  readonly property var snap: client ? client.snap : null
+  readonly property var sys: snap ? (snap.system || {}) : {}
+  readonly property bool usable: client && client.active
+  property var cfg: ({})
+  property var panel: null      // built-in display from a detail Status (Hyprland)
+  property int gamma: 100
+
+  contentHeight: col.implicitHeight
+  clip: true
+
+  function reload() {
+    client.call({ cmd: "config" }, function(r) { if (r.ok) root.cfg = r.data })
+    client.call({ cmd: "status" }, function(r) {
+      if (!r.ok) return
+      var d = r.data.display || []
+      root.panel = null
+      for (var i = 0; i < d.length; i++) if (String(d[i].output).indexOf("eDP") === 0) root.panel = d[i]
+    })
+  }
+  Component.onCompleted: reload()
+
+  readonly property var rateOptions: {
+    var out = []
+    var rs = root.panel ? (root.panel.rates || []) : []
+    for (var i = 0; i < rs.length; i++) out.push({ label: Math.round(rs[i]) + " Hz", value: Math.round(rs[i]) })
+    return out
+  }
+  readonly property var modeOptions: [{ label: "Silent", value: "quiet" }, { label: "Balanced", value: "balanced" }, { label: "Turbo", value: "performance" }]
+  function onOff(v) { return [{ label: "On", value: true }, { label: "Off", value: false }] }
+
+  Column {
+    id: col
+    width: Math.min(root.width, Style.space(640))
+    spacing: Style.space(16)
+
+    Section { text: "DISPLAY"; fg: root.fg }
+    Text {
+      visible: !root.panel
+      text: "Built-in panel not reachable (lid closed or Hyprland not running)."
+      color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall
+    }
+    ChoiceRow {
+      visible: !!root.panel
+      fg: root.fg
+      label: "Refresh rate now"
+      usable: root.usable
+      options: root.rateOptions
+      value: root.panel ? Math.round(root.panel.refresh_hz) : undefined
+      onChosen: function(v) { root.client.run({ cmd: "set_refresh", hz: v }, function() { root.reload() }) }
+    }
+    ChoiceRow {
+      visible: !!root.panel
+      fg: root.fg
+      label: "On AC"
+      usable: root.usable
+      options: root.rateOptions
+      value: root.cfg.system && root.cfg.system.refresh_ac ? Math.round(root.cfg.system.refresh_ac) : undefined
+      onChosen: function(v) { root.client.run({ cmd: "set_source_refresh", ac: v }, function() { root.reload() }) }
+    }
+    ChoiceRow {
+      visible: !!root.panel
+      fg: root.fg
+      label: "On battery"
+      usable: root.usable
+      options: root.rateOptions
+      value: root.cfg.system && root.cfg.system.refresh_battery ? Math.round(root.cfg.system.refresh_battery) : undefined
+      onChosen: function(v) { root.client.run({ cmd: "set_source_refresh", battery: v }, function() { root.reload() }) }
+    }
+    ChoiceRow {
+      fg: root.fg
+      label: "Panel Overdrive"
+      visible: root.sys.panel_od !== undefined && root.sys.panel_od !== null
+      usable: root.usable
+      options: root.onOff()
+      value: root.sys.panel_od
+      onChosen: function(v) { root.client.run({ cmd: "set_toggle", toggle: "panel_od", on: v }) }
+    }
+    ValueSlider {
+      fg: root.fg
+      label: "Gamma (needs Omarchy night light / hyprsunset)"
+      unit: "%"
+      minimum: 20
+      maximum: 100
+      value: root.gamma
+      usable: root.usable
+      onCommitted: function(v) { root.gamma = v; root.client.run({ cmd: "set_gamma", percent: v }) }
+    }
+
+    Section { text: "POWER SOURCE"; fg: root.fg }
+    ChoiceRow {
+      fg: root.fg
+      label: "Mode on AC"
+      usable: root.usable
+      options: root.modeOptions
+      onChosen: function(v) { root.client.run({ cmd: "set_source_profile", ac: v }) }
+    }
+    ChoiceRow {
+      fg: root.fg
+      label: "Mode on battery"
+      usable: root.usable
+      options: root.modeOptions
+      onChosen: function(v) { root.client.run({ cmd: "set_source_profile", battery: v }) }
+    }
+
+    Section { text: "SYSTEM"; fg: root.fg }
+    ChoiceRow {
+      fg: root.fg
+      label: "Sleep mode"
+      usable: root.usable
+      options: (root.sys.sleep_modes || []).map(function(m) { return { label: m === "s2idle" ? "s2idle (modern standby)" : "deep (S3)", value: m } })
+      value: root.sys.mem_sleep
+      onChosen: function(v) { root.client.run({ cmd: "set_sleep_mode", mode: v }) }
+    }
+    ChoiceRow {
+      fg: root.fg
+      label: "Lid closed stays awake on AC"
+      usable: root.usable
+      options: root.onOff()
+      value: root.sys.clamshell === true
+      onChosen: function(v) { root.client.run({ cmd: "set_toggle", toggle: "clamshell", on: v }) }
+    }
+    ChoiceRow {
+      fg: root.fg
+      label: "Boot sound"
+      visible: root.sys.boot_sound !== undefined && root.sys.boot_sound !== null
+      usable: root.usable
+      options: root.onOff()
+      value: root.sys.boot_sound
+      onChosen: function(v) { root.client.run({ cmd: "set_toggle", toggle: "boot_sound", on: v }) }
+    }
+  }
+}

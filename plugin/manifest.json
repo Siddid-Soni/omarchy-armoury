@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "asus.armoury",
+  "name": "Armoury",
+  "version": "0.2.0",
+  "author": "siddid",
+  "license": "MIT",
+  "description": "ASUS ROG control for Omarchy: performance modes, fans, power limits, lighting, battery, display and GPU, backed by armouryd.",
+  "kinds": ["bar-widget", "panel"],
+  "entryPoints": {
+    "barWidget": "Widget.qml",
+    "panel": "Window.qml"
+  },
+  "barWidget": {
+    "displayName": "Armoury",
+    "description": "ASUS performance mode, GPU, quick toggles and status",
+    "category": "System",
+    "allowMultiple": false,
+    "defaults": {
+      "kbdIdleSeconds": 60,
+      "showTemperature": true
+    },
+    "schema": [
+      { "key": "kbdIdleSeconds", "type": "integer", "label": "Dim keyboard after idle (seconds, 0 = never)", "min": 0, "max": 3600, "step": 10, "defaultValue": 60 },
+      { "key": "showTemperature", "type": "enum", "label": "Show CPU temperature in the bar", "options": ["true", "false"], "defaultValue": "true" }
+    ]
+  }
+}
