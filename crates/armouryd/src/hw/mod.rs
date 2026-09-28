@@ -22,6 +22,17 @@ pub trait Gfx: Send + Sync {
     async fn supported(&self) -> anyhow::Result<Vec<u32>>;
     async fn pending_mode(&self) -> anyhow::Result<u32>;
     async fn power(&self) -> anyhow::Result<u32>;
+    /// supergfxd SetMode; returns its user-action code (1 = reboot required).
+    async fn set_mode(&self, mode: u32) -> anyhow::Result<u32>;
+}
+
+#[async_trait::async_trait]
+impl<T: Gfx + ?Sized> Gfx for std::sync::Arc<T> {
+    async fn mode(&self) -> anyhow::Result<u32> { (**self).mode().await }
+    async fn supported(&self) -> anyhow::Result<Vec<u32>> { (**self).supported().await }
+    async fn pending_mode(&self) -> anyhow::Result<u32> { (**self).pending_mode().await }
+    async fn power(&self) -> anyhow::Result<u32> { (**self).power().await }
+    async fn set_mode(&self, mode: u32) -> anyhow::Result<u32> { (**self).set_mode(mode).await }
 }
 
 /// The NVIDIA dGPU. Implementations must not touch the device unless it is already awake.

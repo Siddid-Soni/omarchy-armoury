@@ -35,10 +35,11 @@ pub struct FakeGfx {
     pub pending: u32,
     pub power: u32,
     pub wedged: bool,
+    pub set_calls: Mutex<Vec<u32>>,
 }
 
 impl Default for FakeGfx {
-    fn default() -> Self { Self { mode: 0, supported: vec![1, 0, 3, 5], pending: 6, power: 1, wedged: false } }
+    fn default() -> Self { Self { mode: 0, supported: vec![1, 0, 3, 5], pending: 6, power: 1, wedged: false, set_calls: Mutex::new(Vec::new()) } }
 }
 
 impl FakeGfx {
@@ -51,6 +52,11 @@ impl Gfx for FakeGfx {
     async fn supported(&self) -> anyhow::Result<Vec<u32>> { self.gate().await; Ok(self.supported.clone()) }
     async fn pending_mode(&self) -> anyhow::Result<u32> { self.gate().await; Ok(self.pending) }
     async fn power(&self) -> anyhow::Result<u32> { self.gate().await; Ok(self.power) }
+    async fn set_mode(&self, mode: u32) -> anyhow::Result<u32> {
+        self.gate().await;
+        self.set_calls.lock().unwrap().push(mode);
+        Ok(1)
+    }
 }
 
 #[derive(Default)]
@@ -189,5 +195,13 @@ mod tests {
         assert_eq!(a.fan_curves(1).await.unwrap().len(), 1);
         assert_eq!(a.armoury_range("x").await.unwrap(), (-1, -1));
         assert_eq!(a.calls.lock().unwrap()[0], "set_profile_epp 1 1");
+    }
+
+    #[tokio::test]
+    async fn fake_gfx_set_mode() {
+        use crate::hw::Gfx;
+        let g = FakeGfx::default();
+        assert_eq!(g.set_mode(5).await.unwrap(), 1);
+        assert_eq!(*g.set_calls.lock().unwrap(), [5]);
     }
 }

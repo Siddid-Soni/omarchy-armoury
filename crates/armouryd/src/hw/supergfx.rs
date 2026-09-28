@@ -10,6 +10,7 @@ trait Supergfx {
     fn supported(&self) -> zbus::Result<Vec<u32>>;
     fn pending_mode(&self) -> zbus::Result<u32>;
     fn power(&self) -> zbus::Result<u32>;
+    fn set_mode(&self, mode: u32) -> zbus::Result<u32>;
 }
 
 pub struct SupergfxClient {
@@ -29,4 +30,5 @@ impl Gfx for SupergfxClient {
     async fn supported(&self) -> anyhow::Result<Vec<u32>> { Ok(self.proxy.supported().await?) }
     async fn pending_mode(&self) -> anyhow::Result<u32> { Ok(self.proxy.pending_mode().await?) }
     async fn power(&self) -> anyhow::Result<u32> { Ok(self.proxy.power().await?) }
+    async fn set_mode(&self, mode: u32) -> anyhow::Result<u32> { Ok(self.proxy.set_mode(mode).await?) }
 }
