@@ -59,10 +59,17 @@ pub struct FakeServices {
     pub running: Mutex<HashSet<String>>,
     pub active_units: Mutex<HashSet<String>>,
     pub fail_on: Mutex<Option<String>>,
+    /// Canned stdout for `output`, keyed by a substring of the command.
+    pub outputs: Mutex<HashMap<String, String>>,
 }
 
 #[async_trait::async_trait]
 impl Services for FakeServices {
+    async fn output(&self, argv: &[&str]) -> anyhow::Result<String> {
+        self.run(argv).await?;
+        let joined = argv.join(" ");
+        Ok(self.outputs.lock().unwrap().iter().find(|(k, _)| joined.contains(k.as_str())).map(|(_, v)| v.clone()).unwrap_or_default())
+    }
     async fn run(&self, argv: &[&str]) -> anyhow::Result<()> {
         let joined = argv.join(" ");
         self.calls.lock().unwrap().push(joined.clone());

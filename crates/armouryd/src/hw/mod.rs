@@ -39,6 +39,8 @@ pub const GHELPER_UNIT: &str = "app-ghelper@autostart.service";
 #[async_trait::async_trait]
 pub trait Services: Send + Sync {
     async fn run(&self, argv: &[&str]) -> anyhow::Result<()>;
+    /// Like run, returning stdout.
+    async fn output(&self, argv: &[&str]) -> anyhow::Result<String>;
     async fn is_running(&self, process: &str) -> bool;
     async fn unit_active(&self, unit: &str, user: bool) -> bool;
 }
@@ -58,6 +60,7 @@ pub trait Asusd: Send + Sync {
 #[async_trait::async_trait]
 impl<T: Services + ?Sized> Services for std::sync::Arc<T> {
     async fn run(&self, argv: &[&str]) -> anyhow::Result<()> { (**self).run(argv).await }
+    async fn output(&self, argv: &[&str]) -> anyhow::Result<String> { (**self).output(argv).await }
     async fn is_running(&self, process: &str) -> bool { (**self).is_running(process).await }
     async fn unit_active(&self, unit: &str, user: bool) -> bool { (**self).unit_active(unit, user).await }
 }

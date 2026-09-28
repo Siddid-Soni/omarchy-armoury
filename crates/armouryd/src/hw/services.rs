@@ -13,6 +13,10 @@ impl Default for RealServices {
 #[async_trait::async_trait]
 impl Services for RealServices {
     async fn run(&self, argv: &[&str]) -> anyhow::Result<()> {
+        self.output(argv).await.map(|_| ())
+    }
+
+    async fn output(&self, argv: &[&str]) -> anyhow::Result<String> {
         let (prog, args) = argv.split_first().context("empty argv")?;
         let child = Command::new(prog).args(args).kill_on_drop(true).output();
         let out = tokio::time::timeout(self.timeout, child).await
@@ -21,7 +25,7 @@ impl Services for RealServices {
         if !out.status.success() {
             bail!("{} failed ({}): {}", argv.join(" "), out.status, String::from_utf8_lossy(&out.stderr).trim());
         }
-        Ok(())
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     async fn is_running(&self, process: &str) -> bool {
