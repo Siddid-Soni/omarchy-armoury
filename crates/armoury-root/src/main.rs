@@ -4,6 +4,8 @@ use clap::{Parser, Subcommand};
 use std::path::Path;
 use std::process::Command;
 
+mod msr;
+
 #[derive(Parser)]
 #[command(name = "armoury-root", about = "Privileged helper for omarchy-armoury (fixed command set)")]
 struct Cli {
@@ -23,6 +25,22 @@ enum Cmd {
     AsusdSupportRestore,
     /// Write power limits / CPU boost: pl1= pl2= nv_boost= nv_temp= cpu_boost=on|off
     SetLimits { args: Vec<String> },
+    /// Intel CPU undervolt via the OC mailbox (MSR 0x150)
+    Undervolt {
+        #[command(subcommand)]
+        action: UvAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum UvAction {
+    /// Write -5 mV, read it back, restore 0; prints unlocked|locked
+    Probe,
+    /// Set core+cache offset (-150..0 mV)
+    Set {
+        #[arg(allow_hyphen_values = true)]
+        mv: String,
+    },
 }
 
 fn systemctl(args: &[&str]) -> anyhow::Result<()> {
@@ -98,11 +116,37 @@ fn asusd_support_restore() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn set_limits(args: &[String]) -> anyhow::Result<()> {
-    let pairs = parse_limits(args).map_err(anyhow::Error::msg)?;
-    let uid = std::env::var("PKEXEC_UID").ok().and_then(|u| u.parse().ok()).context("set-limits must be run via pkexec")?;
+/// Hardware-writing commands only run while the calling user's armouryd is active.
+fn require_active() -> anyhow::Result<()> {
+    let uid = std::env::var("PKEXEC_UID").ok().and_then(|u| u.parse().ok()).context("must be run via pkexec")?;
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))?.context("unknown calling user")?;
     if !active_flag(&user.dir).exists() { bail!("armouryd is not in active mode; run 'armoury takeover' first"); }
+    Ok(())
+}
+
+fn undervolt(action: UvAction) -> anyhow::Result<()> {
+    if let UvAction::Set { mv } = &action { parse_uv(mv).map_err(anyhow::Error::msg)?; }
+    require_active()?;
+    let msr = msr::Msr::open()?;
+    match action {
+        UvAction::Probe => {
+            let (core, _) = msr.set_uv(-5)?;
+            msr.set_uv(0)?;
+            println!("{}", if uv_matches(-5, core) { "unlocked" } else { "locked" });
+        }
+        UvAction::Set { mv } => {
+            let mv = parse_uv(&mv).map_err(anyhow::Error::msg)?;
+            let (core, cache) = msr.set_uv(mv)?;
+            println!("core={core} cache={cache}");
+            if !uv_matches(mv, core) { bail!("requested {mv} mV, read back {core} mV: undervolt is BIOS-locked"); }
+        }
+    }
+    Ok(())
+}
+
+fn set_limits(args: &[String]) -> anyhow::Result<()> {
+    let pairs = parse_limits(args).map_err(anyhow::Error::msg)?;
+    require_active()?;
     let errors = write_all(&pairs, |node, value| std::fs::write(node, value).map_err(|e| e.to_string()));
     if !errors.is_empty() { bail!("{}", errors.join("; ")); }
     Ok(())
@@ -143,6 +187,7 @@ fn main() {
         Cmd::Handback => handback(&mut RealHost),
         Cmd::AsusdSupportRestore => asusd_support_restore(),
         Cmd::SetLimits { args } => set_limits(&args),
+        Cmd::Undervolt { action } => undervolt(action),
     };
     if let Err(e) = r {
         eprintln!("armoury-root: {e:#}");

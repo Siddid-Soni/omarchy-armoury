@@ -36,6 +36,35 @@ pub fn active_flag(home: &std::path::Path) -> std::path::PathBuf {
     home.join(".local/state/omarchy-armoury/active")
 }
 
+pub const UV_MIN_MV: i32 = -150;
+pub const UV_MAX_MV: i32 = 0;
+/// Intel OC mailbox (voltage offsets); protocol as in g-helper-linux gpu-helper msr_ops.c.
+pub const MSR_OC_MAILBOX: u64 = 0x150;
+
+/// mV → 11-bit two's complement in 1/1.024 mV units, at bits 31:21.
+pub fn uv_encode(mv: i32) -> u32 {
+    let v = (mv as f64 * 1.024).round() as i32;
+    ((v & 0x7FF) as u32) << 21
+}
+
+pub fn uv_decode(low: u32) -> i32 {
+    let mut o = ((low >> 21) & 0x7FF) as i32;
+    if o & 0x400 != 0 { o -= 0x800; }
+    (o as f64 / 1.024).round() as i32
+}
+
+/// Planes: 0 = core, 2 = cache.
+pub fn uv_write_cmd(plane: u64, mv: i32) -> u64 { 0x8000_0011_0000_0000 | (plane << 40) | uv_encode(mv) as u64 }
+pub fn uv_read_cmd(plane: u64) -> u64 { 0x8000_0010_0000_0000 | (plane << 40) }
+
+pub fn parse_uv(s: &str) -> Result<i32, String> {
+    s.parse::<i32>().ok().filter(|v| (UV_MIN_MV..=UV_MAX_MV).contains(v))
+        .ok_or_else(|| format!("undervolt must be an integer {UV_MIN_MV}–{UV_MAX_MV} mV, got {s:?}"))
+}
+
+/// Readback rounds at ~1 mV; a BIOS-locked mailbox reads back 0.
+pub fn uv_matches(requested: i32, readback: i32) -> bool { (requested - readback).abs() <= 3 }
+
 /// `on|off` → value for intel_pstate/no_turbo.
 pub fn no_turbo_value(state: &str) -> Result<&'static str, String> {
     match state {
@@ -368,5 +397,26 @@ mod host_tests {
     #[test]
     fn active_flag_under_home() {
         assert_eq!(active_flag(std::path::Path::new("/home/u")), std::path::Path::new("/home/u/.local/state/omarchy-armoury/active"));
+    }
+
+    #[test]
+    fn uv_encoding_matches_gpu_helper() {
+        // -50 mV: round(-51.2) = -51 → 11-bit 0x7CD → <<21
+        assert_eq!(uv_encode(-50), 0x7CD << 21);
+        assert_eq!(uv_encode(0), 0);
+        assert_eq!(uv_decode(uv_encode(-50)), -50);
+        assert_eq!(uv_decode(uv_encode(-150)), -150);
+        assert_eq!(uv_write_cmd(0, -50), 0x8000_0011_0000_0000 | (0x7CD_u64 << 21));
+        assert_eq!(uv_write_cmd(2, 0), 0x8000_0211_0000_0000);
+        assert_eq!(uv_read_cmd(2), 0x8000_0210_0000_0000);
+    }
+
+    #[test]
+    fn uv_arg_validation() {
+        assert_eq!(parse_uv("-40"), Ok(-40));
+        assert!(parse_uv("-151").is_err());
+        assert!(parse_uv("5").is_err());
+        assert!(parse_uv("-4O").is_err());
+        assert!(uv_matches(-40, -39) && !uv_matches(-40, 0));
     }
 }
