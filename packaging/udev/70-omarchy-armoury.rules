@@ -1,4 +1,5 @@
-# omarchy-armoury: let the logged-in user read the ASUS N-KEY keyboard's input events
+# omarchy-armoury: give the logged-in user read/write access (uaccess ACL) to the ASUS
+# N-KEY keyboard's input events
 # (ROG key = KEY_PROG1, Fn+F5 = KEY_PROG4). uaccess grants an ACL to the active seat
 # user only; nothing is made world-readable.
 SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="ASUSTek Computer Inc. N-KEY Device", TAG+="uaccess"

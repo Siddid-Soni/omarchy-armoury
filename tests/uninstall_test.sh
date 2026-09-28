@@ -36,7 +36,7 @@ check "marker triggers handback" 'grep -q "armoury-root handback" "$T/log"'
 # 4. uninstall removes the udev rule
 setup
 run; rc=$?
-check "udev rule removed" 'grep -q "sudo rm -f .*/etc/udev/rules.d/70-omarchy-armoury.rules" "$T/log" || grep -q "70-omarchy-armoury.rules" "$T/log"'
+check "udev rule removed" 'grep -q "sudo rm -f .*/etc/udev/rules.d/70-omarchy-armoury.rules" "$T/log"'
 
 # 5. the shipped rule only grants the N-KEY keyboard, via uaccess
 check "udev rule scoped to the N-KEY device" 'grep -q "ATTRS{name}==\"ASUSTek Computer Inc. N-KEY Device\"" "$repo/packaging/udev/70-omarchy-armoury.rules" && grep -q "TAG+=\"uaccess\"" "$repo/packaging/udev/70-omarchy-armoury.rules" && ! grep -q "MODE=\"0666\"" "$repo/packaging/udev/70-omarchy-armoury.rules"'

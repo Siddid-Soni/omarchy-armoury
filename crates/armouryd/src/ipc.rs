@@ -153,7 +153,12 @@ impl Daemon {
                 }
             }
             KeyAction::Command => match command {
-                Some(cmd) => if let Err(e) = self.svc.run(&["sh", "-c", &cmd]).await { eprintln!("armouryd: key command: {e:#}"); },
+                // Detached in its own systemd scope: never waited on (a GUI app would block every
+                // hotkey) and not in armouryd's cgroup, so a daemon restart does not kill it.
+                // A failing command only shows as its own exit status.
+                Some(cmd) => if let Err(e) = self.svc.spawn(&["/usr/bin/systemd-run", "--user", "--scope", "--quiet", "--collect", "/bin/sh", "-c", &cmd], "").await {
+                    eprintln!("armouryd: key command: {e:#}");
+                },
                 None => eprintln!("armouryd: key action 'command' has no command configured"),
             },
         }
@@ -1874,7 +1879,8 @@ mod tests {
         let r = sys_rig(true, "[keys]\nrog = \"command\"\nrog_command = \"false\"\n");
         *r.svc.fail_on.lock().unwrap() = Some("sh -c false".into());
         r.d.on_hotkey(armoury_proto::HotKey::Rog).await;
-        assert!(svc_calls(&r).iter().any(|c| c.contains("sh -c false")));
+        // launched detached in its own scope (never waited on, survives armouryd restarts)
+        assert!(svc_calls(&r).iter().any(|c| c.starts_with("spawn ") && c.contains("systemd-run --user --scope") && c.ends_with("/bin/sh -c false")), "{:?}", svc_calls(&r));
         assert!(r.d.handle(Request::Ping).await.ok);
     }
 
