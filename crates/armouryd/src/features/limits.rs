@@ -15,6 +15,10 @@ impl Limit {
     pub fn label(self) -> &'static str {
         match self { Self::Pl1 => "PL1", Self::Pl2 => "PL2", Self::NvBoost => "Dynamic Boost", Self::NvTemp => "GPU temp target" }
     }
+    /// Field name in ModeSettings / JSON.
+    pub fn key(self) -> &'static str {
+        match self { Self::Pl1 => "pl1", Self::Pl2 => "pl2", Self::NvBoost => "nv_boost", Self::NvTemp => "nv_temp" }
+    }
     pub fn value(self, s: &ModeSettings) -> Option<i32> {
         match self { Self::Pl1 => s.pl1, Self::Pl2 => s.pl2, Self::NvBoost => s.nv_boost, Self::NvTemp => s.nv_temp }
     }
