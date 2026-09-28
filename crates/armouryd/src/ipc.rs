@@ -146,7 +146,7 @@ impl Daemon {
             KeyAction::OpenWindow => {
                 let shell = self.omarchy_bin().join("omarchy-shell");
                 // summon exits 0 either way; it prints "ok" only when the panel exists
-                let opened = self.svc.output(&[&shell.to_string_lossy(), "shell", "summon", "asus.armoury.window", "{}"]).await
+                let opened = self.svc.output(&[&shell.to_string_lossy(), "shell", "summon", "asus.armoury", "{}"]).await
                     .is_ok_and(|o| o.trim() == "ok");
                 if !opened {
                     self.osd("Armoury window: coming with the UI").await;
@@ -694,6 +694,15 @@ impl Daemon {
             Request::SetChargeLimit { .. } | Request::OneShotCharge | Request::SetRefresh { .. } | Request::SetGamma { .. }
             | Request::SetToggle { .. } | Request::SetSleepMode { .. } | Request::SetSourceProfile { .. }
             | Request::SetSourceRefresh { .. } => self.system_request(req).await,
+            Request::SetKeepOn { on } => {
+                if let Err(r) = self.write_guard().await { return r; }
+                let mut cfg = self.config.lock().await;
+                cfg.lighting.keep_on = on;
+                match cfg.save(&self.config_path) {
+                    Ok(()) => Response::ok(serde_json::json!({"keep_on": on})),
+                    Err(e) => Response::err(format!("save config: {e}")),
+                }
+            }
             Request::Keys => Response::ok(serde_json::to_value(self.config.lock().await.keys.clone()).unwrap()),
             Request::SetKeyBinding { key, action, command } => {
                 if let Err(r) = self.write_guard().await { return r; }
@@ -1910,5 +1919,21 @@ mod tests {
         r.svc.outputs.lock().unwrap().insert("summon".into(), "unknown\n".into());
         r.d.on_hotkey(armoury_proto::HotKey::Rog).await;
         assert!(svc_calls(&r).iter().any(|c| c.contains("coming with the UI")), "{:?}", svc_calls(&r));
+    }
+
+    #[tokio::test]
+    async fn rog_key_summons_the_plugin_panel() {
+        let r = sys_rig(true, "");
+        r.svc.outputs.lock().unwrap().insert("summon".into(), "ok\n".into());
+        r.d.on_hotkey(armoury_proto::HotKey::Rog).await;
+        assert!(svc_calls(&r).iter().any(|c| c.ends_with("shell summon asus.armoury {}")), "{:?}", svc_calls(&r));
+        assert!(!svc_calls(&r).iter().any(|c| c.contains("omarchy-osd")));
+    }
+
+    #[tokio::test]
+    async fn keep_on_request_saved() {
+        let r = sys_rig(true, "");
+        assert!(r.d.handle(Request::SetKeepOn { on: true }).await.ok);
+        assert!(std::fs::read_to_string(r.dir.path().join("config.toml")).unwrap().contains("keep_on = true"));
     }
 }
