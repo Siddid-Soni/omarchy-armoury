@@ -145,7 +145,10 @@ impl Daemon {
             }
             KeyAction::OpenWindow => {
                 let shell = self.omarchy_bin().join("omarchy-shell");
-                if self.svc.run(&[&shell.to_string_lossy(), "shell", "summon", "asus.armoury.window", "{}"]).await.is_err() {
+                // summon exits 0 either way; it prints "ok" only when the panel exists
+                let opened = self.svc.output(&[&shell.to_string_lossy(), "shell", "summon", "asus.armoury.window", "{}"]).await
+                    .is_ok_and(|o| o.trim() == "ok");
+                if !opened {
                     self.osd("Armoury window: coming with the UI").await;
                 }
             }
@@ -1892,5 +1895,14 @@ mod tests {
         let r = light_rig(true, FakeAura::default(), "[keys]\nrog = \"cycle_brightness\"\n");
         r.d.on_hotkey(armoury_proto::HotKey::Rog).await; // at 3 → 0
         assert_eq!(acalls(&r).last().unwrap(), "set_brightness 0");
+    }
+
+    #[tokio::test]
+    async fn rog_key_osd_when_shell_reports_unknown_plugin() {
+        // measured: `omarchy-shell shell summon <missing>` prints "unknown" and exits 0
+        let r = sys_rig(true, "");
+        r.svc.outputs.lock().unwrap().insert("summon".into(), "unknown\n".into());
+        r.d.on_hotkey(armoury_proto::HotKey::Rog).await;
+        assert!(svc_calls(&r).iter().any(|c| c.contains("coming with the UI")), "{:?}", svc_calls(&r));
     }
 }
