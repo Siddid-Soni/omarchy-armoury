@@ -38,7 +38,17 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<FanAction>,
     },
-    /// Show or edit a mode's power limits, EPP and CPU boost
+    /// CPU undervolt availability
+    Undervolt {
+        #[command(subcommand)]
+        action: UvAction,
+    },
+    /// NVIDIA dGPU information
+    Gpu {
+        #[command(subcommand)]
+        action: GpuAction,
+    },
+    /// Show or edit a mode's power limits, EPP, CPU boost, undervolt and GPU clocks
     Mode {
         #[arg(value_parser = parse_profile)]
         profile: Profile,
@@ -82,7 +92,39 @@ enum ModeAction {
         epp: Option<Epp>,
         #[arg(long, value_parser = ["on", "off"])]
         cpu_boost: Option<String>,
+        /// CPU undervolt, mV (-150..0; applied only if the BIOS allows it)
+        #[arg(long, allow_hyphen_values = true)]
+        uv: Option<i32>,
+        /// GPU core clock offset, MHz
+        #[arg(long, allow_hyphen_values = true)]
+        gpu_core: Option<i32>,
+        /// GPU memory clock offset, MHz
+        #[arg(long, allow_hyphen_values = true)]
+        gpu_mem: Option<i32>,
+        /// Max GPU core clock, MHz, or off
+        #[arg(long, value_parser = parse_lock)]
+        gpu_core_lock: Option<u32>,
+        /// Max GPU memory clock, MHz, or off
+        #[arg(long, value_parser = parse_lock)]
+        gpu_mem_lock: Option<u32>,
     },
+}
+
+#[derive(Subcommand)]
+enum UvAction {
+    /// Re-check whether the BIOS allows undervolting
+    Probe,
+}
+
+#[derive(Subcommand)]
+enum GpuAction {
+    /// Processes keeping the dGPU awake
+    Users,
+}
+
+fn parse_lock(s: &str) -> Result<u32, String> {
+    if s == "off" { return Ok(0); }
+    s.parse().map_err(|_| format!("expected MHz or off, got {s:?}"))
 }
 
 fn parse_profile(s: &str) -> Result<Profile, String> {
@@ -153,8 +195,21 @@ fn summary(s: &Snapshot) -> String {
         if let Some(w) = p.power_draw_w { parts.push(format!("{w:.1} W")); }
         parts.join(" · ")
     };
+    let dgpu = match (s.gpu.dgpu_active, &s.gpu.nvidia) {
+        (Some(true), Some(n)) => {
+            let users = s.gpu.users.len();
+            let mut line = format!("active · {}/{} MHz · {}°C · {:.1} W", n.core_mhz, n.mem_mhz, n.temp_c, n.power_w);
+            if n.core_offset != 0 { line.push_str(&format!(" · offset {:+}", n.core_offset)); }
+            line.push_str(&format!(" · {users} user{}", if users == 1 { "" } else { "s" }));
+            line
+        }
+        (Some(true), None) => "active".into(),
+        (Some(false), _) => "suspended".into(),
+        (None, _) => "-".into(),
+    };
+    let uv = match s.perf.undervolt { Some(u) if u.unlocked => "unlocked", Some(_) => "locked", None => "-" };
     format!(
-        "Model      {}\nControl    {control}\nProfile    {}\nMode       {perf}\nGPU        {gpu}{pending}\nKeystone   {keystone}\nBattery    {battery}\nasusd      {}\nG-Helper   {}\n",
+        "Model      {}\nControl    {control}\nProfile    {}\nMode       {perf}\nUndervolt  {uv}\nGPU        {gpu}{pending}\ndGPU       {dgpu}\nKeystone   {keystone}\nBattery    {battery}\nasusd      {}\nG-Helper   {}\n",
         opt(s.model.clone()),
         opt(s.platform_profile.clone()),
         if s.asusd_running { "running" } else { "stopped" },
@@ -175,6 +230,19 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let mut s = connect()?;
             writeln!(s, "{}", serde_json::to_string(&Request::Subscribe)?)?;
             for line in BufReader::new(s).lines().skip(1) { println!("{}", line?); }
+        }
+        Cmd::Undervolt { action: UvAction::Probe } => {
+            let v = call(&Request::ProbeUndervolt)?;
+            println!("{}", if v["unlocked"] == true { "unlocked" } else { "locked" });
+        }
+        Cmd::Gpu { action: GpuAction::Users } => {
+            let s: Snapshot = serde_json::from_value(call(&Request::Status)?)?;
+            match s.gpu.dgpu_active {
+                Some(true) if s.gpu.users.is_empty() => println!("dGPU awake, no user processes"),
+                Some(true) => for u in s.gpu.users { println!("{:>7}  {}", u.pid, u.name) },
+                Some(false) => println!("dGPU suspended (nothing is using it)"),
+                None => println!("no NVIDIA dGPU"),
+            }
         }
         Cmd::Profile { action } => {
             let req = match action {
@@ -202,10 +270,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Cmd::Mode { profile, action } => {
             let req = match action {
                 None => Request::ModeSettings { profile },
-                Some(ModeAction::Set { pl1, pl2, nv_boost, nv_temp, epp, cpu_boost }) => Request::SetModeSettings {
-                    profile,
-                    settings: ModeSettings { pl1, pl2, nv_boost, nv_temp, epp, cpu_boost: cpu_boost.map(|v| v == "on"), ..Default::default() },
-                },
+                Some(ModeAction::Set { pl1, pl2, nv_boost, nv_temp, epp, cpu_boost, uv, gpu_core, gpu_mem, gpu_core_lock, gpu_mem_lock }) => {
+                    Request::SetModeSettings {
+                        profile,
+                        settings: ModeSettings {
+                            pl1, pl2, nv_boost, nv_temp, epp,
+                            cpu_boost: cpu_boost.map(|v| v == "on"),
+                            uv_mv: uv, gpu_core_offset: gpu_core, gpu_mem_offset: gpu_mem, gpu_core_lock, gpu_mem_lock,
+                        },
+                    }
+                }
             };
             println!("{}", serde_json::to_string_pretty(&call(&req)?)?);
         }
@@ -265,5 +339,26 @@ mod tests {
         s.perf.gpu_fan_rpm = Some(5200);
         s.perf.power_draw_w = Some(18.25);
         assert!(summary(&s).contains("Mode       performance · CPU 72°C · fans 3300/5200 rpm · 18.2 W"), "{}", summary(&s));
+    }
+
+    #[test]
+    fn lock_parsing() {
+        assert_eq!(parse_lock("off"), Ok(0));
+        assert_eq!(parse_lock("1500"), Ok(1500));
+        assert!(parse_lock("fast").is_err());
+    }
+
+    #[test]
+    fn summary_gpu_and_undervolt_lines() {
+        let mut s = Snapshot::default();
+        s.gpu.dgpu_active = Some(false);
+        s.perf.undervolt = Some(armoury_proto::UndervoltState { unlocked: false });
+        let out = summary(&s);
+        assert!(out.contains("dGPU       suspended"), "{out}");
+        assert!(out.contains("Undervolt  locked"), "{out}");
+        s.gpu.dgpu_active = Some(true);
+        s.gpu.nvidia = Some(armoury_proto::NvStatus { core_mhz: 1500, mem_mhz: 7000, temp_c: 62, power_w: 35.2, pstate: "Zero".into(), core_offset: 50, ..Default::default() });
+        s.gpu.users = vec![armoury_proto::GpuUser { pid: 1, name: "a".into() }];
+        assert!(summary(&s).contains("dGPU       active · 1500/7000 MHz · 62°C · 35.2 W · offset +50 · 1 user"), "{}", summary(&s));
     }
 }
