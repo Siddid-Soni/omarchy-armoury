@@ -25,20 +25,21 @@ pub struct Daemon {
     snap: watch::Sender<Option<Snapshot>>,
     pub config: Mutex<Config>,
     config_path: PathBuf,
-    /// Last profile whose settings were applied (active mode only).
-    applied: Mutex<Option<Profile>>,
+    /// Serialises every apply (poll tick, SetProfile, SetModeSettings).
+    apply: Mutex<ApplyState>,
+    config_error: Option<String>,
     last_reapply: std::sync::Mutex<tokio::time::Instant>,
 }
 
 impl Daemon {
     pub fn new(sys: Box<dyn Sysfs>, gfx: Box<dyn Gfx>, svc: Box<dyn Services>, asusd: Box<dyn Asusd>, control: Control, config_path: PathBuf) -> Arc<Self> {
-        let (config, config_error) = Config::load(&config_path);
-        if let Some(e) = config_error { eprintln!("armouryd: config ignored, using defaults: {e}"); }
+        let (config, config_error) = load_config(&config_path);
+        if let Some(e) = &config_error { eprintln!("armouryd: {e}"); }
         let mode = control.mode_handle();
         Arc::new(Self {
             sys, gfx, svc, asusd, control: Mutex::new(control), mode, snap: watch::channel(None).0,
-            config: Mutex::new(config), config_path,
-            applied: Mutex::new(None), last_reapply: std::sync::Mutex::new(tokio::time::Instant::now()),
+            config: Mutex::new(config), config_path, config_error,
+            apply: Mutex::new(ApplyState::default()), last_reapply: std::sync::Mutex::new(tokio::time::Instant::now()),
         })
     }
 
@@ -46,25 +47,36 @@ impl Daemon {
     /// profile changed from any source, and re-apply on the configured interval.
     /// Returns the errors from any apply done in this tick.
     pub async fn tick(&self) -> Vec<String> {
+        self.tick_inner(false).await
+    }
+
+    async fn tick_inner(&self, force: bool) -> Vec<String> {
+        // Lock before reading the profile, so a slow poll can never apply a mode
+        // that a concurrent SetProfile has already switched away from.
+        let mut st = self.apply.lock().await;
         let snap = self.refresh().await;
-        if self.mode.get() != ControlMode::Active { return Vec::new(); }
+        if self.mode.get() != ControlMode::Active {
+            *st = ApplyState::default(); // re-apply after the next takeover
+            return Vec::new();
+        }
         let Some(profile) = snap.perf.profile else { return Vec::new() };
-        let mut applied = self.applied.lock().await;
         let (settings, secs) = {
             let cfg = self.config.lock().await;
             (cfg.mode(profile), cfg.reapply_power_secs)
         };
-        let due = secs > 0 && self.last_reapply.lock().unwrap().elapsed() >= Duration::from_secs(secs as u64);
-        if *applied != Some(profile) || due {
-            let errs = apply_mode(profile, &settings, &*self.asusd, &*self.svc).await;
-            for e in &errs {
-                eprintln!("armouryd: apply {}: {e}", profile.sysfs());
-            }
-            *applied = Some(profile);
-            *self.last_reapply.lock().unwrap() = tokio::time::Instant::now();
-            return errs;
+        let now = tokio::time::Instant::now();
+        let due = secs > 0 && now.duration_since(*self.last_reapply.lock().unwrap()) >= Duration::from_secs(secs as u64);
+        if st.applied == Some(profile) && !due { return Vec::new(); }
+        if !force && st.failed == Some(profile) && st.retry_at.is_some_and(|t| now < t) { return Vec::new(); }
+        let errs = apply_mode(profile, &settings, &*self.asusd, &*self.svc).await;
+        if errs.is_empty() {
+            *st = ApplyState { applied: Some(profile), ..Default::default() };
+            *self.last_reapply.lock().unwrap() = now;
+        } else {
+            for e in &errs { eprintln!("armouryd: apply {}: {e}", profile.sysfs()); }
+            *st = ApplyState { applied: None, failed: Some(profile), retry_at: Some(now + RETRY_BACKOFF) };
         }
-        Vec::new()
+        errs
     }
 
     async fn write_guard(&self) -> Result<(), Response> {
@@ -89,7 +101,7 @@ impl Daemon {
 
     async fn snapshot_after(&self, r: anyhow::Result<()>) -> Response {
         if let Err(e) = r { return Response::err(format!("{e:#}")); }
-        let errs = self.tick().await;
+        let errs = self.tick_inner(true).await;
         if !errs.is_empty() {
             return Response::err(format!("mode changed, but its settings failed: {}", errs.join("; ")));
         }
@@ -99,7 +111,8 @@ impl Daemon {
     /// Collects a fresh snapshot and publishes it to subscribers only if it changed.
     pub async fn refresh(&self) -> Snapshot {
         let mode = self.mode.get();
-        let s = collect(&*self.sys, &*self.gfx, &*self.svc, mode).await;
+        let mut s = collect(&*self.sys, &*self.gfx, &*self.svc, mode).await;
+        s.config_error = self.config_error.clone();
         self.snap.send_if_modified(|cur| {
             if cur.as_ref() == Some(&s) { false } else { *cur = Some(s.clone()); true }
         });
@@ -152,11 +165,14 @@ impl Daemon {
             }
             Request::SetModeSettings { profile, settings } => {
                 if let Err(r) = self.write_guard().await { return r; }
+                let mut st = self.apply.lock().await; // check → apply → save as one step
                 let merged = merge(self.config.lock().await.mode(profile), settings);
                 if let Err(e) = limits::validate(&merged, self.bounds().await) { return Response::err(e); }
                 if self.refresh().await.perf.profile == Some(profile) {
-                    let errs = apply_mode(profile, &settings, &*self.asusd, &*self.svc).await;
+                    // apply everything stored, not just the delta, so earlier drift is repaired
+                    let errs = apply_mode(profile, &merged, &*self.asusd, &*self.svc).await;
                     if !errs.is_empty() { return Response::err(errs.join("; ")); }
+                    *st = ApplyState { applied: Some(profile), ..Default::default() };
                 }
                 let mut cfg = self.config.lock().await;
                 cfg.modes.insert(profile, merged);
@@ -216,6 +232,35 @@ impl Daemon {
             tokio::time::sleep(every).await;
         }
     }
+}
+
+const RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct ApplyState {
+    /// Profile whose settings are in force.
+    applied: Option<Profile>,
+    /// Profile whose last apply failed, and when to try it again.
+    failed: Option<Profile>,
+    retry_at: Option<tokio::time::Instant>,
+}
+
+/// Loads config.toml. An unparsable file is moved to config.toml.bad (so the next
+/// save cannot destroy it); modes with out-of-range values are dropped. Either is reported.
+fn load_config(path: &Path) -> (Config, Option<String>) {
+    let (mut config, err) = Config::load(path);
+    if let Some(e) = err {
+        let bad = path.with_extension("toml.bad");
+        let moved = std::fs::rename(path, &bad).is_ok();
+        let where_ = if moved { format!("moved to {}", bad.display()) } else { "ignored".into() };
+        return (config, Some(format!("config.toml was invalid and was {where_}: {e}")));
+    }
+    let mut dropped = Vec::new();
+    config.modes.retain(|p, s| match limits::validate(s, |l| limits::bounds(l, None)) {
+        Ok(()) => true,
+        Err(e) => { dropped.push(format!("[modes.{}] ignored: {e}", p.sysfs())); false }
+    });
+    (config, (!dropped.is_empty()).then(|| format!("config.toml: {}", dropped.join("; "))))
 }
 
 /// Fields present in `new` overwrite `old`.
@@ -412,7 +457,7 @@ mod tests {
         r.d.tick().await; // first tick records current profile (nothing stored yet)
         let resp = r.d.handle(set_mode("balanced", 60, 80)).await;
         assert!(resp.ok, "{resp:?}");
-        assert!(limit_calls(&r)[0].ends_with("set-limits pl1=60 pl2=80"), "{:?}", limit_calls(&r));
+        assert!(limit_calls(&r).last().unwrap().ends_with("set-limits pl1=60 pl2=80 cpu_boost=on"), "{:?}", limit_calls(&r));
         let text = std::fs::read_to_string(r.dir.path().join("config.toml")).unwrap();
         assert!(text.contains("pl1 = 60"), "{text}");
     }
@@ -422,7 +467,7 @@ mod tests {
         let r = rig(true);
         r.d.tick().await;
         assert!(r.d.handle(set_mode("performance", 120, 150)).await.ok);
-        assert!(limit_calls(&r).is_empty());
+        assert!(!limit_calls(&r).iter().any(|c| c.contains("pl1=")), "{:?}", limit_calls(&r));
     }
 
     #[tokio::test]
@@ -432,7 +477,7 @@ mod tests {
         assert!(r.d.handle(set_mode("performance", 120, 150)).await.ok);
         r.sys.files.lock().unwrap().insert("sys/firmware/acpi/platform_profile".into(), "performance".into()); // Fn+F5
         r.d.tick().await;
-        assert!(limit_calls(&r)[0].ends_with("set-limits pl1=120 pl2=150"), "{:?}", limit_calls(&r));
+        assert!(limit_calls(&r).last().unwrap().ends_with("set-limits pl1=120 pl2=150 cpu_boost=on"), "{:?}", limit_calls(&r));
     }
 
     #[tokio::test]
@@ -496,5 +541,70 @@ mod tests {
         let resp = d.handle(Request::SetProfile { profile: Profile::Balanced }).await;
         let err = resp.error.expect("apply failure must be reported");
         assert!(err.contains("settings failed") && err.contains("power limits"), "{err}");
+    }
+
+    fn rig_with_config(toml: &str, active: bool) -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), toml).unwrap();
+        let sys = Arc::new(FakeSysfs::with(&[("sys/firmware/acpi/platform_profile", "balanced")]));
+        let asusd = Arc::new(FakeAsusd::default());
+        let svc = Arc::new(FakeServices::default());
+        let mut ctl = Control::load(dir.path());
+        if active { ctl.set(ControlMode::Active).unwrap(); }
+        let d = Daemon::new(Box::new(sys.clone()), Box::new(FakeGfx::default()), Box::new(svc.clone()),
+            Box::new(asusd.clone()), ctl, dir.path().join("config.toml"));
+        Rig { d, sys, asusd, svc, dir }
+    }
+
+    #[tokio::test]
+    async fn takeover_after_handback_reapplies() {
+        let r = rig_with_config("[modes.balanced]\npl1 = 45\npl2 = 65\n", true);
+        r.d.tick().await;
+        r.d.control.lock().await.set(ControlMode::Observe).unwrap(); // handback
+        r.d.tick().await;
+        r.d.control.lock().await.set(ControlMode::Active).unwrap(); // takeover, same mode
+        r.d.tick().await;
+        assert_eq!(limit_calls(&r).len(), 2, "{:?}", limit_calls(&r));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_apply_retried_after_backoff() {
+        let r = rig_with_config("[modes.balanced]\npl1 = 45\npl2 = 65\n", true);
+        *r.svc.fail_on.lock().unwrap() = Some("set-limits".into());
+        r.d.tick().await;
+        r.d.tick().await;
+        assert_eq!(limit_calls(&r).len(), 1, "no retry inside backoff");
+        *r.svc.fail_on.lock().unwrap() = None;
+        tokio::time::advance(Duration::from_secs(31)).await;
+        r.d.tick().await;
+        assert_eq!(limit_calls(&r).len(), 2, "retried after backoff");
+        r.d.tick().await;
+        assert_eq!(limit_calls(&r).len(), 2, "no re-apply once it worked");
+    }
+
+    #[tokio::test]
+    async fn set_mode_settings_applies_merged() {
+        let r = rig_with_config("[modes.balanced]\npl1 = 45\npl2 = 65\ncpu_boost = false\n", true);
+        let req = serde_json::from_value(serde_json::json!({"cmd":"set_mode_settings","profile":"balanced","settings":{"pl2":60}})).unwrap();
+        assert!(r.d.handle(req).await.ok);
+        assert!(limit_calls(&r).last().unwrap().ends_with("set-limits pl1=45 pl2=60 cpu_boost=off"), "{:?}", limit_calls(&r));
+    }
+
+    #[tokio::test]
+    async fn invalid_config_values_dropped_and_reported() {
+        let r = rig_with_config("[modes.performance]\npl1 = 200\npl2 = 150\n[modes.balanced]\npl1 = 45\npl2 = 65\n", true);
+        assert_eq!(r.d.config.lock().await.mode(Profile::Performance), ModeSettings::default());
+        assert_eq!(r.d.config.lock().await.mode(Profile::Balanced).pl1, Some(45));
+        let s = r.d.refresh().await;
+        assert!(s.config_error.unwrap().contains("performance"));
+    }
+
+    #[tokio::test]
+    async fn corrupt_config_moved_aside_and_reported() {
+        let r = rig_with_config("modes = 7\n", true);
+        assert!(r.dir.path().join("config.toml.bad").exists());
+        assert!(r.d.refresh().await.config_error.unwrap().contains("config.toml.bad"));
+        assert!(r.d.handle(set_mode("balanced", 60, 80)).await.ok);
+        assert_eq!(std::fs::read_to_string(r.dir.path().join("config.toml.bad")).unwrap(), "modes = 7\n");
     }
 }

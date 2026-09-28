@@ -105,6 +105,7 @@ pub struct FanCurve {
 
 /// Per-mode settings; `None` leaves that setting untouched.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModeSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pl1: Option<i32>,
@@ -157,6 +158,9 @@ pub struct Snapshot {
     pub gpu: GpuState,
     pub battery: BatteryState,
     pub perf: PerfState,
+    /// Why config.toml (or part of it) was ignored, if it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_error: Option<String>,
     pub asusd_running: bool,
     pub ghelper_running: bool,
 }

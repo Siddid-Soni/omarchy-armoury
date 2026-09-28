@@ -99,9 +99,12 @@ fn asusd_support_restore() -> anyhow::Result<()> {
 }
 
 fn set_limits(args: &[String]) -> anyhow::Result<()> {
-    for (node, value) in parse_limits(args).map_err(anyhow::Error::msg)? {
-        std::fs::write(node, &value).with_context(|| format!("write {value} to {node}"))?;
-    }
+    let pairs = parse_limits(args).map_err(anyhow::Error::msg)?;
+    let uid = std::env::var("PKEXEC_UID").ok().and_then(|u| u.parse().ok()).context("set-limits must be run via pkexec")?;
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))?.context("unknown calling user")?;
+    if !active_flag(&user.dir).exists() { bail!("armouryd is not in active mode; run 'armoury takeover' first"); }
+    let errors = write_all(&pairs, |node, value| std::fs::write(node, value).map_err(|e| e.to_string()));
+    if !errors.is_empty() { bail!("{}", errors.join("; ")); }
     Ok(())
 }
 

@@ -5,7 +5,7 @@ pub const BOARD_NAME: &str = "/sys/class/dmi/id/board_name";
 pub const NO_TURBO: &str = "/sys/devices/system/cpu/intel_pstate/no_turbo";
 
 /// `set-limits KEY=VALUE…` → (sysfs node, value) pairs, in argument order.
-/// Ranges are hard safety caps; armouryd applies the tighter model ranges.
+/// Hard caps = g-helper-linux's widest non-special-edition ranges (HX Intel: 175 W).
 pub fn parse_limits(args: &[String]) -> Result<Vec<(&'static str, String)>, String> {
     if args.is_empty() { return Err("set-limits: nothing to set".into()); }
     args.iter().map(|a| {
@@ -15,14 +15,25 @@ pub fn parse_limits(args: &[String]) -> Result<Vec<(&'static str, String)>, Stri
                 .ok_or_else(|| format!("{k} must be {lo}–{hi}, got {v:?}"))
         };
         Ok(match k {
-            "pl1" => ("/sys/devices/platform/asus-nb-wmi/ppt_pl1_spl", int(5, 250)?),
-            "pl2" => ("/sys/devices/platform/asus-nb-wmi/ppt_pl2_sppt", int(5, 250)?),
-            "nv_boost" => ("/sys/devices/platform/asus-nb-wmi/nv_dynamic_boost", int(0, 50)?),
-            "nv_temp" => ("/sys/devices/platform/asus-nb-wmi/nv_temp_target", int(60, 95)?),
+            "pl1" => ("/sys/devices/platform/asus-nb-wmi/ppt_pl1_spl", int(5, 175)?),
+            "pl2" => ("/sys/devices/platform/asus-nb-wmi/ppt_pl2_sppt", int(5, 175)?),
+            "nv_boost" => ("/sys/devices/platform/asus-nb-wmi/nv_dynamic_boost", int(5, 25)?),
+            "nv_temp" => ("/sys/devices/platform/asus-nb-wmi/nv_temp_target", int(75, 87)?),
             "cpu_boost" => (NO_TURBO, no_turbo_value(v)?.to_string()),
             other => return Err(format!("unknown limit {other:?}")),
         })
     }).collect()
+}
+
+/// Attempts every write even after a failure; returns "node: error" for each failure.
+pub fn write_all(pairs: &[(&'static str, String)], mut write: impl FnMut(&str, &str) -> Result<(), String>) -> Vec<String> {
+    pairs.iter().filter_map(|(node, value)| write(node, value).err().map(|e| format!("{node}: {e}"))).collect()
+}
+
+/// armouryd's active-mode flag for the calling user; set-limits refuses without it
+/// so a same-user process cannot change limits while G-Helper owns the hardware.
+pub fn active_flag(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".local/state/omarchy-armoury/active")
 }
 
 /// `on|off` → value for intel_pstate/no_turbo.
@@ -335,5 +346,27 @@ mod host_tests {
         assert!(bad("cpu_boost=maybe").contains("on|off"));
         assert!(bad("pl1").contains("KEY=VALUE"));
         assert!(parse_limits(&[]).unwrap_err().contains("nothing"));
+    }
+
+    #[test]
+    fn set_limits_caps_match_model_ranges() {
+        assert!(parse_limits(&["pl1=200".to_string()]).is_err());
+        assert!(parse_limits(&["pl1=175".to_string()]).is_ok());
+        assert!(parse_limits(&["nv_boost=30".to_string()]).is_err());
+        assert!(parse_limits(&["nv_temp=70".to_string()]).is_err());
+    }
+
+    #[test]
+    fn write_all_attempts_every_node() {
+        let pairs = vec![("a", "1".to_string()), ("b", "2".to_string()), ("c", "3".to_string())];
+        let mut seen = Vec::new();
+        let errs = write_all(&pairs, |node, _| { seen.push(node.to_string()); if node == "b" { Err("boom".into()) } else { Ok(()) } });
+        assert_eq!(seen, ["a", "b", "c"]);
+        assert_eq!(errs, ["b: boom"]);
+    }
+
+    #[test]
+    fn active_flag_under_home() {
+        assert_eq!(active_flag(std::path::Path::new("/home/u")), std::path::Path::new("/home/u/.local/state/omarchy-armoury/active"));
     }
 }

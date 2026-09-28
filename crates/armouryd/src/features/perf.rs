@@ -13,10 +13,10 @@ pub async fn apply_mode(profile: Profile, s: &ModeSettings, asusd: &dyn Asusd, s
         if let Err(e) = with_retry(|| asusd.set_profile_epp(profile.to_asusd(), epp.to_asusd())).await { errors.push(format!("EPP: {e:#}")); }
     }
     let mut args: Vec<String> = Limit::ALL.iter().filter_map(|l| Some(format!("{}={}", l.key(), l.value(s)?))).collect();
-    if let Some(on) = s.cpu_boost {
-        args.push(format!("cpu_boost={}", if on { "on" } else { "off" }));
-    }
-    if !args.is_empty() {
+    // no_turbo is kernel state no firmware reset touches: a mode without its own
+    // setting gets the default (on) instead of inheriting the previous mode's value.
+    args.push(format!("cpu_boost={}", if s.cpu_boost.unwrap_or(true) { "on" } else { "off" }));
+    {
         let mut argv = vec![PKEXEC, ROOT_HELPER, "set-limits"];
         argv.extend(args.iter().map(String::as_str));
         if let Err(e) = svc.run(&argv).await { errors.push(format!("power limits: {e:#}")); }
@@ -45,10 +45,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_settings_touch_nothing() {
+    async fn unset_boost_restores_default_on() {
+        // no_turbo is kernel state the firmware never resets, so a mode without
+        // its own setting must not inherit the previous mode's "off"
         let (a, s) = (FakeAsusd::default(), FakeServices::default());
         assert!(apply_mode(Profile::Quiet, &ModeSettings::default(), &a, &s).await.is_empty());
-        assert!(a.calls.lock().unwrap().is_empty() && s.calls.lock().unwrap().is_empty());
+        assert!(a.calls.lock().unwrap().is_empty());
+        assert_eq!(*s.calls.lock().unwrap(), [format!("{PKEXEC} {ROOT_HELPER} set-limits cpu_boost=on")]);
     }
 
     #[tokio::test]

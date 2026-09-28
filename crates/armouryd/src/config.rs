@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Re-write the current mode's power limits this often (0 = off); BIOS can clobber them.
     pub reapply_power_secs: u32,
@@ -81,5 +81,13 @@ mod tests {
     #[test]
     fn path_under_home() {
         assert_eq!(config_path(Path::new("/h")), Path::new("/h/.config/omarchy-armoury/config.toml"));
+    }
+
+    #[test]
+    fn unknown_keys_are_errors() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.toml");
+        std::fs::write(&p, "[modes.balanced]\npl_1 = 45\n").unwrap();
+        assert!(Config::load(&p).1.unwrap().contains("pl_1"));
     }
 }
