@@ -1,4 +1,4 @@
-use crate::control::{Control, handback, takeover};
+use crate::control::{Control, ModeHandle, handback, takeover};
 use crate::hw::{Gfx, Services, Sysfs};
 use crate::state::collect;
 use anyhow::bail;
@@ -16,17 +16,19 @@ pub struct Daemon {
     gfx: Box<dyn Gfx>,
     svc: Box<dyn Services>,
     pub control: Mutex<Control>,
+    mode: ModeHandle,
     snap: watch::Sender<Option<Snapshot>>,
 }
 
 impl Daemon {
     pub fn new(sys: Box<dyn Sysfs>, gfx: Box<dyn Gfx>, svc: Box<dyn Services>, control: Control) -> Arc<Self> {
-        Arc::new(Self { sys, gfx, svc, control: Mutex::new(control), snap: watch::channel(None).0 })
+        let mode = control.mode_handle();
+        Arc::new(Self { sys, gfx, svc, control: Mutex::new(control), mode, snap: watch::channel(None).0 })
     }
 
     /// Collects a fresh snapshot and publishes it to subscribers only if it changed.
     pub async fn refresh(&self) -> Snapshot {
-        let mode = self.control.lock().await.mode();
+        let mode = self.mode.get();
         let s = collect(&*self.sys, &*self.gfx, &*self.svc, mode).await;
         self.snap.send_if_modified(|cur| {
             if cur.as_ref() == Some(&s) { false } else { *cur = Some(s.clone()); true }
@@ -236,5 +238,14 @@ mod tests {
         let r = daemon.handle(Request::Takeover).await;
         assert!(!r.ok);
         assert!(r.error.unwrap().contains("G-Helper restored"));
+    }
+
+    #[tokio::test]
+    async fn status_not_blocked_by_transition() {
+        let d = tempfile::tempdir().unwrap();
+        let daemon = daemon(d.path());
+        let _held = daemon.control.lock().await; // a takeover in progress
+        let r = tokio::time::timeout(Duration::from_secs(1), daemon.handle(Request::Status)).await;
+        assert!(r.expect("status blocked by control lock").ok);
     }
 }

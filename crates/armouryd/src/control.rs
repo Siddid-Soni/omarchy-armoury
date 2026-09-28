@@ -2,6 +2,8 @@ use crate::hw::{GHELPER_UNIT, Services};
 use anyhow::{Context, bail};
 use armoury_proto::ControlMode;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub const PKEXEC: &str = "pkexec";
@@ -9,19 +11,37 @@ pub const ROOT_HELPER: &str = "/usr/local/lib/omarchy-armoury/armoury-root";
 /// Also checked by the G-Helper autostart drop-in, so it is the single source of truth.
 pub const ACTIVE_FLAG: &str = "active";
 
+/// Fixed to ~/.local/state (not $XDG_STATE_HOME): the G-Helper drop-in hard-codes %h/.local/state.
+pub fn state_dir(home: &Path) -> PathBuf {
+    home.join(".local/state/omarchy-armoury")
+}
+
+/// Lock-free read of the current mode, so status never waits on a takeover/handback.
+#[derive(Clone)]
+pub struct ModeHandle(Arc<AtomicBool>);
+
+impl ModeHandle {
+    pub fn get(&self) -> ControlMode {
+        if self.0.load(Ordering::SeqCst) { ControlMode::Active } else { ControlMode::Observe }
+    }
+}
+
 pub struct Control {
     flag: PathBuf,
     mode: ControlMode,
+    shared: ModeHandle,
 }
 
 impl Control {
     pub fn load(state_dir: &Path) -> Self {
         let flag = state_dir.join(ACTIVE_FLAG);
         let mode = if flag.exists() { ControlMode::Active } else { ControlMode::Observe };
-        Self { flag, mode }
+        Self { flag, mode, shared: ModeHandle(Arc::new(AtomicBool::new(mode == ControlMode::Active))) }
     }
 
     pub fn mode(&self) -> ControlMode { self.mode }
+
+    pub fn mode_handle(&self) -> ModeHandle { self.shared.clone() }
 
     pub fn set(&mut self, mode: ControlMode) -> std::io::Result<()> {
         match mode {
@@ -35,6 +55,7 @@ impl Control {
             },
         }
         self.mode = mode;
+        self.shared.0.store(mode == ControlMode::Active, Ordering::SeqCst);
         Ok(())
     }
 
@@ -56,9 +77,16 @@ pub async fn takeover(ctl: &mut Control, svc: &dyn Services) -> anyhow::Result<(
     }
     if svc.is_running("ghelper").await { bail!("G-Helper did not exit; takeover aborted"); }
 
-    ctl.set(ControlMode::Active)?;
-    if let Err(e) = svc.run(&[PKEXEC, ROOT_HELPER, "takeover"]).await {
-        ctl.set(ControlMode::Observe)?;
+    // The active flag is written only once asusd owns the hardware, so a crash
+    // mid-takeover never restarts armouryd as Active with G-Helper suppressed.
+    let result = match svc.run(&[PKEXEC, ROOT_HELPER, "takeover"]).await {
+        Ok(()) => ctl.set(ControlMode::Active).map_err(anyhow::Error::from).context("could not record active mode"),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = result {
+        // armoury-root already rolls asusd back; this covers a crash or kill of the root helper.
+        let _ = svc.run(&[PKEXEC, ROOT_HELPER, "handback"]).await;
+        let _ = ctl.set(ControlMode::Observe);
         let _ = svc.run(&["systemctl", "--user", "start", GHELPER_UNIT]).await;
         return Err(e).context("takeover failed; G-Helper restored");
     }
@@ -68,8 +96,11 @@ pub async fn takeover(ctl: &mut Control, svc: &dyn Services) -> anyhow::Result<(
 pub async fn handback(ctl: &mut Control, svc: &dyn Services) -> anyhow::Result<()> {
     if ctl.mode() == ControlMode::Observe { return Ok(()); }
     svc.run(&[PKEXEC, ROOT_HELPER, "handback"]).await.context("handback failed; still active")?;
-    ctl.set(ControlMode::Observe)?;
-    svc.run(&["systemctl", "--user", "start", GHELPER_UNIT]).await.context("asusd stopped but G-Helper did not start")?;
+    // asusd is down now: always try to bring G-Helper back, then report any error.
+    let flag = ctl.set(ControlMode::Observe);
+    let started = svc.run(&["systemctl", "--user", "start", GHELPER_UNIT]).await;
+    flag.context("asusd stopped but the active flag could not be removed (G-Helper autostart stays blocked)")?;
+    started.context("asusd stopped but G-Helper did not start")?;
     Ok(())
 }
 
@@ -116,9 +147,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut c = Control::load(d.path());
         let s = ghelper_up();
-        *s.fail_on.lock().unwrap() = Some("pkexec".into());
+        *s.fail_on.lock().unwrap() = Some("armoury-root takeover".into());
         let err = takeover(&mut c, &s).await.unwrap_err();
         assert!(format!("{err:#}").contains("G-Helper restored"));
+        assert!(s.calls.lock().unwrap().contains(&format!("{PKEXEC} {ROOT_HELPER} handback")), "belt-and-braces asusd rollback");
         assert_eq!(c.mode(), ControlMode::Observe);
         assert!(!d.path().join(ACTIVE_FLAG).exists());
         assert!(s.running.lock().unwrap().contains("ghelper"));
@@ -161,5 +193,44 @@ mod tests {
         c.set(ControlMode::Active).unwrap();
         takeover(&mut c, &s).await.unwrap();
         assert!(s.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn takeover_undone_if_flag_write_fails() {
+        let f = tempfile::NamedTempFile::new().unwrap(); // a file where the state dir should be
+        let mut c = Control::load(f.path());
+        let s = ghelper_up();
+        let err = takeover(&mut c, &s).await.unwrap_err();
+        assert!(format!("{err:#}").contains("G-Helper restored"));
+        let calls = s.calls.lock().unwrap().clone();
+        assert!(calls.contains(&format!("{PKEXEC} {ROOT_HELPER} handback")));
+        assert_eq!(calls.last().unwrap(), &format!("systemctl --user start {GHELPER_UNIT}"));
+        assert_eq!(c.mode(), ControlMode::Observe);
+    }
+
+    #[tokio::test]
+    async fn handback_restarts_ghelper_even_if_flag_removal_fails() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join(ACTIVE_FLAG)).unwrap(); // remove_file will fail
+        let mut c = Control::load(d.path());
+        assert_eq!(c.mode(), ControlMode::Active);
+        let s = FakeServices::default();
+        assert!(handback(&mut c, &s).await.is_err());
+        assert_eq!(s.calls.lock().unwrap().last().unwrap(), &format!("systemctl --user start {GHELPER_UNIT}"));
+    }
+
+    #[test]
+    fn mode_handle_tracks_set() {
+        let d = tempfile::tempdir().unwrap();
+        let mut c = Control::load(d.path());
+        let h = c.mode_handle();
+        assert_eq!(h.get(), ControlMode::Observe);
+        c.set(ControlMode::Active).unwrap();
+        assert_eq!(h.get(), ControlMode::Active);
+    }
+
+    #[test]
+    fn state_dir_is_fixed_under_home() {
+        assert_eq!(state_dir(Path::new("/home/u")), Path::new("/home/u/.local/state/omarchy-armoury"));
     }
 }

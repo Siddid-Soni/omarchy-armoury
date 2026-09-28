@@ -28,6 +28,13 @@ enum Cmd {
     Watch,
 }
 
+fn read_timeout(req: &Request) -> std::time::Duration {
+    std::time::Duration::from_secs(match req {
+        Request::Takeover | Request::Handback => 180,
+        _ => 10,
+    })
+}
+
 fn connect() -> anyhow::Result<UnixStream> {
     let p = socket_path();
     UnixStream::connect(&p).with_context(|| format!("armouryd not running ({})", p.display()))
@@ -35,9 +42,10 @@ fn connect() -> anyhow::Result<UnixStream> {
 
 fn call(req: &Request) -> anyhow::Result<serde_json::Value> {
     let mut s = connect()?;
+    s.set_read_timeout(Some(read_timeout(req)))?;
     writeln!(s, "{}", serde_json::to_string(req)?)?;
     let mut line = String::new();
-    BufReader::new(s).read_line(&mut line)?;
+    BufReader::new(s).read_line(&mut line).context("no answer from armouryd")?;
     let r: Response = serde_json::from_str(&line).context("bad response from armouryd")?;
     if !r.ok { bail!("{}", r.error.unwrap_or_default()); }
     Ok(r.data.unwrap_or_default())
@@ -106,5 +114,11 @@ mod tests {
         assert!(out.contains("GPU        Hybrid"));
         assert!(out.contains("Keystone   inserted"));
         assert!(out.contains("Battery    80% (limit 80%)"));
+    }
+
+    #[test]
+    fn read_timeouts() {
+        assert_eq!(read_timeout(&Request::Status), std::time::Duration::from_secs(10));
+        assert_eq!(read_timeout(&Request::Takeover), std::time::Duration::from_secs(180));
     }
 }
