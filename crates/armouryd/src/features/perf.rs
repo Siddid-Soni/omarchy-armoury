@@ -12,6 +12,13 @@ pub async fn apply_mode(profile: Profile, s: &ModeSettings, asusd: &dyn Asusd, s
     if let Some(epp) = s.epp {
         if let Err(e) = with_retry(|| asusd.set_profile_epp(profile.to_asusd(), epp.to_asusd())).await { errors.push(format!("EPP: {e:#}")); }
     }
+    if Limit::ALL.iter().any(|l| l.value(s).is_some()) {
+        // Some ASUS firmware silently ignores PPT writes unless the EC is in manual
+        // fan mode, i.e. the mode's custom fan curves are on (g-helper, asusd both require it).
+        if let Err(e) = with_retry(|| asusd.set_fan_curves_enabled(profile.to_asusd(), true)).await {
+            errors.push(format!("enable fan curves: {e:#}"));
+        }
+    }
     let mut args: Vec<String> = Limit::ALL.iter().filter_map(|l| Some(format!("{}={}", l.key(), l.value(s)?))).collect();
     // no_turbo is kernel state no firmware reset touches: a mode without its own
     // setting gets the default (on) instead of inheriting the previous mode's value.
@@ -38,7 +45,7 @@ mod tests {
     async fn applies_everything_in_order() {
         let (a, s) = (FakeAsusd::default(), FakeServices::default());
         assert!(apply_mode(Profile::Performance, &full(), &a, &s).await.is_empty());
-        assert_eq!(*a.calls.lock().unwrap(), ["set_profile_epp 1 1"]);
+        assert_eq!(*a.calls.lock().unwrap(), ["set_profile_epp 1 1", "set_fan_curves_enabled 1 true"]);
         assert_eq!(*s.calls.lock().unwrap(), [
             format!("{PKEXEC} {ROOT_HELPER} set-limits pl1=120 pl2=150 nv_boost=25 nv_temp=87 cpu_boost=off"),
         ]);
@@ -61,6 +68,6 @@ mod tests {
         let errs = apply_mode(Profile::Performance, &full(), &a, &s).await;
         assert_eq!(errs.len(), 1);
         assert!(errs[0].contains("power limits"), "{errs:?}");
-        assert_eq!(*a.calls.lock().unwrap(), ["set_profile_epp 1 1"], "EPP still applied");
+        assert_eq!(*a.calls.lock().unwrap(), ["set_profile_epp 1 1", "set_fan_curves_enabled 1 true"], "EPP still applied");
     }
 }

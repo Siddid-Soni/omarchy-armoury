@@ -27,6 +27,7 @@ trait FanCurves {
     fn fan_curve_data(&self, profile: u32) -> zbus::Result<Vec<RawCurve>>;
     fn set_fan_curve(&self, profile: u32, curve: RawCurve) -> zbus::Result<()>;
     fn set_curves_to_defaults(&self, profile: u32) -> zbus::Result<()>;
+    fn set_fan_curves_enabled(&self, profile: u32, enabled: bool) -> zbus::Result<()>;
 }
 
 #[zbus::proxy(interface = "xyz.ljones.AsusArmoury", default_service = "xyz.ljones.Asusd")]
@@ -72,6 +73,9 @@ impl Asusd for AsusdClient {
     async fn fan_curves(&self, profile: u32) -> anyhow::Result<Vec<RawCurve>> { Ok(self.fans().await?.fan_curve_data(profile).await?) }
     async fn set_fan_curve(&self, profile: u32, curve: RawCurve) -> anyhow::Result<()> { Ok(self.fans().await?.set_fan_curve(profile, curve).await?) }
     async fn reset_fan_curves(&self, profile: u32) -> anyhow::Result<()> { Ok(self.fans().await?.set_curves_to_defaults(profile).await?) }
+    async fn set_fan_curves_enabled(&self, profile: u32, enabled: bool) -> anyhow::Result<()> {
+        Ok(self.fans().await?.set_fan_curves_enabled(profile, enabled).await?)
+    }
     async fn armoury_range(&self, attr: &str) -> anyhow::Result<(i32, i32)> {
         let a = self.armoury(attr).await?;
         Ok((a.min_value().await?, a.max_value().await?))

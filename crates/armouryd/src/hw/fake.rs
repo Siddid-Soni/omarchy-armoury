@@ -112,6 +112,9 @@ impl Asusd for FakeAsusd {
         Ok(())
     }
     async fn reset_fan_curves(&self, profile: u32) -> anyhow::Result<()> { self.record(format!("reset_fan_curves {profile}")) }
+    async fn set_fan_curves_enabled(&self, profile: u32, enabled: bool) -> anyhow::Result<()> {
+        self.record(format!("set_fan_curves_enabled {profile} {enabled}"))
+    }
     async fn armoury_range(&self, _attr: &str) -> anyhow::Result<(i32, i32)> { Ok((-1, -1)) }
     async fn set_profile_epp(&self, profile: u32, epp: u32) -> anyhow::Result<()> { self.record(format!("set_profile_epp {profile} {epp}")) }
 }
