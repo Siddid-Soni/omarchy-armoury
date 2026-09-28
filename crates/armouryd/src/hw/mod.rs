@@ -1,8 +1,10 @@
+pub mod asusd;
 pub mod fake;
 pub mod services;
 pub mod supergfx;
 pub mod sysfs;
 
+use crate::features::fan::RawCurve;
 use std::future::Future;
 use std::time::Duration;
 
@@ -28,6 +30,19 @@ pub trait Services: Send + Sync {
     async fn run(&self, argv: &[&str]) -> anyhow::Result<()>;
     async fn is_running(&self, process: &str) -> bool;
     async fn unit_active(&self, unit: &str, user: bool) -> bool;
+}
+
+#[async_trait::async_trait]
+pub trait Asusd: Send + Sync {
+    async fn set_profile(&self, p: u32) -> anyhow::Result<()>;
+    async fn next_profile(&self) -> anyhow::Result<()>;
+    async fn fan_curves(&self, profile: u32) -> anyhow::Result<Vec<RawCurve>>;
+    async fn set_fan_curve(&self, profile: u32, curve: RawCurve) -> anyhow::Result<()>;
+    async fn reset_fan_curves(&self, profile: u32) -> anyhow::Result<()>;
+    async fn set_ppt_group(&self, enabled: bool) -> anyhow::Result<()>;
+    async fn armoury_range(&self, attr: &str) -> anyhow::Result<(i32, i32)>;
+    async fn armoury_set(&self, attr: &str, value: i32) -> anyhow::Result<()>;
+    async fn set_profile_epp(&self, profile: u32, epp: u32) -> anyhow::Result<()>;
 }
 
 /// Runs `f` up to twice, each attempt bounded by CALL_TIMEOUT (supergfxd can wedge).

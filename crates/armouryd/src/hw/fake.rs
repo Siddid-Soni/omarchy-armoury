@@ -1,4 +1,5 @@
-use super::{GHELPER_UNIT, Gfx, Services, Sysfs};
+use super::{Asusd, GHELPER_UNIT, Gfx, Services, Sysfs};
+use crate::features::fan::RawCurve;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
@@ -78,6 +79,45 @@ impl Services for FakeServices {
     async fn unit_active(&self, unit: &str, _user: bool) -> bool { self.active_units.lock().unwrap().contains(unit) }
 }
 
+#[derive(Default)]
+pub struct FakeAsusd {
+    pub calls: Mutex<Vec<String>>,
+    pub curves: Mutex<HashMap<u32, Vec<RawCurve>>>,
+    pub fail_on: Mutex<Option<String>>,
+}
+
+impl FakeAsusd {
+    fn record(&self, s: String) -> anyhow::Result<()> {
+        self.calls.lock().unwrap().push(s.clone());
+        if let Some(f) = self.fail_on.lock().unwrap().as_deref() {
+            if s.contains(f) { anyhow::bail!("fake asusd failure: {s}"); }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Asusd for FakeAsusd {
+    async fn set_profile(&self, p: u32) -> anyhow::Result<()> { self.record(format!("set_profile {p}")) }
+    async fn next_profile(&self) -> anyhow::Result<()> { self.record("next_profile".into()) }
+    async fn fan_curves(&self, profile: u32) -> anyhow::Result<Vec<RawCurve>> {
+        Ok(self.curves.lock().unwrap().get(&profile).cloned().unwrap_or_default())
+    }
+    async fn set_fan_curve(&self, profile: u32, curve: RawCurve) -> anyhow::Result<()> {
+        self.record(format!("set_fan_curve {profile} {}", curve.0))?;
+        let mut all = self.curves.lock().unwrap();
+        let list = all.entry(profile).or_default();
+        list.retain(|c| c.0 != curve.0);
+        list.push(curve);
+        Ok(())
+    }
+    async fn reset_fan_curves(&self, profile: u32) -> anyhow::Result<()> { self.record(format!("reset_fan_curves {profile}")) }
+    async fn set_ppt_group(&self, enabled: bool) -> anyhow::Result<()> { self.record(format!("set_ppt_group {enabled}")) }
+    async fn armoury_range(&self, _attr: &str) -> anyhow::Result<(i32, i32)> { Ok((-1, -1)) }
+    async fn armoury_set(&self, attr: &str, value: i32) -> anyhow::Result<()> { self.record(format!("armoury_set {attr} {value}")) }
+    async fn set_profile_epp(&self, profile: u32, epp: u32) -> anyhow::Result<()> { self.record(format!("set_profile_epp {profile} {epp}")) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +141,18 @@ mod tests {
         let f = FakeSysfs::with(&[("a/b", "1")]);
         assert_eq!(f.read("a/b").as_deref(), Some("1"));
         assert_eq!(f.list("a"), vec!["b"]);
+    }
+
+    #[tokio::test]
+    async fn fake_asusd_records_and_fails() {
+        use crate::hw::Asusd;
+        let a = FakeAsusd::default();
+        a.armoury_set("ppt_pl1_spl", 120).await.unwrap();
+        *a.fail_on.lock().unwrap() = Some("pl2".into());
+        assert!(a.armoury_set("ppt_pl2_sppt", 150).await.is_err());
+        a.curves.lock().unwrap().insert(1, vec![("CPU".into(), [0; 8], [0; 8], true)]);
+        assert_eq!(a.fan_curves(1).await.unwrap().len(), 1);
+        assert_eq!(a.armoury_range("x").await.unwrap(), (-1, -1));
+        assert_eq!(a.calls.lock().unwrap()[0], "armoury_set ppt_pl1_spl 120");
     }
 }
