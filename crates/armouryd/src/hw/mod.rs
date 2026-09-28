@@ -1,3 +1,5 @@
+pub mod fake;
+pub mod services;
 pub mod supergfx;
 pub mod sysfs;
 
@@ -17,6 +19,15 @@ pub trait Gfx: Send + Sync {
     async fn supported(&self) -> anyhow::Result<Vec<u32>>;
     async fn pending_mode(&self) -> anyhow::Result<u32>;
     async fn power(&self) -> anyhow::Result<u32>;
+}
+
+pub const GHELPER_UNIT: &str = "app-ghelper@autostart.service";
+
+#[async_trait::async_trait]
+pub trait Services: Send + Sync {
+    async fn run(&self, argv: &[&str]) -> anyhow::Result<()>;
+    async fn is_running(&self, process: &str) -> bool;
+    async fn unit_active(&self, unit: &str, user: bool) -> bool;
 }
 
 /// Runs `f` up to twice, each attempt bounded by CALL_TIMEOUT (supergfxd can wedge).
