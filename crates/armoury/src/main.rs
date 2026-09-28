@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-use armoury_proto::{ControlMode, Epp, Fan, FanCurve, GpuMode, GpuStep, GpuSwitchResult, ModeSettings, Profile, Request, Response, Snapshot, socket_path};
+use armoury_proto::{AuraEffect, AuraMode, AuraZone, ControlMode, LightingInfo, ZonePower, Epp, Fan, FanCurve, GpuMode, GpuStep, GpuSwitchResult, ModeSettings, Profile, Request, Response, Snapshot, socket_path};
 use clap::{Parser, Subcommand};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -37,6 +37,16 @@ enum Cmd {
         profile: Profile,
         #[command(subcommand)]
         action: Option<FanAction>,
+    },
+    /// Keyboard, lightbar and logo lighting
+    Light {
+        #[command(subcommand)]
+        action: Option<LightAction>,
+    },
+    /// Keyboard backlight idle dim (driven by the shell's idle monitor)
+    Kbd {
+        #[command(subcommand)]
+        action: KbdAction,
     },
     /// CPU undervolt availability
     Undervolt {
@@ -108,6 +118,70 @@ enum ModeAction {
         #[arg(long, value_parser = parse_lock)]
         gpu_mem_lock: Option<u32>,
     },
+}
+
+#[derive(Subcommand)]
+enum LightAction {
+    /// Set keyboard brightness (off|low|med|high or 0-3); remembered separately for AC and battery
+    Brightness {
+        #[arg(value_parser = parse_level)]
+        level: u8,
+    },
+    /// Set the lighting effect
+    Effect {
+        #[arg(value_parser = parse_aura_mode)]
+        mode: AuraMode,
+        /// Primary colour, RRGGBB
+        #[arg(long, value_parser = parse_colour, default_value = "ff0000")]
+        color: [u8; 3],
+        /// Secondary colour, RRGGBB
+        #[arg(long, value_parser = parse_colour, default_value = "000000")]
+        color2: [u8; 3],
+        #[arg(long, value_parser = ["low", "med", "high"], default_value = "med")]
+        speed: String,
+        #[arg(long, value_parser = ["right", "left", "up", "down"], default_value = "right")]
+        direction: String,
+    },
+    /// Turn a zone on/off per power state; unspecified states keep their current value
+    Zone {
+        #[arg(value_parser = ["keyboard", "lightbar", "logo", "lid", "rear"])]
+        zone: String,
+        #[arg(long, value_parser = ["on", "off"])]
+        boot: Option<String>,
+        #[arg(long, value_parser = ["on", "off"])]
+        awake: Option<String>,
+        #[arg(long, value_parser = ["on", "off"])]
+        sleep: Option<String>,
+        #[arg(long, value_parser = ["on", "off"])]
+        shutdown: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum KbdAction {
+    /// Dim the keyboard (remembers the current level)
+    Idle,
+    /// Restore the level from before `idle`
+    Resume,
+}
+
+fn parse_colour(s: &str) -> Result<[u8; 3], String> {
+    let h = s.trim_start_matches('#');
+    if h.len() != 6 { return Err(format!("colour must be RRGGBB, got {s:?}")); }
+    let byte = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).map_err(|_| format!("colour must be RRGGBB, got {s:?}"));
+    Ok([byte(0)?, byte(2)?, byte(4)?])
+}
+
+fn parse_level(s: &str) -> Result<u8, String> {
+    match s {
+        "off" => Ok(0), "low" => Ok(1), "med" => Ok(2), "high" => Ok(3),
+        n => n.parse().ok().filter(|v| *v <= 3).ok_or_else(|| format!("brightness must be off|low|med|high or 0-3, got {s:?}")),
+    }
+}
+
+fn parse_aura_mode(s: &str) -> Result<AuraMode, String> {
+    serde_json::from_value(serde_json::json!(s.replace('-', "_")))
+        .map_err(|_| format!("unknown effect {s:?} (static, breathe, rainbow-cycle, rainbow-wave, star, rain, highlight, laser, ripple, pulse, comet, flash)"))
 }
 
 #[derive(Subcommand)]
@@ -259,6 +333,49 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             writeln!(s, "{}", serde_json::to_string(&Request::Subscribe)?)?;
             for line in BufReader::new(s).lines().skip(1) { println!("{}", line?); }
         }
+        Cmd::Light { action: None } => {
+            let s: Snapshot = serde_json::from_value(call(&Request::Status)?)?;
+            let names = ["off", "low", "med", "high"];
+            let level = s.lighting.brightness.and_then(|b| names.get(b as usize).copied()).unwrap_or("-");
+            let source = match s.lighting.on_ac { Some(true) => "on AC", Some(false) => "on battery", None => "" };
+            println!("Brightness {level} ({source})");
+            match call(&Request::Lighting).and_then(|v| Ok(serde_json::from_value::<LightingInfo>(v)?)) {
+                Ok(info) => {
+                    if let Some(e) = info.effect {
+                        let hex = |c: [u8; 3]| format!("{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
+                        println!("Effect     {:?} {} {} {:?} {:?}", e.mode, hex(e.colour1), hex(e.colour2), e.speed, e.direction);
+                    }
+                    for z in info.zones {
+                        let on = |b: bool| if b { "on " } else { "off" };
+                        println!("Zone       {:<9} boot {} awake {} sleep {} shutdown {}", format!("{:?}", z.zone), on(z.boot), on(z.awake), on(z.sleep), on(z.shutdown));
+                    }
+                }
+                Err(e) => println!("(effects and zones need asusd: {e:#})"),
+            }
+        }
+        Cmd::Light { action: Some(LightAction::Brightness { level }) } => { call(&Request::SetBrightness { level })?; }
+        Cmd::Light { action: Some(LightAction::Effect { mode, color, color2, speed, direction }) } => {
+            let effect = AuraEffect {
+                mode, colour1: color, colour2: color2,
+                speed: serde_json::from_value(serde_json::json!(speed))?,
+                direction: serde_json::from_value(serde_json::json!(direction))?,
+            };
+            call(&Request::SetEffect { effect })?;
+        }
+        Cmd::Light { action: Some(LightAction::Zone { zone, boot, awake, sleep, shutdown }) } => {
+            let zone = match zone.as_str() {
+                "keyboard" => AuraZone::Keyboard, "lightbar" => AuraZone::Lightbar, "logo" => AuraZone::Logo,
+                "lid" => AuraZone::Lid, _ => AuraZone::RearGlow,
+            };
+            let info: LightingInfo = serde_json::from_value(call(&Request::Lighting)?)?;
+            let cur = info.zones.iter().find(|z| z.zone == zone).copied()
+                .unwrap_or(ZonePower { zone, boot: false, awake: false, sleep: false, shutdown: false });
+            let pick = |v: Option<String>, d: bool| v.map_or(d, |s| s == "on");
+            let z = ZonePower { zone, boot: pick(boot, cur.boot), awake: pick(awake, cur.awake), sleep: pick(sleep, cur.sleep), shutdown: pick(shutdown, cur.shutdown) };
+            call(&Request::SetZonePower { zone: z })?;
+        }
+        Cmd::Kbd { action: KbdAction::Idle } => { call(&Request::KbdIdle)?; }
+        Cmd::Kbd { action: KbdAction::Resume } => { call(&Request::KbdResume)?; }
         Cmd::Undervolt { action: UvAction::Probe } => {
             let v = call(&Request::ProbeUndervolt)?;
             println!("{}", if v["unlocked"] == true { "unlocked" } else { "locked" });
@@ -412,5 +529,18 @@ mod tests {
         assert_eq!(parse_gpu_mode("integrated"), Ok(armoury_proto::GpuMode::Integrated));
         assert_eq!(parse_gpu_mode("hybrid"), Ok(armoury_proto::GpuMode::Hybrid));
         assert!(parse_gpu_mode("vfio").is_err());
+    }
+
+    #[test]
+    fn lighting_parsers() {
+        assert_eq!(parse_colour("ff0080"), Ok([255, 0, 128]));
+        assert_eq!(parse_colour("#00FF00"), Ok([0, 255, 0]));
+        assert!(parse_colour("fff").is_err());
+        assert_eq!(parse_level("off"), Ok(0));
+        assert_eq!(parse_level("high"), Ok(3));
+        assert_eq!(parse_level("2"), Ok(2));
+        assert!(parse_level("4").is_err());
+        assert_eq!(parse_aura_mode("rainbow-wave"), Ok(armoury_proto::AuraMode::RainbowWave));
+        assert!(parse_aura_mode("disco").is_err());
     }
 }
