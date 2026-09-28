@@ -1,0 +1,11 @@
+[package]
+name = "armoury"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+armoury-proto.workspace = true
+clap.workspace = true
+serde_json.workspace = true

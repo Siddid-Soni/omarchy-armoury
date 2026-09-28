@@ -1,0 +1,16 @@
+[package]
+name = "armouryd"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+armoury-proto.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+zbus.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
