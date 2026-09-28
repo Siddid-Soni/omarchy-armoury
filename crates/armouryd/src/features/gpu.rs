@@ -5,17 +5,27 @@ use armoury_proto::{GpuMode, GpuState, GpuStep};
 pub fn plan_switch(g: &GpuState, target: GpuMode) -> Result<GpuStep, String> {
     use GpuMode::*;
     let current = g.mode.ok_or("supergfxd is not answering; try again")?;
+    if g.supported.is_empty() { return Err("supergfxd is not answering; try again".into()); }
+    // Anything that might already be queued for the next boot blocks a new switch.
     if let Some(p) = g.pending { return Err(format!("a switch to {p:?} is pending; reboot first")); }
+    if g.pending_unknown { return Err("cannot tell whether a GPU switch is pending (supergfxd did not answer); try again".into()); }
+    if g.pending_reboot == Some(true) { return Err("the firmware has a GPU change waiting; reboot first".into()); }
+    if let Some(c) = g.conf_mode.filter(|c| *c != current) {
+        return Err(format!("/etc/supergfxd.conf already says {c:?} (a switch waiting for reboot); reboot first"));
+    }
+    if g.toggle_running { return Err("Omarchy's GPU toggle is open; finish or close it first".into()); }
+    if let Some(p) = g.armoury_pending { return Err(format!("a switch to {p:?} was made this boot; reboot first")); }
     if !matches!(target, Integrated | Hybrid | AsusMuxDgpu) || !g.supported.contains(&target) {
         return Err(format!("{target:?} is not supported on this machine"));
     }
     if target == current { return Err(format!("already in {target:?}")); }
-    let mux_dgpu = g.mux == Some(0);
-    let dgpu_off = g.dgpu_disable == Some(1);
+    // Unknown hardware state is never treated as safe.
+    let mux_igpu = g.mux == Some(1);
+    let dgpu_on = g.dgpu_disable == Some(0);
     match (current, target) {
-        (Hybrid, Integrated) if mux_dgpu => Err("MUX is set to the dGPU; switch to Hybrid and reboot first".into()),
+        (Hybrid, Integrated) if !mux_igpu => Err("the MUX is not confirmed on the iGPU; cannot switch to Integrated".into()),
         (Hybrid, Integrated) | (Integrated, Hybrid) => Ok(GpuStep::OmarchyToggle { to: target }),
-        (Hybrid, AsusMuxDgpu) if dgpu_off => Err("the dGPU is disabled; it must be enabled before selecting Ultimate".into()),
+        (Hybrid, AsusMuxDgpu) if !dgpu_on => Err("the dGPU is not confirmed enabled; cannot switch to Ultimate".into()),
         (Hybrid, AsusMuxDgpu) | (AsusMuxDgpu, Hybrid) => Ok(GpuStep::Supergfx { to: target }),
         (Integrated, AsusMuxDgpu) => Ok(GpuStep::FirstOfTwo { first: Box::new(GpuStep::OmarchyToggle { to: Hybrid }), then: AsusMuxDgpu }),
         (AsusMuxDgpu, Integrated) => Ok(GpuStep::FirstOfTwo { first: Box::new(GpuStep::Supergfx { to: Hybrid }), then: Integrated }),
@@ -70,18 +80,52 @@ mod tests {
     fn no_step_reaches_black_screen() {
         use GpuMode::*;
         for mode in [Integrated, Hybrid, AsusMuxDgpu] {
-            for mux in [0u8, 1] {
-                for off in [0u8, 1] {
+            for mux in [Option::None, Some(0u8), Some(1)] {
+                for off in [Option::None, Some(0u8), Some(1)] {
                     for target in [Integrated, Hybrid, AsusMuxDgpu] {
-                        let Ok(step) = plan_switch(&st(mode, mux, off), target) else { continue };
+                        let mut g = st(mode, 1, 0);
+                        g.mux = mux;
+                        g.dgpu_disable = off;
+                        let Ok(step) = plan_switch(&g, target) else { continue };
                         let first = match &step { GpuStep::FirstOfTwo { first, .. } => (**first).clone(), s => s.clone() };
                         // the only direct write that sets mux=0 must start from the dGPU enabled
-                        if first == (GpuStep::Supergfx { to: AsusMuxDgpu }) { assert_eq!(off, 0, "{mode:?} mux={mux} off={off} -> {target:?}"); }
+                        if first == (GpuStep::Supergfx { to: AsusMuxDgpu }) { assert_eq!(off, Some(0), "{mode:?} mux={mux:?} off={off:?} -> {target:?}"); }
                         // Integrated (dgpu_disable=1) must never be entered while mux=0
-                        if first == (GpuStep::OmarchyToggle { to: Integrated }) { assert_eq!(mux, 1, "{mode:?} mux={mux} off={off} -> {target:?}"); }
+                        if first == (GpuStep::OmarchyToggle { to: Integrated }) { assert_eq!(mux, Some(1), "{mode:?} mux={mux:?} off={off:?} -> {target:?}"); }
                     }
                 }
             }
         }
+    }
+
+    fn blocked(f: impl FnOnce(&mut GpuState), needle: &str) {
+        let mut g = st(GpuMode::Hybrid, 1, 0);
+        f(&mut g);
+        let e = plan_switch(&g, GpuMode::AsusMuxDgpu).unwrap_err();
+        assert!(e.contains(needle), "{e}");
+    }
+
+    #[test]
+    fn every_pending_signal_blocks() {
+        blocked(|g| g.pending_unknown = true, "cannot tell");
+        blocked(|g| g.pending_reboot = Some(true), "firmware");
+        blocked(|g| g.conf_mode = Some(GpuMode::Integrated), "supergfxd.conf");
+        blocked(|g| g.toggle_running = true, "toggle");
+        blocked(|g| g.armoury_pending = Some(GpuMode::AsusMuxDgpu), "reboot");
+        blocked(|g| g.supported.clear(), "not answering");
+        // a conf that agrees with the running mode is not pending
+        let mut g = st(GpuMode::Hybrid, 1, 0);
+        g.conf_mode = Some(GpuMode::Hybrid);
+        assert!(plan_switch(&g, GpuMode::AsusMuxDgpu).is_ok());
+    }
+
+    #[test]
+    fn unknown_hardware_state_refuses() {
+        let mut g = st(GpuMode::Hybrid, 1, 0);
+        g.mux = None;
+        assert!(plan_switch(&g, GpuMode::Integrated).is_err());
+        let mut g = st(GpuMode::Hybrid, 1, 0);
+        g.dgpu_disable = None;
+        assert!(plan_switch(&g, GpuMode::AsusMuxDgpu).is_err());
     }
 }

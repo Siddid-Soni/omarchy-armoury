@@ -217,6 +217,16 @@ pub struct GpuState {
     pub nvidia: Option<NvStatus>,
     /// Processes holding /dev/nvidia* (keep the dGPU awake).
     pub users: Vec<GpuUser>,
+    /// Firmware reports a GPU change waiting for reboot (asus-armoury pending_reboot).
+    pub pending_reboot: Option<bool>,
+    /// "mode" in /etc/supergfxd.conf; differs from `mode` after an Omarchy toggle rewrite.
+    pub conf_mode: Option<GpuMode>,
+    /// omarchy-toggle-hybrid-gpu is running (waiting for confirmation or rebooting).
+    pub toggle_running: bool,
+    /// supergfxd PendingMode could not be read.
+    pub pending_unknown: bool,
+    /// Switch armouryd made this boot (survives a supergfxd restart).
+    pub armoury_pending: Option<GpuMode>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

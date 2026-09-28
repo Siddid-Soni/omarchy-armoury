@@ -5,7 +5,7 @@ use crate::features::limits::{self, Bounds, Limit};
 use crate::features::perf::{HwCtx, apply_mode, apply_nv, nv_is_stock};
 use crate::hw::{Asusd, Gfx, Nvidia, Services, Sysfs, with_retry};
 use crate::state::collect;
-use anyhow::bail;
+use anyhow::{Context, bail};
 use crate::features::gpu::plan_switch;
 use armoury_proto::{ControlMode, Event, GpuMode, GpuStep, GpuSwitchResult, ModeSettings, Profile, Request, Response, Snapshot, UndervoltState};
 use std::path::{Path, PathBuf};
@@ -33,6 +33,9 @@ pub struct Daemon {
     /// Undervolt probe result (None until probed in active mode).
     uv: std::sync::Mutex<Option<bool>>,
     apply_error: std::sync::Mutex<Option<String>>,
+    /// Serialises GPU plan + execute.
+    gpu_lock: Mutex<()>,
+    state_dir: PathBuf,
     last_reapply: std::sync::Mutex<tokio::time::Instant>,
 }
 
@@ -41,12 +44,15 @@ impl Daemon {
         let (config, config_error) = load_config(&config_path);
         if let Some(e) = &config_error { eprintln!("armouryd: {e}"); }
         let mode = control.mode_handle();
+        let state_dir = control.state_dir();
         Arc::new(Self {
             sys, gfx, svc, asusd, nv, control: Mutex::new(control), mode, snap: watch::channel(None).0,
             config: Mutex::new(config), config_path, config_error,
             apply: Mutex::new(ApplyState::default()),
             uv: std::sync::Mutex::new(None),
-            apply_error: std::sync::Mutex::new(None), last_reapply: std::sync::Mutex::new(tokio::time::Instant::now()),
+            apply_error: std::sync::Mutex::new(None),
+            gpu_lock: Mutex::new(()),
+            state_dir, last_reapply: std::sync::Mutex::new(tokio::time::Instant::now()),
         })
     }
 
@@ -175,17 +181,48 @@ impl Daemon {
             GpuStep::FirstOfTwo { first, .. } => Box::pin(self.run_gpu_step(first)).await,
             GpuStep::OmarchyToggle { to } => {
                 // Exactly what the Omarchy menu runs; it confirms, rewrites supergfxd.conf and reboots.
-                self.svc.run(&["setsid", "-f", "omarchy-launch-floating-terminal-with-presentation", "omarchy-toggle-hybrid-gpu"]).await?;
+                // Absolute paths: at login armouryd may start before uwsm puts Omarchy's bin on PATH.
+                let bin = format!("{}/bin", std::env::var("OMARCHY_PATH").unwrap_or_else(|_| "/usr/share/omarchy".into()));
+                let launcher = format!("{bin}/omarchy-launch-floating-terminal-with-presentation");
+                let toggle = format!("{bin}/omarchy-toggle-hybrid-gpu");
+                self.svc.spawn(&[&launcher, &toggle], &bin).await.context("launch Omarchy's GPU toggle")?;
                 Ok((true, format!("Omarchy's GPU toggle opened in a terminal; confirm there to switch to {} (it reboots)", gpu_name(*to))))
             }
             GpuStep::Supergfx { to } => {
-                let action = with_retry(|| self.gfx.set_mode(to.code())).await?;
+                // Not retried: a timed-out call may still complete inside supergfxd.
+                let action = match tokio::time::timeout(crate::hw::CALL_TIMEOUT * 2, self.gfx.set_mode(to.code())).await {
+                    Ok(Ok(a)) => a,
+                    failed => {
+                        let why = match failed { Ok(Err(e)) => format!("{e:#}"), _ => "timed out".into() };
+                        match with_retry(|| self.gfx.pending_mode()).await {
+                            Ok(p) if p == to.code() => 1, // it was applied after all
+                            _ => anyhow::bail!("SetMode {why}; the switch may or may not have been applied — run `armoury gpu plan {}`", gpu_name(*to)),
+                        }
+                    }
+                };
+                self.write_gpu_record(*to);
                 Ok(match action {
                     0 => (false, format!("log out and back in to finish switching to {}", gpu_name(*to))),
                     4 => (false, format!("switched to {}", gpu_name(*to))),
                     _ => (true, format!("reboot to finish switching to {}", gpu_name(*to))),
                 })
             }
+        }
+    }
+
+    /// Boot-keyed record of a supergfxd switch made this boot (supergfxd forgets on restart).
+    fn gpu_record(&self) -> Option<GpuMode> {
+        let text = std::fs::read_to_string(self.state_dir.join("gpu-pending")).ok()?;
+        let (boot, code) = text.trim_end().split_once(' ')?;
+        let current = self.sys.read(crate::hw::sysfs::BOOT_ID).unwrap_or_default();
+        (boot == current).then(|| code.parse().ok().and_then(GpuMode::from_supergfx)).flatten()
+    }
+
+    fn write_gpu_record(&self, to: GpuMode) {
+        let boot = self.sys.read(crate::hw::sysfs::BOOT_ID).unwrap_or_default();
+        let _ = std::fs::create_dir_all(&self.state_dir);
+        if let Err(e) = std::fs::write(self.state_dir.join("gpu-pending"), format!("{boot} {}", to.code())) {
+            eprintln!("armouryd: record GPU switch: {e}");
         }
     }
 
@@ -233,6 +270,7 @@ impl Daemon {
         s.config_error = self.config_error.clone();
         s.perf.undervolt = self.uv.lock().unwrap().map(|unlocked| UndervoltState { unlocked });
         s.apply_error = self.apply_error.lock().unwrap().clone();
+        s.gpu.armoury_pending = self.gpu_record();
         s
     }
 
@@ -270,8 +308,10 @@ impl Daemon {
                 Err(e) => Response::err(e),
             },
             Request::SetGpuMode { mode } => {
+                let _gpu = self.gpu_lock.lock().await; // plan + execute as one step
                 if let Err(r) = self.write_guard().await { return r; }
                 let step = match plan_switch(&self.refresh().await.gpu, mode) { Ok(s) => s, Err(e) => return Response::err(e) };
+                if self.mode.get() != ControlMode::Active { return Response::err("observe mode: run 'armoury takeover' first"); }
                 match self.run_gpu_step(&step).await {
                     Ok((reboot_required, message)) => {
                         let message = match &step {
@@ -969,7 +1009,10 @@ mod tests {
     async fn hybrid_to_integrated_launches_omarchy_toggle() {
         let r = gpu_rig(0, true);
         assert!(r.d.handle(gpu_req("set_gpu_mode", "Integrated")).await.ok);
-        assert!(r.svc.calls.lock().unwrap().contains(&"setsid -f omarchy-launch-floating-terminal-with-presentation omarchy-toggle-hybrid-gpu".to_string()));
+        let calls = r.svc.calls.lock().unwrap().clone();
+        // absolute paths, exactly the Omarchy menu's command
+        assert!(calls.iter().any(|c| c.starts_with("spawn /") && c.contains("/bin/omarchy-launch-floating-terminal-with-presentation /")
+            && c.ends_with("/bin/omarchy-toggle-hybrid-gpu")), "{calls:?}");
         assert!(r.gfx.set_calls.lock().unwrap().is_empty());
     }
 
@@ -989,5 +1032,32 @@ mod tests {
         assert_eq!(resp.data.unwrap()["kind"], "supergfx");
         assert!(r.gfx.set_calls.lock().unwrap().is_empty());
         assert!(!r.svc.calls.lock().unwrap().iter().any(|c| c.contains("omarchy-toggle")));
+    }
+
+    #[tokio::test]
+    async fn supergfx_switch_is_recorded_as_pending() {
+        let r = gpu_rig(0, true);
+        assert!(r.d.handle(gpu_req("set_gpu_mode", "AsusMuxDgpu")).await.ok);
+        // supergfxd restarted and forgot its pending mode; our boot-keyed record still blocks
+        let e = r.d.handle(gpu_req("set_gpu_mode", "Integrated")).await.error.unwrap();
+        assert!(e.contains("reboot"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn toggle_launch_failure_is_reported() {
+        let r = gpu_rig(0, true);
+        *r.svc.fail_on.lock().unwrap() = Some("omarchy-launch-floating-terminal-with-presentation".into());
+        let resp = r.d.handle(gpu_req("set_gpu_mode", "Integrated")).await;
+        assert!(!resp.ok && resp.error.unwrap().contains("launch"));
+    }
+
+    #[tokio::test]
+    async fn setmode_failure_rechecks_pending() {
+        let r = gpu_rig(0, true);
+        *r.gfx.set_fails.lock().unwrap() = true; // write errors, but supergfxd did apply it
+        *r.gfx.pending_after_fail.lock().unwrap() = Some(5);
+        let resp = r.d.handle(gpu_req("set_gpu_mode", "AsusMuxDgpu")).await;
+        assert!(resp.ok, "{resp:?}");
+        assert_eq!(r.gfx.set_calls.lock().unwrap().len(), 1, "never blind-retried");
     }
 }

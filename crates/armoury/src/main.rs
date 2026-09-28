@@ -183,6 +183,7 @@ fn parse_curve(fan: Fan, s: &str) -> Result<FanCurve, String> {
 fn read_timeout(req: &Request) -> std::time::Duration {
     std::time::Duration::from_secs(match req {
         Request::Takeover | Request::Handback => 180,
+        Request::SetGpuMode { .. } | Request::PlanGpuMode { .. } => 60,
         _ => 10,
     })
 }
@@ -360,6 +361,7 @@ mod tests {
     fn read_timeouts() {
         assert_eq!(read_timeout(&Request::Status), std::time::Duration::from_secs(10));
         assert_eq!(read_timeout(&Request::Takeover), std::time::Duration::from_secs(180));
+        assert_eq!(read_timeout(&Request::SetGpuMode { mode: armoury_proto::GpuMode::Hybrid }), std::time::Duration::from_secs(60));
     }
 
     #[test]

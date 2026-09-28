@@ -28,6 +28,17 @@ impl Services for RealServices {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
+    async fn spawn(&self, argv: &[&str], path_prepend: &str) -> anyhow::Result<()> {
+        let (prog, args) = argv.split_first().context("empty argv")?;
+        if !std::path::Path::new(prog).exists() { bail!("cannot launch {prog}: not found"); }
+        let path = format!("{path_prepend}:{}", std::env::var("PATH").unwrap_or_default());
+        let st = Command::new("setsid").arg("-f").arg(prog).args(args).env("PATH", path)
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().await.with_context(|| format!("launch {prog}"))?;
+        if !st.success() { bail!("launch {prog} failed ({st})"); }
+        Ok(())
+    }
+
     async fn is_running(&self, process: &str) -> bool {
         Command::new("pgrep").args(["-x", process]).output().await.map(|o| o.status.success()).unwrap_or(false)
     }

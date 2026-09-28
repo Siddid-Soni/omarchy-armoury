@@ -36,10 +36,14 @@ pub struct FakeGfx {
     pub power: u32,
     pub wedged: bool,
     pub set_calls: Mutex<Vec<u32>>,
+    /// set_mode returns an error (the call may still have been applied)
+    pub set_fails: Mutex<bool>,
+    /// PendingMode reported once set_mode has been called
+    pub pending_after_fail: Mutex<Option<u32>>,
 }
 
 impl Default for FakeGfx {
-    fn default() -> Self { Self { mode: 0, supported: vec![1, 0, 3, 5], pending: 6, power: 1, wedged: false, set_calls: Mutex::new(Vec::new()) } }
+    fn default() -> Self { Self { mode: 0, supported: vec![1, 0, 3, 5], pending: 6, power: 1, wedged: false, set_calls: Mutex::new(Vec::new()), set_fails: Mutex::new(false), pending_after_fail: Mutex::new(None) } }
 }
 
 impl FakeGfx {
@@ -50,11 +54,16 @@ impl FakeGfx {
 impl Gfx for FakeGfx {
     async fn mode(&self) -> anyhow::Result<u32> { self.gate().await; Ok(self.mode) }
     async fn supported(&self) -> anyhow::Result<Vec<u32>> { self.gate().await; Ok(self.supported.clone()) }
-    async fn pending_mode(&self) -> anyhow::Result<u32> { self.gate().await; Ok(self.pending) }
+    async fn pending_mode(&self) -> anyhow::Result<u32> {
+        self.gate().await;
+        let after = if self.set_calls.lock().unwrap().is_empty() { None } else { *self.pending_after_fail.lock().unwrap() };
+        Ok(after.unwrap_or(self.pending))
+    }
     async fn power(&self) -> anyhow::Result<u32> { self.gate().await; Ok(self.power) }
     async fn set_mode(&self, mode: u32) -> anyhow::Result<u32> {
         self.gate().await;
         self.set_calls.lock().unwrap().push(mode);
+        if *self.set_fails.lock().unwrap() { anyhow::bail!("fake SetMode failure"); }
         Ok(1)
     }
 }
@@ -71,6 +80,15 @@ pub struct FakeServices {
 
 #[async_trait::async_trait]
 impl Services for FakeServices {
+    async fn spawn(&self, argv: &[&str], _path_prepend: &str) -> anyhow::Result<()> {
+        let joined = format!("spawn {}", argv.join(" "));
+        self.calls.lock().unwrap().push(joined.clone());
+        if let Some(f) = self.fail_on.lock().unwrap().as_deref() {
+            if joined.contains(f) { anyhow::bail!("fake launch failure: {joined}"); }
+        }
+        Ok(())
+    }
+
     async fn output(&self, argv: &[&str]) -> anyhow::Result<String> {
         self.run(argv).await?;
         let joined = argv.join(" ");

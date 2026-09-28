@@ -41,6 +41,8 @@ impl Control {
 
     pub fn mode(&self) -> ControlMode { self.mode }
 
+    pub fn state_dir(&self) -> PathBuf { self.flag.parent().map(Path::to_path_buf).unwrap_or_default() }
+
     pub fn mode_handle(&self) -> ModeHandle { self.shared.clone() }
 
     pub fn set(&mut self, mode: ControlMode) -> std::io::Result<()> {

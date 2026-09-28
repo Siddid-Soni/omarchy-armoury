@@ -8,6 +8,9 @@ pub const DGPU_DISABLE: &str = "sys/devices/platform/asus-nb-wmi/dgpu_disable";
 pub const PLATFORM_PROFILE: &str = "sys/firmware/acpi/platform_profile";
 pub const POWER_SUPPLY_DIR: &str = "sys/class/power_supply";
 pub const HWMON_DIR: &str = "sys/class/hwmon";
+pub const PENDING_REBOOT: &str = "sys/class/firmware-attributes/asus-armoury/attributes/pending_reboot";
+pub const SUPERGFXD_CONF: &str = "etc/supergfxd.conf";
+pub const BOOT_ID: &str = "proc/sys/kernel/random/boot_id";
 pub const PROFILE_CHOICES: &str = "sys/firmware/acpi/platform_profile_choices";
 pub const NO_TURBO: &str = "sys/devices/system/cpu/intel_pstate/no_turbo";
 

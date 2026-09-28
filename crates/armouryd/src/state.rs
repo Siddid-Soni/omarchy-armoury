@@ -32,12 +32,20 @@ async fn gpu_state(sys: &dyn Sysfs, gfx: &dyn Gfx, nv: &dyn Nvidia, detail: bool
         g.users = nv.users();
     }
     // A wedged supergfxd costs one retry budget here, not four.
+    g.pending_reboot = sys.read(sysfs::PENDING_REBOOT).map(|v| v == "1");
+    g.conf_mode = sys.read(sysfs::SUPERGFXD_CONF)
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| serde_json::from_value(v["mode"].clone()).ok());
+    g.toggle_running = sys.list("proc").iter().filter(|p| p.bytes().all(|b| b.is_ascii_digit()))
+        .any(|p| sys.read(&format!("proc/{p}/cmdline")).is_some_and(|c| c.contains("omarchy-toggle-hybrid-gpu")));
     let Ok(mode) = with_retry(|| gfx.mode()).await else { return g };
     g.mode = GpuMode::from_supergfx(mode);
     g.supported = with_retry(|| gfx.supported()).await.unwrap_or_default()
         .into_iter().filter_map(GpuMode::from_supergfx).collect();
-    g.pending = with_retry(|| gfx.pending_mode()).await.ok()
-        .and_then(GpuMode::from_supergfx).filter(|m| *m != GpuMode::None);
+    match with_retry(|| gfx.pending_mode()).await {
+        Ok(p) => g.pending = GpuMode::from_supergfx(p).filter(|m| *m != GpuMode::None),
+        Err(_) => g.pending_unknown = true,
+    }
     g.power = with_retry(|| gfx.power()).await.ok().and_then(GpuPower::from_supergfx);
     g
 }
@@ -76,7 +84,7 @@ pub fn perf_state(sys: &dyn Sysfs) -> PerfState {
 mod tests {
     use super::*;
     use crate::hw::fake::{FakeGfx, FakeNvidia, FakeServices, FakeSysfs};
-    use armoury_proto::Profile;
+    use armoury_proto::{GpuMode, Profile};
 
     fn machine() -> FakeSysfs {
         FakeSysfs::with(&[
@@ -173,5 +181,22 @@ mod tests {
         let s = collect(&machine(), &FakeGfx::default(), &FakeServices::default(), &nv, ControlMode::Observe, true).await;
         assert_eq!(s.gpu.nvidia.unwrap().core_mhz, 1500);
         assert_eq!(s.gpu.users[0].name, "game");
+    }
+
+    #[tokio::test]
+    async fn gpu_pending_signals_read() {
+        let sys = machine();
+        {
+            let mut f = sys.files.lock().unwrap();
+            f.insert("sys/class/firmware-attributes/asus-armoury/attributes/pending_reboot".into(), "1".into());
+            f.insert("etc/supergfxd.conf".into(), r#"{"mode": "Integrated", "vfio_enable": true}"#.into());
+            f.insert("proc/777/cmdline".into(), "/bin/bash\0/usr/share/omarchy/bin/omarchy-toggle-hybrid-gpu\0".into());
+            f.insert("proc/12/cmdline".into(), "bash\0".into());
+        }
+        let s = collect(&sys, &FakeGfx::default(), &FakeServices::default(), &FakeNvidia::default(), ControlMode::Observe, false).await;
+        assert_eq!(s.gpu.pending_reboot, Some(true));
+        assert_eq!(s.gpu.conf_mode, Some(GpuMode::Integrated));
+        assert!(s.gpu.toggle_running);
+        assert!(!s.gpu.pending_unknown);
     }
 }
