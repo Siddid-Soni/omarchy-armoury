@@ -631,6 +631,7 @@ impl Daemon {
             Request::SetChargeLimit { .. } | Request::OneShotCharge | Request::SetRefresh { .. } | Request::SetGamma { .. }
             | Request::SetToggle { .. } | Request::SetSleepMode { .. } | Request::SetSourceProfile { .. }
             | Request::SetSourceRefresh { .. } => self.system_request(req).await,
+            Request::Keys | Request::SetKeyBinding { .. } => Response::err("not implemented"),
             Request::PlanGpuMode { mode } => match plan_switch(&self.refresh().await.gpu, mode) {
                 Ok(step) => Response::ok(serde_json::to_value(step).unwrap()),
                 Err(e) => Response::err(e),

@@ -11,6 +11,22 @@ pub struct Config {
     pub modes: BTreeMap<Profile, ModeSettings>,
     pub lighting: LightingConfig,
     pub system: SystemConfig,
+    pub keys: KeysConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeysConfig {
+    pub rog: armoury_proto::KeyAction,
+    pub fan: armoury_proto::KeyAction,
+    pub rog_command: Option<String>,
+    pub fan_command: Option<String>,
+}
+
+impl Default for KeysConfig {
+    fn default() -> Self {
+        Self { rog: armoury_proto::KeyAction::OpenWindow, fan: armoury_proto::KeyAction::CycleMode, rog_command: None, fan_command: None }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

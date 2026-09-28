@@ -173,6 +173,28 @@ pub struct SystemState {
     pub camera_present: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HotKey {
+    /// ROG / Armoury key (KEY_PROG1)
+    Rog,
+    /// Fn+F5 fan key (KEY_PROG4)
+    Fan,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyAction {
+    #[default]
+    None,
+    OpenWindow,
+    CycleMode,
+    CycleBrightness,
+    CycleEffect,
+    /// Runs the configured shell command.
+    Command,
+}
+
 /// One GPU switch action. Integrated↔Ultimate is two manual steps via Hybrid.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -421,6 +443,8 @@ pub enum Request {
     SetSleepMode { mode: SleepMode },
     SetSourceProfile { ac: Option<Profile>, battery: Option<Profile> },
     SetSourceRefresh { ac: Option<f32>, battery: Option<f32> },
+    Keys,
+    SetKeyBinding { key: HotKey, action: KeyAction, #[serde(default)] command: Option<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -552,5 +576,14 @@ mod tests {
         assert_eq!(r, Request::SetToggle { toggle: Toggle::Touchpad, on: false });
         let s = Snapshot::default();
         assert!(s.system.mem_sleep.is_none() && s.display.is_empty() && s.battery_info.health_pct.is_none());
+    }
+
+    #[test]
+    fn key_types() {
+        let r: Request = serde_json::from_str(r#"{"cmd":"set_key_binding","key":"fan","action":"cycle_mode"}"#).unwrap();
+        assert_eq!(r, Request::SetKeyBinding { key: HotKey::Fan, action: KeyAction::CycleMode, command: None });
+        let r: Request = serde_json::from_str(r#"{"cmd":"set_key_binding","key":"rog","action":"command","command":"kitty"}"#).unwrap();
+        assert!(matches!(r, Request::SetKeyBinding { key: HotKey::Rog, action: KeyAction::Command, command: Some(_) }));
+        assert_eq!(serde_json::to_string(&Request::Keys).unwrap(), r#"{"cmd":"keys"}"#);
     }
 }
