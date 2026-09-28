@@ -59,6 +59,7 @@ pub fn perf_state(sys: &dyn Sysfs) -> PerfState {
         gpu_fan_rpm: asus.as_ref().and_then(|h| num(format!("{h}/fan2_input"))).map(|v| v as u32),
         power_draw_w: battery.and_then(|b| num(format!("{}/{b}/power_now", sysfs::POWER_SUPPLY_DIR))).map(|uw| uw as f32 / 1_000_000.0),
         cpu_boost: sys.read(sysfs::NO_TURBO).map(|v| v == "0"),
+        undervolt: None,
     }
 }
 

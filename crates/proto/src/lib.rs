@@ -119,6 +119,44 @@ pub struct ModeSettings {
     pub epp: Option<Epp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_boost: Option<bool>,
+    /// Intel core+cache voltage offset, mV (negative = undervolt).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uv_mv: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_core_offset: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_mem_offset: Option<i32>,
+    /// Max GPU core clock, MHz; 0 = no lock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_core_lock: Option<u32>,
+    /// Max VRAM clock, MHz; 0 = no lock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_mem_lock: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NvStatus {
+    pub core_mhz: u32,
+    pub mem_mhz: u32,
+    pub temp_c: u32,
+    pub power_w: f32,
+    pub util_pct: u32,
+    pub vram_used_mb: u64,
+    pub vram_total_mb: u64,
+    pub pstate: String,
+    pub core_offset: i32,
+    pub mem_offset: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuUser {
+    pub pid: u32,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndervoltState {
+    pub unlocked: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -130,6 +168,8 @@ pub struct PerfState {
     pub gpu_fan_rpm: Option<u32>,
     pub power_draw_w: Option<f32>,
     pub cpu_boost: Option<bool>,
+    /// None until the undervolt probe has run (active mode only).
+    pub undervolt: Option<UndervoltState>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -140,6 +180,12 @@ pub struct GpuState {
     pub power: Option<GpuPower>,
     pub mux: Option<u8>,
     pub dgpu_disable: Option<u8>,
+    /// dGPU PCI runtime PM state is "active" (None = no NVIDIA dGPU found).
+    pub dgpu_active: Option<bool>,
+    /// Read only while the dGPU is already awake.
+    pub nvidia: Option<NvStatus>,
+    /// Processes holding /dev/nvidia* (keep the dGPU awake).
+    pub users: Vec<GpuUser>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -180,6 +226,7 @@ pub enum Request {
     ResetFanCurves { profile: Profile },
     ModeSettings { profile: Profile },
     SetModeSettings { profile: Profile, settings: ModeSettings },
+    ProbeUndervolt,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -263,5 +310,13 @@ mod tests {
         });
         let v = serde_json::to_value(ModeSettings { pl2: Some(150), ..Default::default() }).unwrap();
         assert_eq!(v, serde_json::json!({"pl2": 150}));
+    }
+
+    #[test]
+    fn tuning_fields_wire_format() {
+        let r: Request = serde_json::from_str(r#"{"cmd":"set_mode_settings","profile":"performance","settings":{"uv_mv":-40,"gpu_core_offset":100,"gpu_core_lock":0}}"#).unwrap();
+        assert_eq!(r, Request::SetModeSettings { profile: Profile::Performance, settings: ModeSettings {
+            uv_mv: Some(-40), gpu_core_offset: Some(100), gpu_core_lock: Some(0), ..Default::default() } });
+        assert_eq!(serde_json::to_string(&Request::ProbeUndervolt).unwrap(), r#"{"cmd":"probe_undervolt"}"#);
     }
 }

@@ -49,7 +49,7 @@ mod tests {
     use armoury_proto::Epp;
 
     fn full() -> ModeSettings {
-        ModeSettings { pl1: Some(120), pl2: Some(150), nv_boost: Some(25), nv_temp: Some(87), epp: Some(Epp::Performance), cpu_boost: Some(false) }
+        ModeSettings { pl1: Some(120), pl2: Some(150), nv_boost: Some(25), nv_temp: Some(87), epp: Some(Epp::Performance), cpu_boost: Some(false), ..Default::default() }
     }
 
     #[tokio::test]

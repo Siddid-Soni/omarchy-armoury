@@ -204,7 +204,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 None => Request::ModeSettings { profile },
                 Some(ModeAction::Set { pl1, pl2, nv_boost, nv_temp, epp, cpu_boost }) => Request::SetModeSettings {
                     profile,
-                    settings: ModeSettings { pl1, pl2, nv_boost, nv_temp, epp, cpu_boost: cpu_boost.map(|v| v == "on") },
+                    settings: ModeSettings { pl1, pl2, nv_boost, nv_temp, epp, cpu_boost: cpu_boost.map(|v| v == "on"), ..Default::default() },
                 },
             };
             println!("{}", serde_json::to_string_pretty(&call(&req)?)?);

@@ -144,6 +144,7 @@ impl Daemon {
                 self.snapshot_after(with_retry(|| self.asusd.next_profile()).await).await
             }
             Request::FanCurves { profile } => self.curves(profile).await,
+            Request::ProbeUndervolt => Response::err("not implemented"),
             Request::SetFanCurve { profile, curve } => {
                 if let Err(r) = self.write_guard().await { return r; }
                 if let Err(e) = fan::validate(&curve) { return Response::err(e); }
@@ -272,6 +273,11 @@ fn merge(old: ModeSettings, new: ModeSettings) -> ModeSettings {
         nv_temp: new.nv_temp.or(old.nv_temp),
         epp: new.epp.or(old.epp),
         cpu_boost: new.cpu_boost.or(old.cpu_boost),
+        uv_mv: new.uv_mv.or(old.uv_mv),
+        gpu_core_offset: new.gpu_core_offset.or(old.gpu_core_offset),
+        gpu_mem_offset: new.gpu_mem_offset.or(old.gpu_mem_offset),
+        gpu_core_lock: new.gpu_core_lock.or(old.gpu_core_lock),
+        gpu_mem_lock: new.gpu_mem_lock.or(old.gpu_mem_lock),
     }
 }
 
