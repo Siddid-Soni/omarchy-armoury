@@ -3,7 +3,8 @@ use crate::control::{Control, ModeHandle, handback, takeover};
 use crate::features::fan;
 use crate::features::limits::{self, Bounds, Limit};
 use crate::features::perf::{HwCtx, apply_mode, apply_nv, nv_is_stock};
-use crate::hw::{Asusd, Gfx, Nvidia, Services, Sysfs, with_retry};
+use crate::features::lighting::{effect_from_raw, effect_to_raw, power_from_raw, set_zone, validate_effect};
+use crate::hw::{Asusd, Aura, Gfx, Nvidia, Services, Sysfs, with_retry};
 use crate::state::collect;
 use anyhow::{Context, bail};
 use crate::features::gpu::plan_switch;
@@ -22,6 +23,7 @@ pub struct Daemon {
     svc: Box<dyn Services>,
     asusd: Box<dyn Asusd>,
     nv: Box<dyn Nvidia>,
+    aura: Box<dyn Aura>,
     pub control: Mutex<Control>,
     mode: ModeHandle,
     snap: watch::Sender<Option<Snapshot>>,
@@ -35,6 +37,7 @@ pub struct Daemon {
     apply_error: std::sync::Mutex<Option<String>>,
     /// Serialises GPU plan + execute.
     gpu_lock: Mutex<()>,
+    light: std::sync::Mutex<LightState>,
     state_dir: PathBuf,
     last_reapply: std::sync::Mutex<tokio::time::Instant>,
 }
@@ -46,14 +49,102 @@ impl Daemon {
         let mode = control.mode_handle();
         let state_dir = control.state_dir();
         Arc::new(Self {
-            sys, gfx, svc, asusd, nv, control: Mutex::new(control), mode, snap: watch::channel(None).0,
+            sys, gfx, svc, asusd, nv, aura: Box::new(NoAura), control: Mutex::new(control), mode, snap: watch::channel(None).0,
             config: Mutex::new(config), config_path, config_error,
             apply: Mutex::new(ApplyState::default()),
             uv: std::sync::Mutex::new(None),
             apply_error: std::sync::Mutex::new(None),
             gpu_lock: Mutex::new(()),
+            light: std::sync::Mutex::new(LightState::default()),
             state_dir, last_reapply: std::sync::Mutex::new(tokio::time::Instant::now()),
         })
+    }
+
+    /// Sets the asusd Aura client (keyboard lighting); call before the daemon is shared.
+    pub fn with_aura(self: Arc<Self>, aura: Box<dyn Aura>) -> Arc<Self> {
+        let mut d = Arc::try_unwrap(self).ok().expect("with_aura before the daemon is shared");
+        d.aura = aura;
+        Arc::new(d)
+    }
+
+    /// Applies the stored AC/battery keyboard brightness when the power source changes.
+    async fn follow_power_source(&self, snap: &Snapshot) {
+        let Some(on_ac) = snap.lighting.on_ac else { return };
+        let target = {
+            let mut l = self.light.lock().unwrap();
+            if l.on_ac == Some(on_ac) { return; }
+            l.on_ac = Some(on_ac);
+            if l.idle_saved.is_some() { return; } // resume will restore
+            let cfg = self.config.try_lock();
+            let Ok(cfg) = cfg else { return };
+            if on_ac { cfg.lighting.brightness_ac } else { cfg.lighting.brightness_battery }
+        };
+        if let Some(t) = target.filter(|t| snap.lighting.brightness != Some(*t)) {
+            if let Err(e) = with_retry(|| self.aura.set_brightness(t as u32)).await { eprintln!("armouryd: keyboard brightness: {e:#}"); }
+        }
+    }
+
+    async fn lighting_request(&self, req: Request) -> Response {
+        if !matches!(req, Request::Lighting) {
+            if let Err(r) = self.write_guard().await { return r; }
+        }
+        let info = || async { with_retry(|| self.aura.info()).await };
+        let result: anyhow::Result<serde_json::Value> = async {
+            match req {
+                Request::Lighting => {
+                    let (mode, power, modes, zones) = info().await?;
+                    Ok(serde_json::to_value(armoury_proto::LightingInfo {
+                        effect: effect_from_raw(&mode),
+                        zones: power_from_raw(&power),
+                        modes: modes.into_iter().filter_map(armoury_proto::AuraMode::from_code).collect(),
+                        power_zones: zones.into_iter().filter_map(armoury_proto::AuraZone::from_code).collect(),
+                    })?)
+                }
+                Request::SetBrightness { level } => {
+                    anyhow::ensure!(level <= 3, "brightness must be 0–3 (off, low, med, high)");
+                    with_retry(|| self.aura.set_brightness(level as u32)).await?;
+                    let on_ac = self.refresh().await.lighting.on_ac.unwrap_or(true);
+                    let mut cfg = self.config.lock().await;
+                    if on_ac { cfg.lighting.brightness_ac = Some(level) } else { cfg.lighting.brightness_battery = Some(level) }
+                    cfg.save(&self.config_path)?;
+                    self.light.lock().unwrap().idle_saved = None;
+                    Ok(serde_json::json!({"level": level, "on_ac": on_ac}))
+                }
+                Request::SetEffect { effect } => {
+                    let (_, _, modes, _) = info().await?;
+                    let supported: Vec<_> = modes.into_iter().filter_map(armoury_proto::AuraMode::from_code).collect();
+                    validate_effect(&effect, &supported).map_err(anyhow::Error::msg)?;
+                    with_retry(|| self.aura.set_mode_data(effect_to_raw(&effect))).await?;
+                    Ok(serde_json::to_value(effect)?)
+                }
+                Request::SetZonePower { zone } => {
+                    let (_, power, _, zones) = info().await?;
+                    anyhow::ensure!(zones.contains(&zone.zone.code()), "{:?} lighting is not available on this laptop", zone.zone);
+                    let new = set_zone(&power, &zone);
+                    with_retry(|| self.aura.set_power(new.clone())).await?;
+                    Ok(serde_json::to_value(power_from_raw(&new))?)
+                }
+                Request::KbdIdle => {
+                    if self.config.lock().await.lighting.keep_on { return Ok(serde_json::json!({"dimmed": false})); }
+                    let current = self.refresh().await.lighting.brightness.unwrap_or(0);
+                    let first = {
+                        let mut l = self.light.lock().unwrap();
+                        let first = l.idle_saved.is_none();
+                        if first { l.idle_saved = Some(current); }
+                        first
+                    };
+                    if first && current > 0 { with_retry(|| self.aura.set_brightness(0)).await?; }
+                    Ok(serde_json::json!({"dimmed": true}))
+                }
+                Request::KbdResume => {
+                    let saved = self.light.lock().unwrap().idle_saved.take();
+                    if let Some(level) = saved.filter(|l| *l > 0) { with_retry(|| self.aura.set_brightness(level as u32)).await?; }
+                    Ok(serde_json::json!({"restored": saved}))
+                }
+                _ => unreachable!(),
+            }
+        }.await;
+        match result { Ok(v) => Response::ok(v), Err(e) => Response::err(format!("{e:#}")) }
     }
 
     /// One poll: refresh, then (active only) apply the mode's settings when the
@@ -74,8 +165,10 @@ impl Daemon {
         let snap = self.refresh().await;
         if self.mode.get() != ControlMode::Active {
             *st = ApplyState::default(); // re-apply after the next takeover
+            *self.light.lock().unwrap() = LightState::default();
             return Vec::new();
         }
+        self.follow_power_source(&snap).await;
         let now = tokio::time::Instant::now();
         if self.uv.lock().unwrap().is_none() && self.config.lock().await.modes.values().any(|m| m.uv_mv.is_some())
             && st.probe_retry_at.is_none_or(|t| now >= t)
@@ -304,7 +397,7 @@ impl Daemon {
             }
             Request::FanCurves { profile } => self.curves(profile).await,
             Request::Lighting | Request::SetBrightness { .. } | Request::SetEffect { .. } | Request::SetZonePower { .. }
-            | Request::KbdIdle | Request::KbdResume => Response::err("not implemented"),
+            | Request::KbdIdle | Request::KbdResume => self.lighting_request(req).await,
             Request::PlanGpuMode { mode } => match plan_switch(&self.refresh().await.gpu, mode) {
                 Ok(step) => Response::ok(serde_json::to_value(step).unwrap()),
                 Err(e) => Response::err(e),
@@ -441,6 +534,28 @@ impl Daemon {
 
 use crate::control::{PKEXEC, ROOT_HELPER};
 
+/// Keyboard lighting bookkeeping (active mode).
+#[derive(Default)]
+struct LightState {
+    /// Power source seen at the last tick.
+    on_ac: Option<bool>,
+    /// Brightness before KbdIdle dimmed it.
+    idle_saved: Option<u8>,
+}
+
+/// Placeholder until main wires the asusd Aura client.
+struct NoAura;
+
+#[async_trait::async_trait]
+impl Aura for NoAura {
+    async fn info(&self) -> anyhow::Result<(crate::features::lighting::RawMode, crate::features::lighting::RawPower, Vec<u32>, Vec<u32>)> {
+        anyhow::bail!("asusd has no Aura keyboard device")
+    }
+    async fn set_mode_data(&self, _: crate::features::lighting::RawMode) -> anyhow::Result<()> { anyhow::bail!("asusd has no Aura keyboard device") }
+    async fn set_power(&self, _: crate::features::lighting::RawPower) -> anyhow::Result<()> { anyhow::bail!("asusd has no Aura keyboard device") }
+    async fn set_brightness(&self, _: u32) -> anyhow::Result<()> { anyhow::bail!("asusd has no Aura keyboard device") }
+}
+
 const RETRY_BACKOFF: Duration = Duration::from_secs(30);
 const PROBE_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -519,7 +634,7 @@ pub fn bind(path: &Path) -> anyhow::Result<UnixListener> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hw::fake::{FakeAsusd, FakeGfx, FakeNvidia, FakeServices, FakeSysfs};
+    use crate::hw::fake::{FakeAsusd, FakeAura, FakeGfx, FakeNvidia, FakeServices, FakeSysfs};
     use armoury_proto::ControlMode;
     use std::path::PathBuf;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1061,5 +1176,117 @@ mod tests {
         let resp = r.d.handle(gpu_req("set_gpu_mode", "AsusMuxDgpu")).await;
         assert!(resp.ok, "{resp:?}");
         assert_eq!(r.gfx.set_calls.lock().unwrap().len(), 1, "never blind-retried");
+    }
+
+    struct LightRig { d: Arc<Daemon>, sys: Arc<FakeSysfs>, aura: Arc<FakeAura>, dir: tempfile::TempDir }
+
+    fn light_rig(active: bool, aura: FakeAura, toml: &str) -> LightRig {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), toml).unwrap();
+        let sys = Arc::new(FakeSysfs::with(&[
+            ("sys/class/leds/asus::kbd_backlight/brightness", "3"),
+            ("sys/class/power_supply/ADP0/type", "Mains"),
+            ("sys/class/power_supply/ADP0/online", "1"),
+        ]));
+        let aura = Arc::new(aura);
+        let mut ctl = Control::load(dir.path());
+        if active { ctl.set(ControlMode::Active).unwrap(); }
+        let d = Daemon::new(Box::new(sys.clone()), Box::new(FakeGfx::default()), Box::new(FakeServices::default()),
+            Box::new(FakeAsusd::default()), ctl, dir.path().join("config.toml"), Box::new(FakeNvidia::default()))
+            .with_aura(Box::new(aura.clone()));
+        LightRig { d, sys, aura, dir }
+    }
+
+    fn req(v: serde_json::Value) -> Request { serde_json::from_value(v).unwrap() }
+    fn acalls(r: &LightRig) -> Vec<String> { r.aura.calls.lock().unwrap().clone() }
+    fn set_brightness_sysfs(r: &LightRig, v: &str) { r.sys.files.lock().unwrap().insert("sys/class/leds/asus::kbd_backlight/brightness".into(), v.into()); }
+
+    #[tokio::test]
+    async fn lighting_info_and_effect() {
+        let r = light_rig(true, FakeAura::default(), "");
+        let info = r.d.handle(Request::Lighting).await.data.unwrap();
+        assert_eq!(info["effect"]["mode"], "static");
+        assert_eq!(info["power_zones"].as_array().unwrap().len(), 3);
+        let resp = r.d.handle(req(serde_json::json!({"cmd":"set_effect","effect":{"mode":"rainbow_wave","colour1":[255,0,0],"colour2":[0,0,0],"speed":"high","direction":"left"}}))).await;
+        assert!(resp.ok, "{resp:?}");
+        assert_eq!(acalls(&r), ["set_mode_data 3"]);
+    }
+
+    #[tokio::test]
+    async fn unsupported_mode_refused() {
+        let r = light_rig(true, FakeAura { modes: vec![0], ..Default::default() }, "");
+        let resp = r.d.handle(req(serde_json::json!({"cmd":"set_effect","effect":{"mode":"comet","colour1":[0,0,0],"colour2":[0,0,0],"speed":"med","direction":"right"}}))).await;
+        assert!(resp.error.unwrap().contains("not supported"));
+        assert!(acalls(&r).is_empty());
+    }
+
+    #[tokio::test]
+    async fn zone_power_keeps_other_zones() {
+        let r = light_rig(true, FakeAura::default(), "");
+        assert!(r.d.handle(req(serde_json::json!({"cmd":"set_zone_power","zone":{"zone":"logo","boot":false,"awake":false,"sleep":false,"shutdown":false}}))).await.ok);
+        let p = r.aura.power.lock().unwrap().clone();
+        assert_eq!(p.0, vec![(1, true, true, false, false), (2, true, true, false, false), (0, false, false, false, false)]);
+        let resp = r.d.handle(req(serde_json::json!({"cmd":"set_zone_power","zone":{"zone":"rear_glow","boot":true,"awake":true,"sleep":false,"shutdown":false}}))).await;
+        assert!(resp.error.unwrap().contains("not"), "unsupported zone refused");
+    }
+
+    #[tokio::test]
+    async fn brightness_stored_per_power_source() {
+        let r = light_rig(true, FakeAura::default(), "");
+        assert!(r.d.handle(req(serde_json::json!({"cmd":"set_brightness","level":1}))).await.ok);
+        assert_eq!(acalls(&r), ["set_brightness 1"]);
+        let text = std::fs::read_to_string(r.dir.path().join("config.toml")).unwrap();
+        assert!(text.contains("brightness_ac = 1"), "{text}");
+        assert!(r.d.handle(req(serde_json::json!({"cmd":"set_brightness","level":7}))).await.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn brightness_follows_power_source() {
+        let r = light_rig(true, FakeAura::default(), "[lighting]\nbrightness_ac = 3\nbrightness_battery = 1\n");
+        r.d.tick().await; // on AC, sysfs already 3 → no write
+        assert!(!acalls(&r).iter().any(|c| c.starts_with("set_brightness")), "{:?}", acalls(&r));
+        r.sys.files.lock().unwrap().insert("sys/class/power_supply/ADP0/online".into(), "0".into());
+        r.d.tick().await;
+        assert_eq!(acalls(&r).last().unwrap(), "set_brightness 1");
+        set_brightness_sysfs(&r, "1");
+        r.d.tick().await; // still on battery: no repeat
+        assert_eq!(acalls(&r).iter().filter(|c| c.starts_with("set_brightness")).count(), 1);
+        r.sys.files.lock().unwrap().insert("sys/class/power_supply/ADP0/online".into(), "1".into());
+        r.d.tick().await;
+        assert_eq!(acalls(&r).last().unwrap(), "set_brightness 3");
+    }
+
+    #[tokio::test]
+    async fn idle_twice_restores_original() {
+        let r = light_rig(true, FakeAura::default(), "");
+        set_brightness_sysfs(&r, "2");
+        assert!(r.d.handle(Request::KbdIdle).await.ok);
+        set_brightness_sysfs(&r, "0");
+        assert!(r.d.handle(Request::KbdIdle).await.ok);
+        assert!(r.d.handle(Request::KbdResume).await.ok);
+        assert_eq!(acalls(&r), ["set_brightness 0", "set_brightness 2"]);
+        assert!(r.d.handle(Request::KbdResume).await.ok, "resume when not idle is a no-op");
+        assert_eq!(acalls(&r).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn keep_on_disables_idle() {
+        let r = light_rig(true, FakeAura::default(), "[lighting]\nkeep_on = true\n");
+        assert!(r.d.handle(Request::KbdIdle).await.ok);
+        assert!(acalls(&r).is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_aura_device() {
+        let r = light_rig(true, FakeAura { missing: true, ..Default::default() }, "");
+        assert!(r.d.handle(Request::Lighting).await.error.unwrap().contains("no Aura"));
+    }
+
+    #[tokio::test]
+    async fn lighting_writes_refused_in_observe() {
+        let r = light_rig(false, FakeAura::default(), "");
+        assert!(r.d.handle(req(serde_json::json!({"cmd":"set_brightness","level":1}))).await.error.unwrap().contains("observe"));
+        assert!(r.d.handle(Request::KbdIdle).await.error.unwrap().contains("observe"));
+        assert_eq!(r.d.refresh().await.lighting.brightness, Some(3), "reads still work");
     }
 }

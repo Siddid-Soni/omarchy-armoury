@@ -1,5 +1,5 @@
 use crate::hw::{Gfx, Nvidia, Services, Sysfs, sysfs, with_retry};
-use armoury_proto::{BatteryState, ControlMode, GpuMode, GpuPower, GpuState, PerfState, Profile, Snapshot};
+use armoury_proto::{BatteryState, ControlMode, GpuMode, GpuPower, GpuState, LightingState, PerfState, Profile, Snapshot};
 
 /// `gpu_detail` reads NVIDIA status and dGPU users. Only for explicit requests: polling
 /// NVML every 2 s kept the dGPU from ever runtime-suspending (measured on the G533ZW).
@@ -12,7 +12,10 @@ pub async fn collect(sys: &dyn Sysfs, gfx: &dyn Gfx, svc: &dyn Services, nv: &dy
         gpu: gpu_state(sys, gfx, nv, gpu_detail).await,
         battery: battery_state(sys),
         perf: perf_state(sys),
-        lighting: Default::default(),
+        lighting: LightingState {
+            brightness: sys.read(sysfs::KBD_BRIGHTNESS).and_then(|v| v.parse().ok()),
+            on_ac: on_ac(sys),
+        },
         config_error: None,
         apply_error: None,
         asusd_running: svc.unit_active("asusd.service", false).await,
@@ -61,6 +64,15 @@ fn battery_state(sys: &dyn Sysfs) -> BatteryState {
         status: attr("status"),
         charge_limit: attr("charge_control_end_threshold").and_then(|v| v.parse().ok()),
     }
+}
+
+/// Some(true) if any mains supply is online; None if the machine reports none.
+pub fn on_ac(sys: &dyn Sysfs) -> Option<bool> {
+    let mains: Vec<String> = sys.list(sysfs::POWER_SUPPLY_DIR).into_iter()
+        .filter(|n| sys.read(&format!("{}/{n}/type", sysfs::POWER_SUPPLY_DIR)).as_deref() == Some("Mains"))
+        .collect();
+    if mains.is_empty() { return None; }
+    Some(mains.iter().any(|n| sys.read(&format!("{}/{n}/online", sysfs::POWER_SUPPLY_DIR)).as_deref() == Some("1")))
 }
 
 pub fn perf_state(sys: &dyn Sysfs) -> PerfState {
@@ -199,5 +211,21 @@ mod tests {
         assert_eq!(s.gpu.conf_mode, Some(GpuMode::Integrated));
         assert!(s.gpu.toggle_running);
         assert!(!s.gpu.pending_unknown);
+    }
+
+    #[tokio::test]
+    async fn lighting_readings() {
+        let sys = machine();
+        {
+            let mut f = sys.files.lock().unwrap();
+            f.insert("sys/class/leds/asus::kbd_backlight/brightness".into(), "2".into());
+            f.insert("sys/class/power_supply/ADP0/online".into(), "1".into());
+        }
+        let s = collect(&sys, &FakeGfx::default(), &FakeServices::default(), &FakeNvidia::default(), ControlMode::Observe, false).await;
+        assert_eq!(s.lighting.brightness, Some(2));
+        assert_eq!(s.lighting.on_ac, Some(true));
+        sys.files.lock().unwrap().insert("sys/class/power_supply/ADP0/online".into(), "0".into());
+        let s = collect(&sys, &FakeGfx::default(), &FakeServices::default(), &FakeNvidia::default(), ControlMode::Observe, false).await;
+        assert_eq!(s.lighting.on_ac, Some(false));
     }
 }

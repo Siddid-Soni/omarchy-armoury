@@ -1,6 +1,6 @@
 use armouryd::config::config_path;
 use armouryd::control::{Control, state_dir};
-use armouryd::hw::{asusd::AsusdClient, nvidia::RealNvidia, services::RealServices, supergfx::SupergfxClient, sysfs::RealSysfs};
+use armouryd::hw::{asusd::AsusdClient, aura::AuraClient, nvidia::RealNvidia, services::RealServices, supergfx::SupergfxClient, sysfs::RealSysfs};
 use armouryd::ipc::{Daemon, bind};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -21,7 +21,8 @@ async fn main() -> anyhow::Result<()> {
         Control::load(&dir),
         config_path(&home),
         Box::new(RealNvidia::new("/")),
-    );
+    )
+    .with_aura(Box::new(AuraClient::new().await?));
     eprintln!("armouryd: {:?} mode, socket {}", daemon.control.lock().await.mode(), armoury_proto::socket_path().display());
     tokio::spawn(daemon.clone().poll_loop(Duration::from_secs(2)));
     daemon.serve(listener).await

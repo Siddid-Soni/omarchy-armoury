@@ -9,6 +9,17 @@ pub struct Config {
     /// Re-write the current mode's power limits this often (0 = off); BIOS can clobber them.
     pub reapply_power_secs: u32,
     pub modes: BTreeMap<Profile, ModeSettings>,
+    pub lighting: LightingConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LightingConfig {
+    /// Keyboard brightness (0–3) to use on AC / on battery; None = leave as is.
+    pub brightness_ac: Option<u8>,
+    pub brightness_battery: Option<u8>,
+    /// Never dim the keyboard when idle.
+    pub keep_on: bool,
 }
 
 pub fn config_path(home: &Path) -> PathBuf {
