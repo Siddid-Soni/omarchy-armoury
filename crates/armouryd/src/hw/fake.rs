@@ -1,5 +1,6 @@
 use super::{Asusd, GHELPER_UNIT, Gfx, Services, Sysfs};
 use crate::features::fan::RawCurve;
+use crate::features::lighting::{RawMode, RawPower};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
@@ -108,6 +109,54 @@ impl Services for FakeServices {
     }
     async fn is_running(&self, process: &str) -> bool { self.running.lock().unwrap().contains(process) }
     async fn unit_active(&self, unit: &str, _user: bool) -> bool { self.active_units.lock().unwrap().contains(unit) }
+}
+
+pub struct FakeAura {
+    pub calls: Mutex<Vec<String>>,
+    pub mode: Mutex<RawMode>,
+    pub power: Mutex<RawPower>,
+    pub brightness: Mutex<u32>,
+    pub modes: Vec<u32>,
+    pub zones: Vec<u32>,
+    pub missing: bool,
+}
+
+impl Default for FakeAura {
+    /// State captured from the G533ZW's asusd.
+    fn default() -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            mode: Mutex::new((0, 0, (166, 0, 0), (0, 0, 0), "Med".into(), "Right".into())),
+            power: Mutex::new((vec![(1, true, true, false, false), (2, true, true, false, false), (0, true, true, false, false)],)),
+            brightness: Mutex::new(3),
+            modes: vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12],
+            zones: vec![1, 2, 0],
+            missing: false,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl super::Aura for FakeAura {
+    async fn info(&self) -> anyhow::Result<(RawMode, RawPower, Vec<u32>, Vec<u32>)> {
+        if self.missing { anyhow::bail!("asusd has no Aura keyboard device"); }
+        Ok((self.mode.lock().unwrap().clone(), self.power.lock().unwrap().clone(), self.modes.clone(), self.zones.clone()))
+    }
+    async fn set_mode_data(&self, m: RawMode) -> anyhow::Result<()> {
+        self.calls.lock().unwrap().push(format!("set_mode_data {}", m.0));
+        *self.mode.lock().unwrap() = m;
+        Ok(())
+    }
+    async fn set_power(&self, p: RawPower) -> anyhow::Result<()> {
+        self.calls.lock().unwrap().push(format!("set_power {:?}", p.0));
+        *self.power.lock().unwrap() = p;
+        Ok(())
+    }
+    async fn set_brightness(&self, level: u32) -> anyhow::Result<()> {
+        self.calls.lock().unwrap().push(format!("set_brightness {level}"));
+        *self.brightness.lock().unwrap() = level;
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -221,5 +270,19 @@ mod tests {
         let g = FakeGfx::default();
         assert_eq!(g.set_mode(5).await.unwrap(), 1);
         assert_eq!(*g.set_calls.lock().unwrap(), [5]);
+    }
+
+    #[tokio::test]
+    async fn fake_aura_holds_state() {
+        use crate::hw::Aura;
+        let a = FakeAura::default();
+        let (mode, power, modes, zones) = a.info().await.unwrap();
+        assert_eq!(mode.0, 0);
+        assert_eq!(power.0.len(), 3);
+        assert_eq!(modes.len(), 12);
+        assert_eq!(zones, [1, 2, 0]);
+        a.set_brightness(1).await.unwrap();
+        assert_eq!(*a.brightness.lock().unwrap(), 1);
+        assert_eq!(a.calls.lock().unwrap()[0], "set_brightness 1");
     }
 }

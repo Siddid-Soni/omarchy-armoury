@@ -1,4 +1,5 @@
 pub mod asusd;
+pub mod aura;
 pub mod fake;
 pub mod nvidia;
 pub mod services;
@@ -6,6 +7,7 @@ pub mod supergfx;
 pub mod sysfs;
 
 use crate::features::fan::RawCurve;
+use crate::features::lighting::{RawMode, RawPower};
 use std::future::Future;
 use std::time::Duration;
 
@@ -33,6 +35,24 @@ impl<T: Gfx + ?Sized> Gfx for std::sync::Arc<T> {
     async fn pending_mode(&self) -> anyhow::Result<u32> { (**self).pending_mode().await }
     async fn power(&self) -> anyhow::Result<u32> { (**self).power().await }
     async fn set_mode(&self, mode: u32) -> anyhow::Result<u32> { (**self).set_mode(mode).await }
+}
+
+/// asusd Aura (keyboard / lightbar / logo lighting).
+#[async_trait::async_trait]
+pub trait Aura: Send + Sync {
+    /// (LedModeData, LedPower, SupportedBasicModes, SupportedPowerZones)
+    async fn info(&self) -> anyhow::Result<(RawMode, RawPower, Vec<u32>, Vec<u32>)>;
+    async fn set_mode_data(&self, m: RawMode) -> anyhow::Result<()>;
+    async fn set_power(&self, p: RawPower) -> anyhow::Result<()>;
+    async fn set_brightness(&self, level: u32) -> anyhow::Result<()>;
+}
+
+#[async_trait::async_trait]
+impl<T: Aura + ?Sized> Aura for std::sync::Arc<T> {
+    async fn info(&self) -> anyhow::Result<(RawMode, RawPower, Vec<u32>, Vec<u32>)> { (**self).info().await }
+    async fn set_mode_data(&self, m: RawMode) -> anyhow::Result<()> { (**self).set_mode_data(m).await }
+    async fn set_power(&self, p: RawPower) -> anyhow::Result<()> { (**self).set_power(p).await }
+    async fn set_brightness(&self, level: u32) -> anyhow::Result<()> { (**self).set_brightness(level).await }
 }
 
 /// The NVIDIA dGPU. Implementations must not touch the device unless it is already awake.
