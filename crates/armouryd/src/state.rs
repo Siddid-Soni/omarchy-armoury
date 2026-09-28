@@ -12,6 +12,7 @@ pub async fn collect(sys: &dyn Sysfs, gfx: &dyn Gfx, svc: &dyn Services, nv: &dy
         gpu: gpu_state(sys, gfx, nv, gpu_detail).await,
         battery: battery_state(sys),
         perf: perf_state(sys),
+        lighting: Default::default(),
         config_error: None,
         apply_error: None,
         asusd_running: svc.unit_active("asusd.service", false).await,

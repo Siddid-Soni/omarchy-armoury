@@ -47,6 +47,76 @@ impl GpuMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuraMode { Static, Breathe, RainbowCycle, RainbowWave, Star, Rain, Highlight, Laser, Ripple, Pulse, Comet, Flash }
+
+impl AuraMode {
+    const CODES: [(AuraMode, u32); 12] = [
+        (Self::Static, 0), (Self::Breathe, 1), (Self::RainbowCycle, 2), (Self::RainbowWave, 3), (Self::Star, 4), (Self::Rain, 5),
+        (Self::Highlight, 6), (Self::Laser, 7), (Self::Ripple, 8), (Self::Pulse, 10), (Self::Comet, 11), (Self::Flash, 12),
+    ];
+    /// asusd AuraModeNum.
+    pub fn code(self) -> u32 { Self::CODES.iter().find(|(m, _)| *m == self).unwrap().1 }
+    pub fn from_code(c: u32) -> Option<Self> { Self::CODES.iter().find(|(_, v)| *v == c).map(|(m, _)| *m) }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Speed { Low, #[default] Med, High }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction { #[default] Right, Left, Up, Down }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuraZone { Logo, Keyboard, Lightbar, Lid, RearGlow }
+
+impl AuraZone {
+    /// asusd PowerZones.
+    pub fn code(self) -> u32 {
+        match self { Self::Logo => 0, Self::Keyboard => 1, Self::Lightbar => 2, Self::Lid => 3, Self::RearGlow => 4 }
+    }
+    pub fn from_code(c: u32) -> Option<Self> {
+        [Self::Logo, Self::Keyboard, Self::Lightbar, Self::Lid, Self::RearGlow].get(c as usize).copied()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuraEffect {
+    pub mode: AuraMode,
+    pub colour1: [u8; 3],
+    pub colour2: [u8; 3],
+    pub speed: Speed,
+    pub direction: Direction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZonePower {
+    pub zone: AuraZone,
+    pub boot: bool,
+    pub awake: bool,
+    pub sleep: bool,
+    pub shutdown: bool,
+}
+
+/// Read from asusd on request (active mode).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LightingInfo {
+    pub effect: Option<AuraEffect>,
+    pub zones: Vec<ZonePower>,
+    pub modes: Vec<AuraMode>,
+    pub power_zones: Vec<AuraZone>,
+}
+
+/// Observe-safe lighting readings (sysfs).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LightingState {
+    pub brightness: Option<u8>,
+    pub on_ac: Option<bool>,
+}
+
 /// One GPU switch action. Integrated↔Ultimate is two manual steps via Hybrid.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -245,6 +315,7 @@ pub struct Snapshot {
     pub gpu: GpuState,
     pub battery: BatteryState,
     pub perf: PerfState,
+    pub lighting: LightingState,
     /// Why config.toml (or part of it) was ignored, if it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_error: Option<String>,
@@ -273,6 +344,12 @@ pub enum Request {
     ProbeUndervolt,
     SetGpuMode { mode: GpuMode },
     PlanGpuMode { mode: GpuMode },
+    Lighting,
+    SetBrightness { level: u8 },
+    SetEffect { effect: AuraEffect },
+    SetZonePower { zone: ZonePower },
+    KbdIdle,
+    KbdResume,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -375,5 +452,18 @@ mod tests {
         assert_eq!(v["first"]["kind"], "omarchy_toggle");
         let r: Request = serde_json::from_str(r#"{"cmd":"set_gpu_mode","mode":"AsusMuxDgpu"}"#).unwrap();
         assert_eq!(r, Request::SetGpuMode { mode: GpuMode::AsusMuxDgpu });
+    }
+
+    #[test]
+    fn lighting_types() {
+        for c in [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12] { assert_eq!(AuraMode::from_code(c).unwrap().code(), c); }
+        assert_eq!(AuraMode::from_code(9), None);
+        assert_eq!(AuraZone::Lightbar.code(), 2);
+        assert_eq!(AuraZone::from_code(0), Some(AuraZone::Logo));
+        let r: Request = serde_json::from_str(r#"{"cmd":"set_effect","effect":{"mode":"rainbow_wave","colour1":[255,0,0],"colour2":[0,0,0],"speed":"high","direction":"left"}}"#).unwrap();
+        assert_eq!(r, Request::SetEffect { effect: AuraEffect { mode: AuraMode::RainbowWave, colour1: [255, 0, 0], colour2: [0, 0, 0], speed: Speed::High, direction: Direction::Left } });
+        let z: Request = serde_json::from_str(r#"{"cmd":"set_zone_power","zone":{"zone":"logo","boot":true,"awake":false,"sleep":false,"shutdown":false}}"#).unwrap();
+        assert!(matches!(z, Request::SetZonePower { .. }));
+        assert_eq!(serde_json::to_string(&Request::KbdIdle).unwrap(), r#"{"cmd":"kbd_idle"}"#);
     }
 }
