@@ -65,6 +65,33 @@ pub fn parse_uv(s: &str) -> Result<i32, String> {
 /// Readback rounds at ~1 mV; a BIOS-locked mailbox reads back 0.
 pub fn uv_matches(requested: i32, readback: i32) -> bool { (requested - readback).abs() <= 3 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NvArgs {
+    pub core_offset: i32,
+    pub mem_offset: i32,
+    pub core_lock: Option<u32>,
+    pub mem_lock: Option<u32>,
+}
+
+/// `nv-clocks <core_off> <mem_off> <core_lock|off> <mem_lock|off>`; hard caps before NVML's own range check.
+pub fn parse_nv_args(a: &[String]) -> Result<NvArgs, String> {
+    if a.len() != 4 { return Err(format!("nv-clocks takes 4 arguments, got {}", a.len())); }
+    let off = |s: &str, name: &str, lo: i32, hi: i32| {
+        s.parse::<i32>().ok().filter(|v| (lo..=hi).contains(v)).ok_or_else(|| format!("{name} offset must be {lo}–{hi} MHz, got {s:?}"))
+    };
+    let lock = |s: &str, name: &str| -> Result<Option<u32>, String> {
+        if s == "off" { return Ok(None); }
+        s.parse::<u32>().ok().filter(|v| (200..=3000).contains(v)).map(Some)
+            .ok_or_else(|| format!("{name} lock must be 200–3000 MHz or off, got {s:?}"))
+    };
+    Ok(NvArgs {
+        core_offset: off(&a[0], "core", -500, 500)?,
+        mem_offset: off(&a[1], "memory", -2000, 3000)?,
+        core_lock: lock(&a[2], "core")?,
+        mem_lock: lock(&a[3], "memory")?,
+    })
+}
+
 /// `on|off` → value for intel_pstate/no_turbo.
 pub fn no_turbo_value(state: &str) -> Result<&'static str, String> {
     match state {
@@ -418,5 +445,15 @@ mod host_tests {
         assert!(parse_uv("5").is_err());
         assert!(parse_uv("-4O").is_err());
         assert!(uv_matches(-40, -39) && !uv_matches(-40, 0));
+    }
+
+    #[test]
+    fn nv_args() {
+        let a = |v: &[&str]| parse_nv_args(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(a(&["100", "-200", "1500", "off"]), Ok(NvArgs { core_offset: 100, mem_offset: -200, core_lock: Some(1500), mem_lock: None }));
+        assert!(a(&["900", "0", "off", "off"]).unwrap_err().contains("core"));
+        assert!(a(&["0", "0", "50", "off"]).unwrap_err().contains("lock"));
+        assert!(a(&["0", "0", "off"]).unwrap_err().contains("4"));
+        assert!(a(&["x", "0", "off", "off"]).is_err());
     }
 }

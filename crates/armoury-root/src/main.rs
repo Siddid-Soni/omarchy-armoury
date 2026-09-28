@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process::Command;
 
 mod msr;
+mod nv;
 
 #[derive(Parser)]
 #[command(name = "armoury-root", about = "Privileged helper for omarchy-armoury (fixed command set)")]
@@ -25,6 +26,11 @@ enum Cmd {
     AsusdSupportRestore,
     /// Write power limits / CPU boost: pl1= pl2= nv_boost= nv_temp= cpu_boost=on|off
     SetLimits { args: Vec<String> },
+    /// NVIDIA clocks: <core_off> <mem_off> <core_lock|off> <mem_lock|off> (MHz)
+    NvClocks {
+        #[arg(allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Intel CPU undervolt via the OC mailbox (MSR 0x150)
     Undervolt {
         #[command(subcommand)]
@@ -144,6 +150,14 @@ fn undervolt(action: UvAction) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn nv_clocks(args: &[String]) -> anyhow::Result<()> {
+    let a = parse_nv_args(args).map_err(anyhow::Error::msg)?;
+    require_active()?;
+    let (core, mem) = nv::apply(a)?;
+    println!("core_offset={core} mem_offset={mem}");
+    Ok(())
+}
+
 fn set_limits(args: &[String]) -> anyhow::Result<()> {
     let pairs = parse_limits(args).map_err(anyhow::Error::msg)?;
     require_active()?;
@@ -188,6 +202,7 @@ fn main() {
         Cmd::AsusdSupportRestore => asusd_support_restore(),
         Cmd::SetLimits { args } => set_limits(&args),
         Cmd::Undervolt { action } => undervolt(action),
+        Cmd::NvClocks { args } => nv_clocks(&args),
     };
     if let Err(e) = r {
         eprintln!("armoury-root: {e:#}");

@@ -8,3 +8,4 @@ license.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 nix.workspace = true
+nvml-wrapper = "0.13"
