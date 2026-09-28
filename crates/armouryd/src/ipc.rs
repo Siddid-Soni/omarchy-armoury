@@ -52,6 +52,7 @@ impl Daemon {
                     Err(e) => Response::err(format!("{e:#}")),
                 }
             }
+            _ => Response::err("not implemented"),
         }
     }
 

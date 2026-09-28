@@ -51,6 +51,86 @@ impl GpuPower {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Profile { Quiet, Balanced, Performance }
+
+impl Profile {
+    pub const ALL: [Profile; 3] = [Profile::Quiet, Profile::Balanced, Profile::Performance];
+    pub fn from_asusd(v: u32) -> Option<Self> {
+        match v { 0 => Some(Self::Balanced), 1 => Some(Self::Performance), 2 => Some(Self::Quiet), _ => None }
+    }
+    pub fn to_asusd(self) -> u32 {
+        match self { Self::Balanced => 0, Self::Performance => 1, Self::Quiet => 2 }
+    }
+    pub fn from_sysfs(s: &str) -> Option<Self> {
+        match s { "quiet" => Some(Self::Quiet), "balanced" => Some(Self::Balanced), "performance" => Some(Self::Performance), _ => None }
+    }
+    pub fn sysfs(self) -> &'static str {
+        match self { Self::Quiet => "quiet", Self::Balanced => "balanced", Self::Performance => "performance" }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Epp { Default, Performance, BalancePerformance, BalancePower, Power }
+
+impl Epp {
+    pub fn to_asusd(self) -> u32 { self as u32 }
+    pub fn from_asusd(v: u32) -> Option<Self> {
+        [Self::Default, Self::Performance, Self::BalancePerformance, Self::BalancePower, Self::Power].get(v as usize).copied()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Fan { Cpu, Gpu, Mid }
+
+impl Fan {
+    pub fn asusd_name(self) -> &'static str {
+        match self { Self::Cpu => "CPU", Self::Gpu => "GPU", Self::Mid => "MID" }
+    }
+    pub fn from_asusd(s: &str) -> Option<Self> {
+        match s { "CPU" => Some(Self::Cpu), "GPU" => Some(Self::Gpu), "MID" => Some(Self::Mid), _ => None }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FanCurve {
+    pub fan: Fan,
+    pub temps: [u8; 8],
+    pub percent: [u8; 8],
+    pub enabled: bool,
+}
+
+/// Per-mode settings; `None` leaves that setting untouched.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModeSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pl1: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pl2: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nv_boost: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nv_temp: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epp: Option<Epp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_boost: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PerfState {
+    pub profile: Option<Profile>,
+    pub choices: Vec<Profile>,
+    pub cpu_temp_c: Option<f32>,
+    pub cpu_fan_rpm: Option<u32>,
+    pub gpu_fan_rpm: Option<u32>,
+    pub power_draw_w: Option<f32>,
+    pub cpu_boost: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GpuState {
     pub mode: Option<GpuMode>,
@@ -76,13 +156,27 @@ pub struct Snapshot {
     pub platform_profile: Option<String>,
     pub gpu: GpuState,
     pub battery: BatteryState,
+    pub perf: PerfState,
     pub asusd_running: bool,
     pub ghelper_running: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
-pub enum Request { Ping, Status, Subscribe, Takeover, Handback }
+pub enum Request {
+    Ping,
+    Status,
+    Subscribe,
+    Takeover,
+    Handback,
+    SetProfile { profile: Profile },
+    NextProfile,
+    FanCurves { profile: Profile },
+    SetFanCurve { profile: Profile, curve: FanCurve },
+    ResetFanCurves { profile: Profile },
+    ModeSettings { profile: Profile },
+    SetModeSettings { profile: Profile, settings: ModeSettings },
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Response {
@@ -138,5 +232,32 @@ mod tests {
         assert_eq!(v, serde_json::json!({"ok": false, "error": "boom"}));
         let v = serde_json::to_value(Response::ok(serde_json::json!(1))).unwrap();
         assert_eq!(v, serde_json::json!({"ok": true, "data": 1}));
+    }
+
+    #[test]
+    fn profile_codes() {
+        assert_eq!(Profile::from_asusd(2), Some(Profile::Quiet));
+        assert_eq!(Profile::from_asusd(3), None);
+        assert_eq!(Profile::Performance.to_asusd(), 1);
+        assert_eq!(Profile::from_sysfs("balanced"), Some(Profile::Balanced));
+        assert_eq!(Profile::Quiet.sysfs(), "quiet");
+        assert_eq!(Epp::BalancePower.to_asusd(), 3);
+        assert_eq!(Fan::from_asusd("GPU"), Some(Fan::Gpu));
+        assert_eq!(Fan::Cpu.asusd_name(), "CPU");
+    }
+
+    #[test]
+    fn new_requests_wire_format() {
+        let r: Request = serde_json::from_str(r#"{"cmd":"set_profile","profile":"quiet"}"#).unwrap();
+        assert_eq!(r, Request::SetProfile { profile: Profile::Quiet });
+        let r: Request = serde_json::from_str(
+            r#"{"cmd":"set_mode_settings","profile":"performance","settings":{"pl1":120,"epp":"balance_power"}}"#,
+        ).unwrap();
+        assert_eq!(r, Request::SetModeSettings {
+            profile: Profile::Performance,
+            settings: ModeSettings { pl1: Some(120), epp: Some(Epp::BalancePower), ..Default::default() },
+        });
+        let v = serde_json::to_value(ModeSettings { pl2: Some(150), ..Default::default() }).unwrap();
+        assert_eq!(v, serde_json::json!({"pl2": 150}));
     }
 }

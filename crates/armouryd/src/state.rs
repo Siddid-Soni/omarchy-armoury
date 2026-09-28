@@ -9,6 +9,7 @@ pub async fn collect(sys: &dyn Sysfs, gfx: &dyn Gfx, svc: &dyn Services, control
         platform_profile: sys.read(sysfs::PLATFORM_PROFILE),
         gpu: gpu_state(sys, gfx).await,
         battery: battery_state(sys),
+        perf: Default::default(),
         asusd_running: svc.unit_active("asusd.service", false).await,
         ghelper_running: svc.is_running("ghelper").await,
     }
