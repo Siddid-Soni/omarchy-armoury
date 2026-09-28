@@ -6,7 +6,8 @@ use crate::features::perf::{HwCtx, apply_mode, apply_nv, nv_is_stock};
 use crate::hw::{Asusd, Gfx, Nvidia, Services, Sysfs, with_retry};
 use crate::state::collect;
 use anyhow::bail;
-use armoury_proto::{ControlMode, Event, ModeSettings, Profile, Request, Response, Snapshot, UndervoltState};
+use crate::features::gpu::plan_switch;
+use armoury_proto::{ControlMode, Event, GpuMode, GpuStep, GpuSwitchResult, ModeSettings, Profile, Request, Response, Snapshot, UndervoltState};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -168,6 +169,26 @@ impl Daemon {
         *st = ApplyState::default();
     }
 
+    /// Executes one planned GPU step (for a two-step path, only the first).
+    async fn run_gpu_step(&self, step: &GpuStep) -> anyhow::Result<(bool, String)> {
+        match step {
+            GpuStep::FirstOfTwo { first, .. } => Box::pin(self.run_gpu_step(first)).await,
+            GpuStep::OmarchyToggle { to } => {
+                // Exactly what the Omarchy menu runs; it confirms, rewrites supergfxd.conf and reboots.
+                self.svc.run(&["setsid", "-f", "omarchy-launch-floating-terminal-with-presentation", "omarchy-toggle-hybrid-gpu"]).await?;
+                Ok((true, format!("Omarchy's GPU toggle opened in a terminal; confirm there to switch to {} (it reboots)", gpu_name(*to))))
+            }
+            GpuStep::Supergfx { to } => {
+                let action = with_retry(|| self.gfx.set_mode(to.code())).await?;
+                Ok(match action {
+                    0 => (false, format!("log out and back in to finish switching to {}", gpu_name(*to))),
+                    4 => (false, format!("switched to {}", gpu_name(*to))),
+                    _ => (true, format!("reboot to finish switching to {}", gpu_name(*to))),
+                })
+            }
+        }
+    }
+
     async fn write_guard(&self) -> Result<(), Response> {
         self.control.lock().await.require_active().map_err(|e| Response::err(e.to_string()))
     }
@@ -244,7 +265,25 @@ impl Daemon {
                 self.snapshot_after(with_retry(|| self.asusd.next_profile()).await).await
             }
             Request::FanCurves { profile } => self.curves(profile).await,
-            Request::SetGpuMode { .. } | Request::PlanGpuMode { .. } => Response::err("not implemented"),
+            Request::PlanGpuMode { mode } => match plan_switch(&self.refresh().await.gpu, mode) {
+                Ok(step) => Response::ok(serde_json::to_value(step).unwrap()),
+                Err(e) => Response::err(e),
+            },
+            Request::SetGpuMode { mode } => {
+                if let Err(r) = self.write_guard().await { return r; }
+                let step = match plan_switch(&self.refresh().await.gpu, mode) { Ok(s) => s, Err(e) => return Response::err(e) };
+                match self.run_gpu_step(&step).await {
+                    Ok((reboot_required, message)) => {
+                        let message = match &step {
+                            GpuStep::FirstOfTwo { then, .. } => format!("Step 1 of 2: {message}. After rebooting, run `armoury gpu set {}` again.", gpu_name(*then)),
+                            _ => message,
+                        };
+                        self.refresh().await;
+                        Response::ok(serde_json::to_value(GpuSwitchResult { step, reboot_required, message }).unwrap())
+                    }
+                    Err(e) => Response::err(format!("{e:#}")),
+                }
+            }
             Request::ProbeUndervolt => {
                 if let Err(r) = self.write_guard().await { return r; }
                 // The probe leaves the offset at 0 mV: re-apply the mode under the same
@@ -394,6 +433,11 @@ fn load_config(path: &Path) -> (Config, Option<String>) {
         Err(e) => { dropped.push(format!("[modes.{}] ignored: {e}", p.sysfs())); false }
     });
     (config, (!dropped.is_empty()).then(|| format!("config.toml: {}", dropped.join("; "))))
+}
+
+/// User-facing GPU mode name (AsusMuxDgpu is "Ultimate" in G-Helper and the UI).
+fn gpu_name(m: GpuMode) -> &'static str {
+    match m { GpuMode::Integrated => "integrated", GpuMode::Hybrid => "hybrid", GpuMode::AsusMuxDgpu => "ultimate", _ => "other" }
 }
 
 /// Fields present in `new` overwrite `old`.
@@ -881,5 +925,69 @@ mod tests {
             r.d.tick().await;
         }
         assert_eq!(calls(&r).iter().filter(|c| c.contains("nv-clocks")).count(), 1, "{:?}", calls(&r));
+    }
+
+    struct GpuRig { d: Arc<Daemon>, svc: Arc<FakeServices>, gfx: Arc<FakeGfx> }
+
+    fn gpu_rig(mode: u32, active: bool) -> GpuRig {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = Arc::new(FakeSysfs::with(&[
+            ("sys/devices/platform/asus-nb-wmi/gpu_mux_mode", if mode == 5 { "0" } else { "1" }),
+            ("sys/devices/platform/asus-nb-wmi/dgpu_disable", if mode == 1 { "1" } else { "0" }),
+        ]));
+        let svc = Arc::new(FakeServices::default());
+        let gfx = Arc::new(FakeGfx { mode, ..Default::default() });
+        let mut ctl = Control::load(dir.path());
+        if active { ctl.set(ControlMode::Active).unwrap(); }
+        let d = Daemon::new(Box::new(sys), Box::new(gfx.clone()), Box::new(svc.clone()),
+            Box::new(FakeAsusd::default()), ctl, dir.path().join("config.toml"), Box::new(FakeNvidia::default()));
+        std::mem::forget(dir);
+        GpuRig { d, svc, gfx }
+    }
+
+    fn gpu_req(cmd: &str, mode: &str) -> Request {
+        serde_json::from_value(serde_json::json!({"cmd": cmd, "mode": mode})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn gpu_switch_requires_active() {
+        let r = gpu_rig(0, false);
+        assert!(r.d.handle(gpu_req("set_gpu_mode", "AsusMuxDgpu")).await.error.unwrap().contains("observe"));
+        assert!(r.gfx.set_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn hybrid_to_ultimate_calls_supergfx() {
+        let r = gpu_rig(0, true);
+        let resp = r.d.handle(gpu_req("set_gpu_mode", "AsusMuxDgpu")).await;
+        assert!(resp.ok, "{resp:?}");
+        assert_eq!(*r.gfx.set_calls.lock().unwrap(), [5]);
+        assert_eq!(resp.data.unwrap()["reboot_required"], true);
+    }
+
+    #[tokio::test]
+    async fn hybrid_to_integrated_launches_omarchy_toggle() {
+        let r = gpu_rig(0, true);
+        assert!(r.d.handle(gpu_req("set_gpu_mode", "Integrated")).await.ok);
+        assert!(r.svc.calls.lock().unwrap().contains(&"setsid -f omarchy-launch-floating-terminal-with-presentation omarchy-toggle-hybrid-gpu".to_string()));
+        assert!(r.gfx.set_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn integrated_to_ultimate_runs_first_step_only() {
+        let r = gpu_rig(1, true);
+        let resp = r.d.handle(gpu_req("set_gpu_mode", "AsusMuxDgpu")).await;
+        assert!(resp.data.unwrap()["message"].as_str().unwrap().contains("Step 1 of 2"));
+        assert!(r.gfx.set_calls.lock().unwrap().is_empty());
+        assert!(r.svc.calls.lock().unwrap().iter().any(|c| c.contains("omarchy-toggle-hybrid-gpu")));
+    }
+
+    #[tokio::test]
+    async fn plan_does_not_execute() {
+        let r = gpu_rig(0, false);
+        let resp = r.d.handle(gpu_req("plan_gpu_mode", "AsusMuxDgpu")).await;
+        assert_eq!(resp.data.unwrap()["kind"], "supergfx");
+        assert!(r.gfx.set_calls.lock().unwrap().is_empty());
+        assert!(!r.svc.calls.lock().unwrap().iter().any(|c| c.contains("omarchy-toggle")));
     }
 }
