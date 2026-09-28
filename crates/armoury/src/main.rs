@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-use armoury_proto::{SleepMode, Toggle, AuraEffect, AuraMode, AuraZone, ControlMode, LightingInfo, ZonePower, Epp, Fan, FanCurve, GpuMode, GpuStep, GpuSwitchResult, ModeSettings, Profile, Request, Response, Snapshot, socket_path};
+use armoury_proto::{HotKey, KeyAction, SleepMode, Toggle, AuraEffect, AuraMode, AuraZone, ControlMode, LightingInfo, ZonePower, Epp, Fan, FanCurve, GpuMode, GpuStep, GpuSwitchResult, ModeSettings, Profile, Request, Response, Snapshot, socket_path};
 use clap::{Parser, Subcommand};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -74,6 +74,11 @@ enum Cmd {
     Kbd {
         #[command(subcommand)]
         action: KbdAction,
+    },
+    /// ROG key and Fn+F5 bindings
+    Keys {
+        #[command(subcommand)]
+        action: Option<KeysAction>,
     },
     /// CPU undervolt availability
     Undervolt {
@@ -246,6 +251,25 @@ enum LightAction {
         #[arg(long, value_parser = ["on", "off"])]
         shutdown: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum KeysAction {
+    /// Bind a key: none|open-window|cycle-mode|cycle-brightness|cycle-effect|command
+    Set {
+        #[arg(value_parser = ["rog", "fan"])]
+        key: String,
+        #[arg(value_parser = parse_key_action)]
+        action: KeyAction,
+        /// Shell command for the `command` action
+        #[arg(long)]
+        command: Option<String>,
+    },
+}
+
+fn parse_key_action(s: &str) -> Result<KeyAction, String> {
+    serde_json::from_value(serde_json::json!(s.replace('-', "_")))
+        .map_err(|_| format!("unknown action {s:?} (none|open-window|cycle-mode|cycle-brightness|cycle-effect|command)"))
 }
 
 #[derive(Subcommand)]
@@ -490,6 +514,18 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let z = ZonePower { zone, boot: pick(boot, cur.boot), awake: pick(awake, cur.awake), sleep: pick(sleep, cur.sleep), shutdown: pick(shutdown, cur.shutdown) };
             call(&Request::SetZonePower { zone: z })?;
         }
+        Cmd::Keys { action: None } => {
+            let v = call(&Request::Keys)?;
+            let show = |k: &str| {
+                let a = v[k].as_str().unwrap_or("-").replace('_', "-");
+                match v[format!("{k}_command")].as_str() { Some(c) if a == "command" => format!("command: {c}"), _ => a }
+            };
+            println!("ROG key    {}\nFn+F5      {}", show("rog"), show("fan"));
+        }
+        Cmd::Keys { action: Some(KeysAction::Set { key, action, command }) } => {
+            let key = if key == "rog" { HotKey::Rog } else { HotKey::Fan };
+            call(&Request::SetKeyBinding { key, action, command })?;
+        }
         Cmd::Kbd { action: KbdAction::Idle } => { call(&Request::KbdIdle)?; }
         Cmd::Kbd { action: KbdAction::Resume } => { call(&Request::KbdResume)?; }
         Cmd::Undervolt { action: UvAction::Probe } => {
@@ -673,5 +709,12 @@ mod tests {
         assert_eq!(parse_toggle("od"), Ok(armoury_proto::Toggle::PanelOd));
         assert_eq!(parse_toggle("bootsound"), Ok(armoury_proto::Toggle::BootSound));
         assert!(parse_toggle("camera").is_err());
+    }
+
+    #[test]
+    fn key_action_names() {
+        assert_eq!(parse_key_action("cycle-mode"), Ok(armoury_proto::KeyAction::CycleMode));
+        assert_eq!(parse_key_action("open-window"), Ok(armoury_proto::KeyAction::OpenWindow));
+        assert!(parse_key_action("reboot").is_err());
     }
 }

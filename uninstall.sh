@@ -31,6 +31,7 @@ sudo "$LIB/armoury-root" asusd-support-restore || echo "Could not restore aura_s
 sudo rm -rf "$LIB" "$ROOT_STATE"
 sudo rm -f /usr/share/polkit-1/actions/org.omarchy.armoury.policy \
   /etc/polkit-1/rules.d/50-omarchy-armoury.rules \
-  /etc/pacman.d/hooks/omarchy-armoury-asusd.hook
+  /etc/pacman.d/hooks/omarchy-armoury-asusd.hook \
+  /etc/udev/rules.d/70-omarchy-armoury.rules
 
 echo "Removed omarchy-armoury."

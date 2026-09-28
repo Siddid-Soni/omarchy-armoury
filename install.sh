@@ -18,6 +18,9 @@ sudo install -Dm644 packaging/polkit/org.omarchy.armoury.policy /usr/share/polki
 sed "s/@USER@/$USER/" packaging/polkit/50-omarchy-armoury.rules.in |
   sudo install -Dm644 /dev/stdin /etc/polkit-1/rules.d/50-omarchy-armoury.rules
 sudo install -Dm644 packaging/pacman/omarchy-armoury-asusd.hook /etc/pacman.d/hooks/omarchy-armoury-asusd.hook
+sudo install -Dm644 packaging/udev/70-omarchy-armoury.rules /etc/udev/rules.d/70-omarchy-armoury.rules
+sudo udevadm control --reload
+sudo udevadm trigger --subsystem-match=input --action=change
 sudo "$LIB/armoury-root" asusd-support-fix
 
 systemctl --user daemon-reload
