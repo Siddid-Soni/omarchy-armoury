@@ -14,6 +14,11 @@ pub struct HwCtx {
     pub uv_unlocked: bool,
     /// The dGPU is awake; NVIDIA settings are never sent to a suspended dGPU.
     pub dgpu_active: bool,
+    /// Periodic re-apply: only power limits (never MSR or NVML, which would keep the dGPU awake).
+    pub limits_only: bool,
+    /// Stock undervolt / NVIDIA clocks were the last values sent; skip re-sending stock.
+    pub uv_at_stock: bool,
+    pub nv_at_stock: bool,
 }
 
 pub async fn apply_mode(profile: Profile, s: &ModeSettings, ctx: HwCtx, asusd: &dyn Asusd, svc: &dyn Services) -> Vec<String> {
@@ -45,15 +50,21 @@ pub async fn apply_mode(profile: Profile, s: &ModeSettings, ctx: HwCtx, asusd: &
     let mut argv = vec![PKEXEC, ROOT_HELPER, "set-limits"];
     argv.extend(args.iter().map(String::as_str));
     if let Err(e) = svc.run(&argv).await { errors.push(format!("power limits: {e:#}")); }
+    if ctx.limits_only { return errors; }
     // MSR offsets and NVIDIA clocks persist across modes, so unset means stock (0 / off).
-    if ctx.uv_unlocked {
+    if ctx.uv_unlocked && !(s.uv_mv.unwrap_or(0) == 0 && ctx.uv_at_stock) {
         let mv = s.uv_mv.unwrap_or(0).to_string();
         if let Err(e) = svc.run(&[PKEXEC, ROOT_HELPER, "undervolt", "set", &mv]).await { errors.push(format!("undervolt: {e:#}")); }
     }
-    if ctx.dgpu_active {
+    if ctx.dgpu_active && !(nv_is_stock(s) && ctx.nv_at_stock) {
         errors.extend(apply_nv(s, svc).await);
     }
     errors
+}
+
+pub fn nv_is_stock(s: &ModeSettings) -> bool {
+    s.gpu_core_offset.unwrap_or(0) == 0 && s.gpu_mem_offset.unwrap_or(0) == 0
+        && s.gpu_core_lock.unwrap_or(0) == 0 && s.gpu_mem_lock.unwrap_or(0) == 0
 }
 
 /// NVIDIA offsets/locks for a mode (unset = stock). Only call while the dGPU is awake.
@@ -113,7 +124,7 @@ mod tests {
         assert_eq!(*a.calls.lock().unwrap(), ["set_profile 1", "set_profile_epp 1 1", "set_fan_curves_enabled 1 true"], "EPP still applied");
     }
 
-    fn ctx(uv: bool, gpu: bool) -> HwCtx { HwCtx { uv_unlocked: uv, dgpu_active: gpu } }
+    fn ctx(uv: bool, gpu: bool) -> HwCtx { HwCtx { uv_unlocked: uv, dgpu_active: gpu, ..Default::default() } }
 
     #[tokio::test]
     async fn uv_skipped_when_locked() {

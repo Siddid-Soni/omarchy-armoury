@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::control::{Control, ModeHandle, handback, takeover};
 use crate::features::fan;
 use crate::features::limits::{self, Bounds, Limit};
-use crate::features::perf::{HwCtx, apply_mode, apply_nv};
+use crate::features::perf::{HwCtx, apply_mode, apply_nv, nv_is_stock};
 use crate::hw::{Asusd, Gfx, Nvidia, Services, Sysfs, with_retry};
 use crate::state::collect;
 use anyhow::bail;
@@ -31,6 +31,7 @@ pub struct Daemon {
     config_error: Option<String>,
     /// Undervolt probe result (None until probed in active mode).
     uv: std::sync::Mutex<Option<bool>>,
+    apply_error: std::sync::Mutex<Option<String>>,
     last_reapply: std::sync::Mutex<tokio::time::Instant>,
 }
 
@@ -43,7 +44,8 @@ impl Daemon {
             sys, gfx, svc, asusd, nv, control: Mutex::new(control), mode, snap: watch::channel(None).0,
             config: Mutex::new(config), config_path, config_error,
             apply: Mutex::new(ApplyState::default()),
-            uv: std::sync::Mutex::new(None), last_reapply: std::sync::Mutex::new(tokio::time::Instant::now()),
+            uv: std::sync::Mutex::new(None),
+            apply_error: std::sync::Mutex::new(None), last_reapply: std::sync::Mutex::new(tokio::time::Instant::now()),
         })
     }
 
@@ -58,12 +60,26 @@ impl Daemon {
         // Lock before reading the profile, so a slow poll can never apply a mode
         // that a concurrent SetProfile has already switched away from.
         let mut st = self.apply.lock().await;
+        self.tick_locked(&mut st, force).await
+    }
+
+    async fn tick_locked(&self, st: &mut ApplyState, force: bool) -> Vec<String> {
         let snap = self.refresh().await;
         if self.mode.get() != ControlMode::Active {
             *st = ApplyState::default(); // re-apply after the next takeover
             return Vec::new();
         }
-        if self.uv.lock().unwrap().is_none() { self.probe_undervolt().await; }
+        let now = tokio::time::Instant::now();
+        if self.uv.lock().unwrap().is_none() && self.config.lock().await.modes.values().any(|m| m.uv_mv.is_some())
+            && st.probe_retry_at.is_none_or(|t| now >= t)
+        {
+            match self.probe_undervolt().await {
+                None => st.probe_retry_at = Some(now + PROBE_BACKOFF),
+                // the mode may already be applied without undervolt: apply it again
+                Some(true) => { st.applied = None; st.uv_at_stock = true; }
+                Some(false) => {}
+            }
+        }
         let Some(profile) = snap.perf.profile else { return Vec::new() };
         let dgpu_active = snap.gpu.dgpu_active == Some(true);
         let woke = dgpu_active && !st.dgpu_was_active;
@@ -72,37 +88,84 @@ impl Daemon {
             let cfg = self.config.lock().await;
             (cfg.mode(profile), cfg.reapply_power_secs)
         };
-        let now = tokio::time::Instant::now();
         let due = secs > 0 && now.duration_since(*self.last_reapply.lock().unwrap()) >= Duration::from_secs(secs as u64);
-        if st.applied == Some(profile) && !due {
-            // NVIDIA settings could not be sent while the dGPU slept; send them now it is awake.
-            return if woke { apply_nv(&settings, &*self.svc).await } else { Vec::new() };
+        if st.applied == Some(profile) {
+            let mut errs = Vec::new();
+            if woke && !(nv_is_stock(&settings) && st.nv_at_stock) {
+                // NVIDIA settings could not be sent while the dGPU slept; send them now it is awake.
+                errs = apply_nv(&settings, &*self.svc).await;
+                st.nv_at_stock = errs.is_empty() && nv_is_stock(&settings);
+            }
+            if due {
+                errs.extend(apply_mode(profile, &settings, HwCtx { limits_only: true, ..self.hw_ctx(dgpu_active, st) }, &*self.asusd, &*self.svc).await);
+                *self.last_reapply.lock().unwrap() = now;
+            }
+            self.note_apply(profile, &errs);
+            return errs;
         }
         if !force && st.failed == Some(profile) && st.retry_at.is_some_and(|t| now < t) { return Vec::new(); }
-        let errs = apply_mode(profile, &settings, self.hw_ctx(dgpu_active), &*self.asusd, &*self.svc).await;
+        let ctx = self.hw_ctx(dgpu_active, st);
+        let errs = apply_mode(profile, &settings, ctx, &*self.asusd, &*self.svc).await;
+        self.note_apply(profile, &errs);
         if errs.is_empty() {
-            *st = ApplyState { applied: Some(profile), dgpu_was_active: dgpu_active, ..Default::default() };
+            *st = ApplyState {
+                applied: Some(profile),
+                dgpu_was_active: dgpu_active,
+                uv_at_stock: if ctx.uv_unlocked { settings.uv_mv.unwrap_or(0) == 0 } else { st.uv_at_stock },
+                nv_at_stock: if dgpu_active { nv_is_stock(&settings) } else { st.nv_at_stock },
+                probe_retry_at: st.probe_retry_at,
+                ..Default::default()
+            };
             *self.last_reapply.lock().unwrap() = now;
         } else {
-            for e in &errs { eprintln!("armouryd: apply {}: {e}", profile.sysfs()); }
-            *st = ApplyState { applied: None, failed: Some(profile), retry_at: Some(now + RETRY_BACKOFF), dgpu_was_active: dgpu_active };
+            *st = ApplyState { failed: Some(profile), retry_at: Some(now + RETRY_BACKOFF), dgpu_was_active: dgpu_active, probe_retry_at: st.probe_retry_at, ..Default::default() };
         }
         errs
     }
 
-    fn hw_ctx(&self, dgpu_active: bool) -> HwCtx {
-        HwCtx { uv_unlocked: self.uv.lock().unwrap().unwrap_or(false), dgpu_active }
+    /// Records the outcome for `Snapshot.apply_error` and the journal.
+    fn note_apply(&self, profile: Profile, errs: &[String]) {
+        for e in errs { eprintln!("armouryd: apply {}: {e}", profile.sysfs()); }
+        *self.apply_error.lock().unwrap() = (!errs.is_empty()).then(|| format!("{}: {}", profile.sysfs(), errs.join("; ")));
+    }
+
+    fn hw_ctx(&self, dgpu_active: bool, st: &ApplyState) -> HwCtx {
+        HwCtx {
+            uv_unlocked: self.uv.lock().unwrap().unwrap_or(false),
+            dgpu_active,
+            limits_only: false,
+            uv_at_stock: st.uv_at_stock,
+            nv_at_stock: st.nv_at_stock,
+        }
     }
 
     /// Asks armoury-root whether the BIOS leaves the undervolt mailbox writable.
-    /// Any failure counts as locked, so undervolt is never sent blind.
-    async fn probe_undervolt(&self) -> bool {
-        let unlocked = match self.svc.output(&[PKEXEC, ROOT_HELPER, "undervolt", "probe"]).await {
-            Ok(out) => out.trim() == "unlocked",
-            Err(e) => { eprintln!("armouryd: undervolt probe: {e:#}"); false }
-        };
-        *self.uv.lock().unwrap() = Some(unlocked);
-        unlocked
+    /// A failed probe is not cached (None): it is retried after a backoff, and
+    /// undervolt is never sent until a probe says unlocked.
+    async fn probe_undervolt(&self) -> Option<bool> {
+        match self.svc.output(&[PKEXEC, ROOT_HELPER, "undervolt", "probe"]).await {
+            Ok(out) => {
+                let unlocked = out.trim() == "unlocked";
+                *self.uv.lock().unwrap() = Some(unlocked);
+                Some(unlocked)
+            }
+            Err(e) => { eprintln!("armouryd: undervolt probe: {e:#}"); None }
+        }
+    }
+
+    /// Before handing the hardware back: undervolt and NVIDIA clocks persist until
+    /// reboot, so return them to stock rather than leave them under G-Helper.
+    async fn reset_to_stock(&self) {
+        let mut st = self.apply.lock().await;
+        let dgpu_active = self.refresh().await.gpu.dgpu_active == Some(true);
+        let uv_unlocked = *self.uv.lock().unwrap() == Some(true);
+        if uv_unlocked && !st.uv_at_stock {
+            if let Err(e) = self.svc.run(&[PKEXEC, ROOT_HELPER, "undervolt", "set", "0"]).await { eprintln!("armouryd: reset undervolt: {e:#}"); }
+        }
+        if dgpu_active && !st.nv_at_stock {
+            for e in apply_nv(&ModeSettings::default(), &*self.svc).await { eprintln!("armouryd: reset GPU clocks: {e}"); }
+        }
+        *st = ApplyState::default();
     }
 
     async fn write_guard(&self) -> Result<(), Response> {
@@ -148,6 +211,7 @@ impl Daemon {
         let mut s = collect(&*self.sys, &*self.gfx, &*self.svc, &*self.nv, mode, gpu_detail).await;
         s.config_error = self.config_error.clone();
         s.perf.undervolt = self.uv.lock().unwrap().map(|unlocked| UndervoltState { unlocked });
+        s.apply_error = self.apply_error.lock().unwrap().clone();
         s
     }
 
@@ -160,6 +224,7 @@ impl Daemon {
             }
             Request::Subscribe => Response::ok(serde_json::Value::Null),
             Request::Takeover | Request::Handback => {
+                if req == Request::Handback && self.mode.get() == ControlMode::Active { self.reset_to_stock().await; }
                 let result = {
                     let mut ctl = self.control.lock().await;
                     if req == Request::Takeover { takeover(&mut ctl, &*self.svc).await } else { handback(&mut ctl, &*self.svc).await }
@@ -181,7 +246,15 @@ impl Daemon {
             Request::FanCurves { profile } => self.curves(profile).await,
             Request::ProbeUndervolt => {
                 if let Err(r) = self.write_guard().await { return r; }
-                Response::ok(serde_json::json!({"unlocked": self.probe_undervolt().await}))
+                // The probe leaves the offset at 0 mV: re-apply the mode under the same
+                // lock, which also keeps two root processes off the MSR mailbox at once.
+                let mut st = self.apply.lock().await;
+                let Some(unlocked) = self.probe_undervolt().await else { return Response::err("undervolt probe failed; see journalctl --user -u armouryd") };
+                st.applied = None;
+                st.uv_at_stock = true;
+                let errs = self.tick_locked(&mut st, true).await;
+                if !errs.is_empty() { return Response::err(errs.join("; ")); }
+                Response::ok(serde_json::json!({"unlocked": unlocked}))
             }
             Request::SetFanCurve { profile, curve } => {
                 if let Err(r) = self.write_guard().await { return r; }
@@ -211,9 +284,18 @@ impl Daemon {
                 if snap.perf.profile == Some(profile) {
                     // apply everything stored, not just the delta, so earlier drift is repaired
                     let dgpu_active = snap.gpu.dgpu_active == Some(true);
-                    let errs = apply_mode(profile, &merged, self.hw_ctx(dgpu_active), &*self.asusd, &*self.svc).await;
+                    let ctx = self.hw_ctx(dgpu_active, &st);
+                    let errs = apply_mode(profile, &merged, ctx, &*self.asusd, &*self.svc).await;
+                    self.note_apply(profile, &errs);
                     if !errs.is_empty() { return Response::err(errs.join("; ")); }
-                    *st = ApplyState { applied: Some(profile), dgpu_was_active: dgpu_active, ..Default::default() };
+                    *st = ApplyState {
+                        applied: Some(profile),
+                        dgpu_was_active: dgpu_active,
+                        uv_at_stock: if ctx.uv_unlocked { merged.uv_mv.unwrap_or(0) == 0 } else { st.uv_at_stock },
+                        nv_at_stock: if dgpu_active { nv_is_stock(&merged) } else { st.nv_at_stock },
+                        probe_retry_at: st.probe_retry_at,
+                        ..Default::default()
+                    };
                 }
                 let mut cfg = self.config.lock().await;
                 cfg.modes.insert(profile, merged);
@@ -278,6 +360,7 @@ impl Daemon {
 use crate::control::{PKEXEC, ROOT_HELPER};
 
 const RETRY_BACKOFF: Duration = Duration::from_secs(30);
+const PROBE_BACKOFF: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 struct ApplyState {
@@ -288,6 +371,10 @@ struct ApplyState {
     retry_at: Option<tokio::time::Instant>,
     /// dGPU state at the last tick, to catch it waking up.
     dgpu_was_active: bool,
+    /// Last undervolt / NVIDIA values sent were stock, so stock need not be re-sent.
+    uv_at_stock: bool,
+    nv_at_stock: bool,
+    probe_retry_at: Option<tokio::time::Instant>,
 }
 
 /// Loads config.toml. An unparsable file is moved to config.toml.bad (so the next
@@ -713,5 +800,85 @@ mod tests {
         let v = r.d.handle(Request::Status).await.data.unwrap();
         assert_eq!(v["gpu"]["nvidia"]["core_mhz"], 1500, "explicit status still reports NVIDIA details");
         assert_eq!(r.nv.status_reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    fn calls(r: &NvRig) -> Vec<String> { r.svc.calls.lock().unwrap().clone() }
+
+    #[tokio::test]
+    async fn probe_request_reapplies_undervolt() {
+        let r = rig_with_nv("[modes.balanced]\nuv_mv = -30\n", "unlocked\n");
+        r.d.tick().await;
+        r.svc.calls.lock().unwrap().clear();
+        assert!(r.d.handle(Request::ProbeUndervolt).await.ok);
+        let c = calls(&r);
+        assert!(c.iter().any(|c| c.ends_with("undervolt probe")));
+        assert!(c.last().unwrap().ends_with("undervolt set -30"), "{c:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reapply_timer_touches_only_limits() {
+        let r = rig_with_nv("reapply_power_secs = 5\n[modes.balanced]\npl1 = 45\npl2 = 65\nuv_mv = -30\ngpu_core_offset = 50\n", "unlocked\n");
+        *r.nv.active.lock().unwrap() = Some(true);
+        r.d.tick().await;
+        r.svc.calls.lock().unwrap().clear();
+        tokio::time::advance(Duration::from_secs(6)).await;
+        r.d.tick().await;
+        let c = calls(&r);
+        assert!(c.iter().any(|c| c.contains("set-limits pl1=45")), "{c:?}");
+        assert!(!c.iter().any(|c| c.contains("nv-clocks") || c.contains("undervolt")), "{c:?}");
+    }
+
+    #[tokio::test]
+    async fn handback_resets_undervolt_and_gpu_clocks() {
+        let r = rig_with_nv("[modes.balanced]\nuv_mv = -30\ngpu_core_offset = 50\n", "unlocked\n");
+        *r.nv.active.lock().unwrap() = Some(true);
+        r.d.tick().await;
+        r.svc.calls.lock().unwrap().clear();
+        r.d.handle(Request::Handback).await;
+        let c = calls(&r);
+        let pos = |s: &str| c.iter().position(|x| x.ends_with(s)).unwrap_or_else(|| panic!("{s} missing: {c:?}"));
+        assert!(pos("undervolt set 0") < pos("armoury-root handback"));
+        assert!(pos("nv-clocks 0 0 off off") < pos("armoury-root handback"));
+    }
+
+    #[tokio::test]
+    async fn wake_apply_error_is_reported() {
+        let r = rig_with_nv("[modes.balanced]\ngpu_core_offset = 400\n", "locked\n");
+        r.d.tick().await;
+        *r.svc.fail_on.lock().unwrap() = Some("nv-clocks".into());
+        *r.nv.active.lock().unwrap() = Some(true);
+        r.d.tick().await;
+        assert!(r.d.refresh().await.apply_error.unwrap().contains("NVIDIA"));
+    }
+
+    #[tokio::test]
+    async fn no_probe_unless_a_mode_uses_undervolt() {
+        let r = rig_with_nv("[modes.balanced]\npl1 = 45\npl2 = 65\n", "unlocked\n");
+        r.d.tick().await;
+        assert!(!calls(&r).iter().any(|c| c.contains("undervolt")), "{:?}", calls(&r));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_probe_is_retried_not_cached() {
+        let r = rig_with_nv("[modes.balanced]\nuv_mv = -30\n", "unlocked\n");
+        *r.svc.fail_on.lock().unwrap() = Some("undervolt probe".into());
+        r.d.tick().await;
+        assert_eq!(r.d.refresh().await.perf.undervolt, None);
+        *r.svc.fail_on.lock().unwrap() = None;
+        tokio::time::advance(Duration::from_secs(61)).await;
+        r.d.tick().await;
+        assert!(calls(&r).iter().any(|c| c.ends_with("undervolt set -30")), "{:?}", calls(&r));
+    }
+
+    #[tokio::test]
+    async fn stock_gpu_clocks_not_resent_on_every_wake() {
+        let r = rig_with_nv("[modes.balanced]\npl1 = 45\npl2 = 65\n", "locked\n");
+        for _ in 0..3 {
+            *r.nv.active.lock().unwrap() = Some(true);
+            r.d.tick().await;
+            *r.nv.active.lock().unwrap() = Some(false);
+            r.d.tick().await;
+        }
+        assert_eq!(calls(&r).iter().filter(|c| c.contains("nv-clocks")).count(), 1, "{:?}", calls(&r));
     }
 }

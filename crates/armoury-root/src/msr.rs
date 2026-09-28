@@ -2,25 +2,32 @@ use anyhow::Context;
 use armoury_root::{MSR_OC_MAILBOX, uv_decode, uv_read_cmd, uv_write_cmd};
 use std::os::unix::fs::FileExt;
 
-pub struct Msr(std::fs::File);
+const ALLOW_WRITES: &str = "/sys/module/msr/parameters/allow_writes";
+
+/// /dev/cpu/0/msr opened for the OC mailbox; restores msr's allow_writes on drop.
+pub struct Msr {
+    f: std::fs::File,
+    prev_allow: Option<String>,
+}
 
 impl Msr {
     pub fn open() -> anyhow::Result<Self> {
         if !std::path::Path::new("/dev/cpu/0/msr").exists() {
             let _ = std::process::Command::new("modprobe").arg("msr").status();
         }
-        let _ = std::fs::write("/sys/module/msr/parameters/allow_writes", "on");
+        let prev_allow = std::fs::read_to_string(ALLOW_WRITES).ok().map(|s| s.trim().to_string()).filter(|s| s != "on");
+        let _ = std::fs::write(ALLOW_WRITES, "on");
         let f = std::fs::OpenOptions::new().read(true).write(true).open("/dev/cpu/0/msr").context("open /dev/cpu/0/msr")?;
-        Ok(Self(f))
+        Ok(Self { f, prev_allow })
     }
 
     fn write(&self, v: u64) -> anyhow::Result<()> {
-        self.0.write_all_at(&v.to_le_bytes(), MSR_OC_MAILBOX).context("write MSR 0x150")
+        self.f.write_all_at(&v.to_le_bytes(), MSR_OC_MAILBOX).context("write MSR 0x150")
     }
 
     fn read(&self) -> anyhow::Result<u64> {
         let mut b = [0u8; 8];
-        self.0.read_exact_at(&mut b, MSR_OC_MAILBOX).context("read MSR 0x150")?;
+        self.f.read_exact_at(&mut b, MSR_OC_MAILBOX).context("read MSR 0x150")?;
         Ok(u64::from_le_bytes(b))
     }
 
@@ -34,5 +41,11 @@ impl Msr {
             rb[i] = uv_decode(self.read()? as u32);
         }
         Ok((rb[0], rb[1]))
+    }
+}
+
+impl Drop for Msr {
+    fn drop(&mut self) {
+        if let Some(prev) = &self.prev_allow { let _ = std::fs::write(ALLOW_WRITES, prev); }
     }
 }

@@ -136,8 +136,10 @@ fn undervolt(action: UvAction) -> anyhow::Result<()> {
     let msr = msr::Msr::open()?;
     match action {
         UvAction::Probe => {
-            let (core, _) = msr.set_uv(-5)?;
-            msr.set_uv(0)?;
+            let probe = msr.set_uv(-5);
+            let restore = msr.set_uv(0); // always attempted, even if the probe write failed
+            let (core, _) = probe?;
+            restore?;
             println!("{}", if uv_matches(-5, core) { "unlocked" } else { "locked" });
         }
         UvAction::Set { mv } => {

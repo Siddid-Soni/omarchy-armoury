@@ -207,6 +207,9 @@ pub struct Snapshot {
     /// Why config.toml (or part of it) was ignored, if it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_error: Option<String>,
+    /// Last failure applying a mode's settings (cleared by the next success).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_error: Option<String>,
     pub asusd_running: bool,
     pub ghelper_running: bool,
 }

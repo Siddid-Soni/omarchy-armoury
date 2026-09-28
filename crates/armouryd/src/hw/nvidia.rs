@@ -2,6 +2,14 @@ use super::Nvidia;
 use armoury_proto::{GpuUser, NvStatus};
 use std::path::PathBuf;
 
+/// Runs a blocking call on its own thread; None if it does not finish in time
+/// (a wedged NVIDIA driver must not hang armouryd). A stuck thread is abandoned.
+pub fn with_thread_timeout<T: Send + 'static>(d: std::time::Duration, f: impl FnOnce() -> Option<T> + Send + 'static) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || { let _ = tx.send(f()); });
+    rx.recv_timeout(d).ok().flatten()
+}
+
 pub struct RealNvidia {
     root: PathBuf,
     dev: Option<PathBuf>,
@@ -27,6 +35,14 @@ impl Nvidia for RealNvidia {
     }
 
     fn status(&self) -> Option<NvStatus> {
+        with_thread_timeout(crate::hw::CALL_TIMEOUT, read_nvml)
+    }
+
+    fn users(&self) -> Vec<GpuUser> { self.scan_users() }
+}
+
+fn read_nvml() -> Option<NvStatus> {
+    {
         use nvml_wrapper::enum_wrappers::device::{Clock, PerformanceState, TemperatureSensor};
         // Initialised per read and dropped, so armouryd never holds the device open.
         let nvml = nvml_wrapper::Nvml::init().ok()?;
@@ -45,8 +61,10 @@ impl Nvidia for RealNvidia {
             mem_offset: d.clock_offset(Clock::Memory, PerformanceState::Zero).map(|o| o.clock_offset_mhz).unwrap_or(0),
         })
     }
+}
 
-    fn users(&self) -> Vec<GpuUser> {
+impl RealNvidia {
+    fn scan_users(&self) -> Vec<GpuUser> {
         let me = std::process::id();
         let mut users: Vec<GpuUser> = std::fs::read_dir(self.root.join("proc")).into_iter().flatten().flatten()
             .filter_map(|e| {
@@ -62,3 +80,48 @@ impl Nvidia for RealNvidia {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_dgpu_and_runtime_status() {
+        let d = tempfile::tempdir().unwrap();
+        let igpu = d.path().join("sys/bus/pci/devices/0000:00:02.0");
+        let dgpu = d.path().join("sys/bus/pci/devices/0000:01:00.0");
+        for (p, v, c) in [(&igpu, "0x8086", "0x030000"), (&dgpu, "0x10de", "0x030000")] {
+            std::fs::create_dir_all(p.join("power")).unwrap();
+            std::fs::write(p.join("vendor"), v).unwrap();
+            std::fs::write(p.join("class"), c).unwrap();
+        }
+        std::fs::write(dgpu.join("power/runtime_status"), "suspended\n").unwrap();
+        let nv = RealNvidia::new(d.path());
+        assert_eq!(nv.dgpu_active(), Some(false));
+        std::fs::write(dgpu.join("power/runtime_status"), "active\n").unwrap();
+        assert_eq!(nv.dgpu_active(), Some(true));
+        assert_eq!(RealNvidia::new(d.path().join("nothing")).dgpu_active(), None);
+    }
+
+    #[test]
+    fn users_found_from_proc_fds() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("proc/4242");
+        std::fs::create_dir_all(p.join("fd")).unwrap();
+        std::fs::write(p.join("comm"), "game\n").unwrap();
+        std::os::unix::fs::symlink("/dev/nvidia0", p.join("fd/7")).unwrap();
+        let q = d.path().join("proc/99");
+        std::fs::create_dir_all(q.join("fd")).unwrap();
+        std::os::unix::fs::symlink("/dev/null", q.join("fd/1")).unwrap();
+        let users = RealNvidia::new(d.path()).users();
+        assert_eq!(users, vec![GpuUser { pid: 4242, name: "game".into() }]);
+    }
+
+    #[test]
+    fn blocking_call_times_out() {
+        let started = std::time::Instant::now();
+        let r: Option<u32> = with_thread_timeout(std::time::Duration::from_millis(100), || { std::thread::sleep(std::time::Duration::from_secs(5)); Some(1) });
+        assert_eq!(r, None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(with_thread_timeout(std::time::Duration::from_secs(1), || Some(7)), Some(7));
+    }
+}
