@@ -80,6 +80,33 @@ impl Services for FakeServices {
 }
 
 #[derive(Default)]
+pub struct FakeNvidia {
+    pub active: Mutex<Option<bool>>,
+    pub status_reads: std::sync::atomic::AtomicU32,
+}
+
+impl FakeNvidia {
+    pub fn with_active(active: Option<bool>) -> Self {
+        Self { active: Mutex::new(active), ..Default::default() }
+    }
+}
+
+impl super::Nvidia for FakeNvidia {
+    fn dgpu_active(&self) -> Option<bool> { *self.active.lock().unwrap() }
+    fn status(&self) -> Option<armoury_proto::NvStatus> {
+        self.status_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(armoury_proto::NvStatus { core_mhz: 1500, pstate: "P0".into(), ..Default::default() })
+    }
+    fn users(&self) -> Vec<armoury_proto::GpuUser> { vec![armoury_proto::GpuUser { pid: 42, name: "game".into() }] }
+}
+
+impl<T: super::Nvidia + ?Sized> super::Nvidia for std::sync::Arc<T> {
+    fn dgpu_active(&self) -> Option<bool> { (**self).dgpu_active() }
+    fn status(&self) -> Option<armoury_proto::NvStatus> { (**self).status() }
+    fn users(&self) -> Vec<armoury_proto::GpuUser> { (**self).users() }
+}
+
+#[derive(Default)]
 pub struct FakeAsusd {
     pub calls: Mutex<Vec<String>>,
     pub curves: Mutex<HashMap<u32, Vec<RawCurve>>>,

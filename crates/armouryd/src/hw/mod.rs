@@ -1,5 +1,6 @@
 pub mod asusd;
 pub mod fake;
+pub mod nvidia;
 pub mod services;
 pub mod supergfx;
 pub mod sysfs;
@@ -21,6 +22,16 @@ pub trait Gfx: Send + Sync {
     async fn supported(&self) -> anyhow::Result<Vec<u32>>;
     async fn pending_mode(&self) -> anyhow::Result<u32>;
     async fn power(&self) -> anyhow::Result<u32>;
+}
+
+/// The NVIDIA dGPU. Implementations must not touch the device unless it is already awake.
+pub trait Nvidia: Send + Sync {
+    /// PCI runtime PM state is "active"; None when there is no NVIDIA dGPU.
+    fn dgpu_active(&self) -> Option<bool>;
+    /// NVML readings; only call while dgpu_active() is Some(true).
+    fn status(&self) -> Option<armoury_proto::NvStatus>;
+    /// Processes holding /dev/nvidia*; only call while the dGPU is awake.
+    fn users(&self) -> Vec<armoury_proto::GpuUser>;
 }
 
 pub const GHELPER_UNIT: &str = "app-ghelper@autostart.service";

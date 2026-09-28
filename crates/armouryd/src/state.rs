@@ -1,13 +1,13 @@
-use crate::hw::{Gfx, Services, Sysfs, sysfs, with_retry};
+use crate::hw::{Gfx, Nvidia, Services, Sysfs, sysfs, with_retry};
 use armoury_proto::{BatteryState, ControlMode, GpuMode, GpuPower, GpuState, PerfState, Profile, Snapshot};
 
-pub async fn collect(sys: &dyn Sysfs, gfx: &dyn Gfx, svc: &dyn Services, control: ControlMode) -> Snapshot {
+pub async fn collect(sys: &dyn Sysfs, gfx: &dyn Gfx, svc: &dyn Services, nv: &dyn Nvidia, control: ControlMode) -> Snapshot {
     Snapshot {
         model: sys.read(sysfs::PRODUCT_NAME),
         control,
         keystone: sys.read(sysfs::KEYSTONE).map(|v| v == "1"),
         platform_profile: sys.read(sysfs::PLATFORM_PROFILE),
-        gpu: gpu_state(sys, gfx).await,
+        gpu: gpu_state(sys, gfx, nv).await,
         battery: battery_state(sys),
         perf: perf_state(sys),
         config_error: None,
@@ -16,12 +16,18 @@ pub async fn collect(sys: &dyn Sysfs, gfx: &dyn Gfx, svc: &dyn Services, control
     }
 }
 
-async fn gpu_state(sys: &dyn Sysfs, gfx: &dyn Gfx) -> GpuState {
+async fn gpu_state(sys: &dyn Sysfs, gfx: &dyn Gfx, nv: &dyn Nvidia) -> GpuState {
     let mut g = GpuState {
         mux: sys.read(sysfs::GPU_MUX).and_then(|v| v.parse().ok()),
         dgpu_disable: sys.read(sysfs::DGPU_DISABLE).and_then(|v| v.parse().ok()),
+        dgpu_active: nv.dgpu_active(),
         ..Default::default()
     };
+    // Never wake a sleeping dGPU just to report on it.
+    if g.dgpu_active == Some(true) {
+        g.nvidia = nv.status();
+        g.users = nv.users();
+    }
     // A wedged supergfxd costs one retry budget here, not four.
     let Ok(mode) = with_retry(|| gfx.mode()).await else { return g };
     g.mode = GpuMode::from_supergfx(mode);
@@ -66,7 +72,7 @@ pub fn perf_state(sys: &dyn Sysfs) -> PerfState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hw::fake::{FakeGfx, FakeServices, FakeSysfs};
+    use crate::hw::fake::{FakeGfx, FakeNvidia, FakeServices, FakeSysfs};
     use armoury_proto::Profile;
 
     fn machine() -> FakeSysfs {
@@ -96,7 +102,7 @@ mod tests {
     async fn collect_reads_everything() {
         let svc = FakeServices::default();
         svc.running.lock().unwrap().insert("ghelper".into());
-        let s = collect(&machine(), &FakeGfx::default(), &svc, ControlMode::Observe).await;
+        let s = collect(&machine(), &FakeGfx::default(), &svc, &FakeNvidia::default(), ControlMode::Observe).await;
         assert_eq!(s.model.as_deref(), Some("ROG Strix G533ZW_G533ZW"));
         assert_eq!(s.keystone, Some(true));
         assert_eq!(s.platform_profile.as_deref(), Some("performance"));
@@ -115,7 +121,7 @@ mod tests {
     #[tokio::test]
     async fn pending_mode_reported_when_set() {
         let gfx = FakeGfx { pending: 5, ..Default::default() };
-        let s = collect(&machine(), &gfx, &FakeServices::default(), ControlMode::Active).await;
+        let s = collect(&machine(), &gfx, &FakeServices::default(), &FakeNvidia::default(), ControlMode::Active).await;
         assert_eq!(s.gpu.pending, Some(GpuMode::AsusMuxDgpu));
         assert_eq!(s.control, ControlMode::Active);
     }
@@ -124,7 +130,7 @@ mod tests {
     async fn collect_survives_wedged_gfx() {
         let gfx = FakeGfx { wedged: true, ..Default::default() };
         let started = tokio::time::Instant::now();
-        let s = collect(&machine(), &gfx, &FakeServices::default(), ControlMode::Observe).await;
+        let s = collect(&machine(), &gfx, &FakeServices::default(), &FakeNvidia::default(), ControlMode::Observe).await;
         assert_eq!(s.gpu.mode, None);
         assert!(s.gpu.supported.is_empty());
         assert_eq!(s.gpu.mux, Some(1), "sysfs still read");
@@ -133,19 +139,36 @@ mod tests {
 
     #[tokio::test]
     async fn missing_nodes_are_none() {
-        let s = collect(&FakeSysfs::default(), &FakeGfx::default(), &FakeServices::default(), ControlMode::Observe).await;
+        let s = collect(&FakeSysfs::default(), &FakeGfx::default(), &FakeServices::default(), &FakeNvidia::default(), ControlMode::Observe).await;
         assert_eq!(s.keystone, None);
         assert_eq!(s.battery, BatteryState::default());
     }
 
     #[tokio::test]
     async fn perf_readings() {
-        let s = collect(&machine(), &FakeGfx::default(), &FakeServices::default(), ControlMode::Observe).await;
+        let s = collect(&machine(), &FakeGfx::default(), &FakeServices::default(), &FakeNvidia::default(), ControlMode::Observe).await;
         assert_eq!(s.perf.profile, Some(Profile::Performance));
         assert_eq!(s.perf.choices, vec![Profile::Quiet, Profile::Balanced, Profile::Performance]);
         assert_eq!(s.perf.cpu_temp_c, Some(72.0));
         assert_eq!((s.perf.cpu_fan_rpm, s.perf.gpu_fan_rpm), (Some(3300), Some(5200)));
         assert_eq!(s.perf.power_draw_w, Some(18.25));
         assert_eq!(s.perf.cpu_boost, Some(true));
+    }
+
+    #[tokio::test]
+    async fn no_nvml_while_suspended() {
+        let nv = FakeNvidia::with_active(Some(false));
+        let s = collect(&machine(), &FakeGfx::default(), &FakeServices::default(), &nv, ControlMode::Observe).await;
+        assert_eq!(s.gpu.dgpu_active, Some(false));
+        assert!(s.gpu.nvidia.is_none() && s.gpu.users.is_empty());
+        assert_eq!(nv.status_reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn nvml_read_when_active() {
+        let nv = FakeNvidia::with_active(Some(true));
+        let s = collect(&machine(), &FakeGfx::default(), &FakeServices::default(), &nv, ControlMode::Observe).await;
+        assert_eq!(s.gpu.nvidia.unwrap().core_mhz, 1500);
+        assert_eq!(s.gpu.users[0].name, "game");
     }
 }

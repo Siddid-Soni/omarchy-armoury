@@ -93,6 +93,7 @@ dependencies = [
  "anyhow",
  "armoury-proto",
  "async-trait",
+ "nvml-wrapper",
  "serde",
  "serde_json",
  "tempfile",

@@ -3,7 +3,7 @@ use crate::control::{Control, ModeHandle, handback, takeover};
 use crate::features::fan;
 use crate::features::limits::{self, Bounds, Limit};
 use crate::features::perf::apply_mode;
-use crate::hw::{Asusd, Gfx, Services, Sysfs, with_retry};
+use crate::hw::{Asusd, Gfx, Nvidia, Services, Sysfs, with_retry};
 use crate::state::collect;
 use anyhow::bail;
 use armoury_proto::{ControlMode, Event, ModeSettings, Profile, Request, Response, Snapshot};
@@ -20,6 +20,7 @@ pub struct Daemon {
     gfx: Box<dyn Gfx>,
     svc: Box<dyn Services>,
     asusd: Box<dyn Asusd>,
+    nv: Box<dyn Nvidia>,
     pub control: Mutex<Control>,
     mode: ModeHandle,
     snap: watch::Sender<Option<Snapshot>>,
@@ -32,12 +33,12 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    pub fn new(sys: Box<dyn Sysfs>, gfx: Box<dyn Gfx>, svc: Box<dyn Services>, asusd: Box<dyn Asusd>, control: Control, config_path: PathBuf) -> Arc<Self> {
+    pub fn new(sys: Box<dyn Sysfs>, gfx: Box<dyn Gfx>, svc: Box<dyn Services>, asusd: Box<dyn Asusd>, control: Control, config_path: PathBuf, nv: Box<dyn Nvidia>) -> Arc<Self> {
         let (config, config_error) = load_config(&config_path);
         if let Some(e) = &config_error { eprintln!("armouryd: {e}"); }
         let mode = control.mode_handle();
         Arc::new(Self {
-            sys, gfx, svc, asusd, control: Mutex::new(control), mode, snap: watch::channel(None).0,
+            sys, gfx, svc, asusd, nv, control: Mutex::new(control), mode, snap: watch::channel(None).0,
             config: Mutex::new(config), config_path, config_error,
             apply: Mutex::new(ApplyState::default()), last_reapply: std::sync::Mutex::new(tokio::time::Instant::now()),
         })
@@ -111,7 +112,7 @@ impl Daemon {
     /// Collects a fresh snapshot and publishes it to subscribers only if it changed.
     pub async fn refresh(&self) -> Snapshot {
         let mode = self.mode.get();
-        let mut s = collect(&*self.sys, &*self.gfx, &*self.svc, mode).await;
+        let mut s = collect(&*self.sys, &*self.gfx, &*self.svc, &*self.nv, mode).await;
         s.config_error = self.config_error.clone();
         self.snap.send_if_modified(|cur| {
             if cur.as_ref() == Some(&s) { false } else { *cur = Some(s.clone()); true }
@@ -301,7 +302,7 @@ pub fn bind(path: &Path) -> anyhow::Result<UnixListener> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hw::fake::{FakeAsusd, FakeGfx, FakeServices, FakeSysfs};
+    use crate::hw::fake::{FakeAsusd, FakeGfx, FakeNvidia, FakeServices, FakeSysfs};
     use armoury_proto::ControlMode;
     use std::path::PathBuf;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -310,7 +311,7 @@ mod tests {
     fn daemon(dir: &Path) -> Arc<Daemon> {
         let sys = FakeSysfs::with(&[("sys/devices/platform/asus-nb-wmi/keystone", "1")]);
         Daemon::new(Box::new(sys), Box::new(FakeGfx::default()), Box::new(FakeServices::default()),
-            Box::new(FakeAsusd::default()), Control::load(dir), dir.join("config.toml"))
+            Box::new(FakeAsusd::default()), Control::load(dir), dir.join("config.toml"), Box::new(FakeNvidia::default()))
     }
 
     async fn start(dir: &Path) -> (Arc<Daemon>, PathBuf) {
@@ -410,7 +411,7 @@ mod tests {
         let svc = FakeServices::default();
         *svc.fail_on.lock().unwrap() = Some("pkexec".into());
         let daemon = Daemon::new(Box::new(FakeSysfs::default()), Box::new(FakeGfx::default()), Box::new(svc),
-            Box::new(FakeAsusd::default()), Control::load(d.path()), d.path().join("config.toml"));
+            Box::new(FakeAsusd::default()), Control::load(d.path()), d.path().join("config.toml"), Box::new(FakeNvidia::default()));
         let r = daemon.handle(Request::Takeover).await;
         assert!(!r.ok);
         assert!(r.error.unwrap().contains("G-Helper restored"));
@@ -435,7 +436,7 @@ mod tests {
         let mut ctl = Control::load(dir.path());
         if active { ctl.set(ControlMode::Active).unwrap(); }
         let d = Daemon::new(Box::new(sys.clone()), Box::new(FakeGfx::default()), Box::new(svc.clone()),
-            Box::new(asusd.clone()), ctl, dir.path().join("config.toml"));
+            Box::new(asusd.clone()), ctl, dir.path().join("config.toml"), Box::new(FakeNvidia::default()));
         Rig { d, sys, asusd, svc, dir }
     }
 
@@ -543,7 +544,7 @@ mod tests {
         let mut ctl = Control::load(dir.path());
         ctl.set(ControlMode::Active).unwrap();
         let d = Daemon::new(Box::new(sys), Box::new(FakeGfx::default()), Box::new(svc),
-            Box::new(FakeAsusd::default()), ctl, dir.path().join("config.toml"));
+            Box::new(FakeAsusd::default()), ctl, dir.path().join("config.toml"), Box::new(FakeNvidia::default()));
         let resp = d.handle(Request::SetProfile { profile: Profile::Balanced }).await;
         let err = resp.error.expect("apply failure must be reported");
         assert!(err.contains("settings failed") && err.contains("power limits"), "{err}");
@@ -558,7 +559,7 @@ mod tests {
         let mut ctl = Control::load(dir.path());
         if active { ctl.set(ControlMode::Active).unwrap(); }
         let d = Daemon::new(Box::new(sys.clone()), Box::new(FakeGfx::default()), Box::new(svc.clone()),
-            Box::new(asusd.clone()), ctl, dir.path().join("config.toml"));
+            Box::new(asusd.clone()), ctl, dir.path().join("config.toml"), Box::new(FakeNvidia::default()));
         Rig { d, sys, asusd, svc, dir }
     }
 
