@@ -12,6 +12,9 @@ pub async fn collect(sys: &dyn Sysfs, gfx: &dyn Gfx, svc: &dyn Services, nv: &dy
         gpu: gpu_state(sys, gfx, nv, gpu_detail).await,
         battery: battery_state(sys),
         perf: perf_state(sys),
+        battery_info: Default::default(),
+        display: Vec::new(),
+        system: Default::default(),
         lighting: LightingState {
             brightness: sys.read(sysfs::KBD_BRIGHTNESS).and_then(|v| v.parse().ok()),
             on_ac: on_ac(sys),

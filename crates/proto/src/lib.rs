@@ -117,6 +117,56 @@ pub struct LightingState {
     pub on_ac: Option<bool>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BatteryInfo {
+    pub capacity: Option<u8>,
+    pub status: Option<String>,
+    pub health_pct: Option<f32>,
+    pub full_wh: Option<f32>,
+    pub design_wh: Option<f32>,
+    /// None when the firmware reports 0 (it does not count cycles).
+    pub cycles: Option<u32>,
+    pub voltage_v: Option<f32>,
+    pub draw_w: Option<f32>,
+    pub time_left_min: Option<u32>,
+    pub charge_limit: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DisplayInfo {
+    pub output: String,
+    pub width: u32,
+    pub height: u32,
+    pub refresh_hz: f32,
+    pub rates: Vec<f32>,
+    pub scale: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SleepMode { S2idle, Deep }
+
+impl SleepMode {
+    pub fn kernel(self) -> &'static str { match self { Self::S2idle => "s2idle", Self::Deep => "deep" } }
+    pub fn from_kernel(s: &str) -> Option<Self> { match s { "s2idle" => Some(Self::S2idle), "deep" => Some(Self::Deep), _ => None } }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Toggle { Touchpad, BootSound, PanelOd, Clamshell }
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SystemState {
+    pub boot_sound: Option<bool>,
+    pub panel_od: Option<bool>,
+    pub touchpad: Option<bool>,
+    pub clamshell: bool,
+    /// Active kernel sleep mode (the bracketed one in /sys/power/mem_sleep).
+    pub mem_sleep: Option<SleepMode>,
+    pub sleep_modes: Vec<SleepMode>,
+    pub camera_present: bool,
+}
+
 /// One GPU switch action. Integrated↔Ultimate is two manual steps via Hybrid.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -316,6 +366,13 @@ pub struct Snapshot {
     pub battery: BatteryState,
     pub perf: PerfState,
     pub lighting: LightingState,
+    #[serde(default)]
+    pub battery_info: BatteryInfo,
+    /// Hyprland outputs (empty outside a Hyprland session).
+    #[serde(default)]
+    pub display: Vec<DisplayInfo>,
+    #[serde(default)]
+    pub system: SystemState,
     /// Why config.toml (or part of it) was ignored, if it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_error: Option<String>,
@@ -326,7 +383,7 @@ pub struct Snapshot {
     pub ghelper_running: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Ping,
@@ -350,6 +407,14 @@ pub enum Request {
     SetZonePower { zone: ZonePower },
     KbdIdle,
     KbdResume,
+    SetChargeLimit { percent: u8 },
+    OneShotCharge,
+    SetRefresh { hz: f32 },
+    SetGamma { percent: u8 },
+    SetToggle { toggle: Toggle, on: bool },
+    SetSleepMode { mode: SleepMode },
+    SetSourceProfile { ac: Option<Profile>, battery: Option<Profile> },
+    SetSourceRefresh { ac: Option<f32>, battery: Option<f32> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -465,5 +530,21 @@ mod tests {
         let z: Request = serde_json::from_str(r#"{"cmd":"set_zone_power","zone":{"zone":"logo","boot":true,"awake":false,"sleep":false,"shutdown":false}}"#).unwrap();
         assert!(matches!(z, Request::SetZonePower { .. }));
         assert_eq!(serde_json::to_string(&Request::KbdIdle).unwrap(), r#"{"cmd":"kbd_idle"}"#);
+    }
+
+    #[test]
+    fn system_types() {
+        let r: Request = serde_json::from_str(r#"{"cmd":"set_charge_limit","percent":80}"#).unwrap();
+        assert_eq!(r, Request::SetChargeLimit { percent: 80 });
+        let r: Request = serde_json::from_str(r#"{"cmd":"set_refresh","hz":60.0}"#).unwrap();
+        assert_eq!(r, Request::SetRefresh { hz: 60.0 });
+        let r: Request = serde_json::from_str(r#"{"cmd":"set_sleep_mode","mode":"deep"}"#).unwrap();
+        assert_eq!(r, Request::SetSleepMode { mode: SleepMode::Deep });
+        let r: Request = serde_json::from_str(r#"{"cmd":"set_source_profile","ac":"performance","battery":"quiet"}"#).unwrap();
+        assert_eq!(r, Request::SetSourceProfile { ac: Some(Profile::Performance), battery: Some(Profile::Quiet) });
+        let r: Request = serde_json::from_str(r#"{"cmd":"set_toggle","toggle":"touchpad","on":false}"#).unwrap();
+        assert_eq!(r, Request::SetToggle { toggle: Toggle::Touchpad, on: false });
+        let s = Snapshot::default();
+        assert!(s.system.mem_sleep.is_none() && s.display.is_empty() && s.battery_info.health_pct.is_none());
     }
 }

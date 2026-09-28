@@ -434,6 +434,9 @@ impl Daemon {
             Request::FanCurves { profile } => self.curves(profile).await,
             Request::Lighting | Request::SetBrightness { .. } | Request::SetEffect { .. } | Request::SetZonePower { .. }
             | Request::KbdIdle | Request::KbdResume => self.lighting_request(req).await,
+            Request::SetChargeLimit { .. } | Request::OneShotCharge | Request::SetRefresh { .. } | Request::SetGamma { .. }
+            | Request::SetToggle { .. } | Request::SetSleepMode { .. } | Request::SetSourceProfile { .. }
+            | Request::SetSourceRefresh { .. } => Response::err("not implemented"),
             Request::PlanGpuMode { mode } => match plan_switch(&self.refresh().await.gpu, mode) {
                 Ok(step) => Response::ok(serde_json::to_value(step).unwrap()),
                 Err(e) => Response::err(e),
