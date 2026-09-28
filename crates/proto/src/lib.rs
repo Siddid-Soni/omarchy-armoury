@@ -32,6 +32,37 @@ impl GpuMode {
             _ => return Option::None,
         })
     }
+
+    /// supergfxd mode code (inverse of from_supergfx).
+    pub fn code(self) -> u32 {
+        match self {
+            Self::Hybrid => 0,
+            Self::Integrated => 1,
+            Self::NvidiaNoModeset => 2,
+            Self::Vfio => 3,
+            Self::AsusEgpu => 4,
+            Self::AsusMuxDgpu => 5,
+            Self::None => 6,
+        }
+    }
+}
+
+/// One GPU switch action. Integrated↔Ultimate is two manual steps via Hybrid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GpuStep {
+    /// Omarchy's own omarchy-toggle-hybrid-gpu (Hybrid ↔ Integrated; it reboots).
+    OmarchyToggle { to: GpuMode },
+    /// supergfxd SetMode (Hybrid ↔ Ultimate; reboot to finish).
+    Supergfx { to: GpuMode },
+    FirstOfTwo { first: Box<GpuStep>, then: GpuMode },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuSwitchResult {
+    pub step: GpuStep,
+    pub reboot_required: bool,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,6 +261,8 @@ pub enum Request {
     ModeSettings { profile: Profile },
     SetModeSettings { profile: Profile, settings: ModeSettings },
     ProbeUndervolt,
+    SetGpuMode { mode: GpuMode },
+    PlanGpuMode { mode: GpuMode },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -321,5 +354,16 @@ mod tests {
         assert_eq!(r, Request::SetModeSettings { profile: Profile::Performance, settings: ModeSettings {
             uv_mv: Some(-40), gpu_core_offset: Some(100), gpu_core_lock: Some(0), ..Default::default() } });
         assert_eq!(serde_json::to_string(&Request::ProbeUndervolt).unwrap(), r#"{"cmd":"probe_undervolt"}"#);
+    }
+
+    #[test]
+    fn gpu_switch_types() {
+        assert_eq!(GpuMode::AsusMuxDgpu.code(), 5);
+        for c in 0..=6 { assert_eq!(GpuMode::from_supergfx(c).unwrap().code(), c); }
+        let v = serde_json::to_value(GpuStep::FirstOfTwo { first: Box::new(GpuStep::OmarchyToggle { to: GpuMode::Hybrid }), then: GpuMode::AsusMuxDgpu }).unwrap();
+        assert_eq!(v["kind"], "first_of_two");
+        assert_eq!(v["first"]["kind"], "omarchy_toggle");
+        let r: Request = serde_json::from_str(r#"{"cmd":"set_gpu_mode","mode":"AsusMuxDgpu"}"#).unwrap();
+        assert_eq!(r, Request::SetGpuMode { mode: GpuMode::AsusMuxDgpu });
     }
 }

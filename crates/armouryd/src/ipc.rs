@@ -244,6 +244,7 @@ impl Daemon {
                 self.snapshot_after(with_retry(|| self.asusd.next_profile()).await).await
             }
             Request::FanCurves { profile } => self.curves(profile).await,
+            Request::SetGpuMode { .. } | Request::PlanGpuMode { .. } => Response::err("not implemented"),
             Request::ProbeUndervolt => {
                 if let Err(r) = self.write_guard().await { return r; }
                 // The probe leaves the offset at 0 mV: re-apply the mode under the same
