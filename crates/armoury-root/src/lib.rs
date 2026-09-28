@@ -42,6 +42,69 @@ pub fn aura_config_stale(text: &str, fix: &Fix) -> bool {
     fix.zones.iter().any(|z| !text.contains(&format!("zone: {z},")))
 }
 
+/// Configs to set aside so asusd regenerates them with all zones. Only after the
+/// support file actually changed, so repeat runs never touch the user's config.
+pub fn stale_configs<'a>(support_changed: bool, configs: &'a [(String, String)], fix: &Fix) -> Vec<&'a str> {
+    if !support_changed { return Vec::new(); }
+    configs.iter().filter(|(_, text)| aura_config_stale(text, fix)).map(|(name, _)| name.as_str()).collect()
+}
+
+/// First free `<path>.armoury-bak[.N]`, so an existing backup is never overwritten.
+pub fn backup_path(path: &std::path::Path, taken: impl Fn(&std::path::Path) -> bool) -> std::path::PathBuf {
+    let base = format!("{}.armoury-bak", path.display());
+    let mut candidate = std::path::PathBuf::from(&base);
+    let mut n = 0;
+    while taken(&candidate) {
+        n += 1;
+        candidate = format!("{base}.{n}").into();
+    }
+    candidate
+}
+
+/// Pacman cache path of the installed asusctl, from `pacman -Q asusctl` output.
+pub fn cached_package(pacman_q: &str, arch: &str) -> Option<String> {
+    let version = pacman_q.split_whitespace().nth(1)?;
+    Some(format!("/var/cache/pacman/pkg/asusctl-{version}-{arch}.pkg.tar.zst"))
+}
+
+/// System operations armoury-root performs, so takeover/handback ordering is testable.
+pub trait Host {
+    fn systemctl(&mut self, args: &[&str]) -> anyhow::Result<()>;
+    fn asusd_masked(&mut self) -> bool;
+    fn set_marker(&mut self, present: bool) -> anyhow::Result<()>;
+    fn marker_exists(&mut self) -> bool;
+    fn support_fix(&mut self) -> anyhow::Result<()>;
+    fn warn(&mut self, msg: &str);
+}
+
+/// Unmask (remembering the mask) and start asusd. Any failure after the unmask
+/// restores the previous asusd state, so asusd never ends up running beside G-Helper.
+pub fn takeover(h: &mut dyn Host) -> anyhow::Result<()> {
+    if h.asusd_masked() {
+        h.set_marker(true)?;
+        h.systemctl(&["unmask", "asusd"])?;
+    }
+    if let Err(e) = h.support_fix() {
+        h.warn(&format!("lighting-zone fix skipped: {e:#}"));
+    }
+    if let Err(e) = h.systemctl(&["enable", "--now", "asusd"]) {
+        return Err(match handback(h) {
+            Ok(()) => e.context("asusd did not start; restored previous asusd state"),
+            Err(r) => e.context(format!("asusd did not start and rollback failed: {r:#}")),
+        });
+    }
+    Ok(())
+}
+
+pub fn handback(h: &mut dyn Host) -> anyhow::Result<()> {
+    h.systemctl(&["disable", "--now", "asusd"])?;
+    if h.marker_exists() {
+        h.systemctl(&["mask", "asusd"])?;
+        h.set_marker(false)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +187,99 @@ mod tests {
         assert!(aura_config_stale(only_kbd, g533z()));
         let full = "( zone: Keyboard, ) ( zone: Lightbar, ) ( zone: Logo, )";
         assert!(!aura_config_stale(full, g533z()));
+    }
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct FakeHost {
+        calls: Vec<String>,
+        masked: bool,
+        marker: bool,
+        fail_on: Option<&'static str>,
+        support_fix_fails: bool,
+        warnings: Vec<String>,
+    }
+
+    impl Host for FakeHost {
+        fn systemctl(&mut self, args: &[&str]) -> anyhow::Result<()> {
+            let j = args.join(" ");
+            self.calls.push(j.clone());
+            if self.fail_on.is_some_and(|f| j.contains(f)) { anyhow::bail!("systemctl {j} failed"); }
+            match args {
+                ["unmask", _] => self.masked = false,
+                ["mask", _] => self.masked = true,
+                _ => {}
+            }
+            Ok(())
+        }
+        fn asusd_masked(&mut self) -> bool { self.masked }
+        fn set_marker(&mut self, present: bool) -> anyhow::Result<()> { self.marker = present; Ok(()) }
+        fn marker_exists(&mut self) -> bool { self.marker }
+        fn support_fix(&mut self) -> anyhow::Result<()> {
+            if self.support_fix_fails { anyhow::bail!("no entry for G533Z") } else { Ok(()) }
+        }
+        fn warn(&mut self, msg: &str) { self.warnings.push(msg.into()); }
+    }
+
+    #[test]
+    fn takeover_unmasks_and_starts() {
+        let mut h = FakeHost { masked: true, ..Default::default() };
+        takeover(&mut h).unwrap();
+        assert_eq!(h.calls, ["unmask asusd", "enable --now asusd"]);
+        assert!(h.marker);
+    }
+
+    #[test]
+    fn takeover_failure_restores_mask() {
+        let mut h = FakeHost { masked: true, fail_on: Some("enable"), ..Default::default() };
+        let err = takeover(&mut h).unwrap_err();
+        assert!(format!("{err:#}").contains("restored previous asusd state"));
+        assert_eq!(h.calls, ["unmask asusd", "enable --now asusd", "disable --now asusd", "mask asusd"]);
+        assert!(h.masked);
+        assert!(!h.marker);
+    }
+
+    #[test]
+    fn support_fix_failure_does_not_block_takeover() {
+        let mut h = FakeHost { support_fix_fails: true, ..Default::default() };
+        takeover(&mut h).unwrap();
+        assert_eq!(h.calls, ["enable --now asusd"]);
+        assert!(h.warnings[0].contains("no entry for G533Z"));
+    }
+
+    #[test]
+    fn handback_leaves_unmasked_if_it_was_not_masked() {
+        let mut h = FakeHost::default();
+        handback(&mut h).unwrap();
+        assert_eq!(h.calls, ["disable --now asusd"]);
+    }
+
+    #[test]
+    fn configs_set_aside_only_when_support_changed() {
+        let fix = fix_for_board("G533ZW").unwrap();
+        let cfgs = vec![("aura_19b6.ron".to_string(), "zone: Keyboard,".to_string())];
+        assert!(stale_configs(false, &cfgs, fix).is_empty());
+        assert_eq!(stale_configs(true, &cfgs, fix), ["aura_19b6.ron"]);
+    }
+
+    #[test]
+    fn backup_never_overwrites() {
+        let p = std::path::Path::new("/etc/asusd/aura_19b6.ron");
+        assert_eq!(backup_path(p, |_| false).to_str(), Some("/etc/asusd/aura_19b6.ron.armoury-bak"));
+        let taken = |q: &std::path::Path| q.to_str().unwrap().ends_with(".armoury-bak") || q.to_str().unwrap().ends_with(".armoury-bak.1");
+        assert_eq!(backup_path(p, taken).to_str(), Some("/etc/asusd/aura_19b6.ron.armoury-bak.2"));
+    }
+
+    #[test]
+    fn cached_package_path() {
+        assert_eq!(
+            cached_package("asusctl 6.4.0-2\n", "x86_64").as_deref(),
+            Some("/var/cache/pacman/pkg/asusctl-6.4.0-2-x86_64.pkg.tar.zst")
+        );
+        assert_eq!(cached_package("", "x86_64"), None);
     }
 }
