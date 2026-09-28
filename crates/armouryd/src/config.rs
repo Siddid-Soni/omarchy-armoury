@@ -10,6 +10,19 @@ pub struct Config {
     pub reapply_power_secs: u32,
     pub modes: BTreeMap<Profile, ModeSettings>,
     pub lighting: LightingConfig,
+    pub system: SystemConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SystemConfig {
+    /// Re-applied at every active start (the kernel resets it each boot).
+    pub sleep_mode: Option<armoury_proto::SleepMode>,
+    /// Stay awake with the lid closed while on AC.
+    pub clamshell: bool,
+    /// Built-in panel refresh rate on AC / on battery.
+    pub refresh_ac: Option<f32>,
+    pub refresh_battery: Option<f32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

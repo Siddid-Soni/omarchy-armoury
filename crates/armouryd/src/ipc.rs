@@ -4,11 +4,13 @@ use crate::features::fan;
 use crate::features::limits::{self, Bounds, Limit};
 use crate::features::perf::{HwCtx, apply_mode, apply_nv, nv_is_stock};
 use crate::features::lighting::{effect_from_raw, effect_to_raw, power_from_raw, set_zone, validate_effect};
+use crate::features::clamshell::Clamshell;
+use crate::hw::hypr::{Hypr, RealHypr, lua_monitor, lua_touchpad};
 use crate::hw::{Asusd, Aura, Gfx, Nvidia, Services, Sysfs, with_retry};
 use crate::state::collect;
 use anyhow::{Context, bail};
 use crate::features::gpu::plan_switch;
-use armoury_proto::{ControlMode, Event, GpuMode, GpuStep, GpuSwitchResult, ModeSettings, Profile, Request, Response, Snapshot, UndervoltState};
+use armoury_proto::{Toggle, ControlMode, Event, GpuMode, GpuStep, GpuSwitchResult, ModeSettings, Profile, Request, Response, Snapshot, UndervoltState};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,6 +40,10 @@ pub struct Daemon {
     /// Serialises GPU plan + execute.
     gpu_lock: Mutex<()>,
     light: std::sync::Mutex<LightState>,
+    hypr: Box<dyn Hypr>,
+    clamshell: Mutex<Clamshell>,
+    touchpad_on: std::sync::Mutex<Option<bool>>,
+    sys_src: std::sync::Mutex<SysSource>,
     state_dir: PathBuf,
     last_reapply: std::sync::Mutex<tokio::time::Instant>,
 }
@@ -56,6 +62,10 @@ impl Daemon {
             apply_error: std::sync::Mutex::new(None),
             gpu_lock: Mutex::new(()),
             light: std::sync::Mutex::new(LightState::default()),
+            hypr: Box::new(RealHypr),
+            clamshell: Mutex::new(Clamshell::systemd_inhibit()),
+            touchpad_on: std::sync::Mutex::new(None),
+            sys_src: std::sync::Mutex::new(SysSource::default()),
             state_dir, last_reapply: std::sync::Mutex::new(tokio::time::Instant::now()),
         })
     }
@@ -65,6 +75,121 @@ impl Daemon {
         let mut d = Arc::try_unwrap(self).ok().expect("with_aura before the daemon is shared");
         d.aura = aura;
         Arc::new(d)
+    }
+
+    pub fn with_hypr(self: Arc<Self>, hypr: Box<dyn Hypr>) -> Arc<Self> {
+        let mut d = Arc::try_unwrap(self).ok().expect("with_hypr before the daemon is shared");
+        d.hypr = hypr;
+        Arc::new(d)
+    }
+
+    pub fn with_clamshell(self: Arc<Self>, c: Clamshell) -> Arc<Self> {
+        let mut d = Arc::try_unwrap(self).ok().expect("with_clamshell before the daemon is shared");
+        d.clamshell = Mutex::new(c);
+        Arc::new(d)
+    }
+
+    pub async fn clamshell_holding(&self) -> bool { self.clamshell.lock().await.holding() }
+
+    /// The built-in panel (eDP) or, failing that, the first output.
+    async fn panel(&self) -> anyhow::Result<armoury_proto::DisplayInfo> {
+        let mons = self.hypr.monitors().await?;
+        mons.iter().find(|m| m.output.starts_with("eDP")).or(mons.first()).cloned().context("no display found")
+    }
+
+    async fn set_refresh(&self, hz: f32) -> anyhow::Result<()> {
+        let panel = self.panel().await?;
+        if (panel.refresh_hz - hz).abs() < 0.5 { return Ok(()); }
+        let lua = lua_monitor(&panel, hz).map_err(anyhow::Error::msg)?;
+        self.hypr.eval(&lua).await
+    }
+
+    /// Per-source refresh rate, clamshell inhibitor and the once-per-start sleep mode.
+    async fn follow_system(&self, snap: &Snapshot) {
+        let cfg = self.config.lock().await.system.clone();
+        let on_ac = snap.lighting.on_ac;
+        self.clamshell.lock().await.update(cfg.clamshell, on_ac == Some(true)).await;
+        let (prev, sleep_applied) = { let s = self.sys_src.lock().unwrap(); (s.on_ac, s.sleep_applied) };
+        if !sleep_applied {
+            if let Some(m) = cfg.sleep_mode.filter(|m| snap.system.mem_sleep != Some(*m)) {
+                if let Err(e) = self.svc.run(&[PKEXEC, ROOT_HELPER, "mem-sleep", m.kernel()]).await { eprintln!("armouryd: sleep mode: {e:#}"); }
+            }
+            self.sys_src.lock().unwrap().sleep_applied = true;
+        }
+        let Some(ac) = on_ac else { return };
+        if prev == Some(ac) { return; }
+        if let Some(hz) = if ac { cfg.refresh_ac } else { cfg.refresh_battery } {
+            if let Err(e) = self.set_refresh(hz).await {
+                eprintln!("armouryd: refresh rate: {e:#}");
+                return; // retry next tick
+            }
+        }
+        self.sys_src.lock().unwrap().on_ac = Some(ac);
+    }
+
+    async fn system_request(&self, req: Request) -> Response {
+        if let Err(r) = self.write_guard().await { return r; }
+        let result: anyhow::Result<serde_json::Value> = async {
+            match req {
+                Request::SetChargeLimit { percent } => {
+                    anyhow::ensure!((20..=100).contains(&percent), "charge limit must be 20–100 %");
+                    with_retry(|| self.asusd.set_charge_limit(percent)).await?;
+                    Ok(serde_json::json!({"percent": percent}))
+                }
+                Request::OneShotCharge => { with_retry(|| self.asusd.one_shot_charge()).await?; Ok(serde_json::json!({})) }
+                Request::SetRefresh { hz } => { self.set_refresh(hz).await?; Ok(serde_json::json!({"hz": hz})) }
+                Request::SetGamma { percent } => {
+                    anyhow::ensure!((20..=100).contains(&percent), "gamma must be 20–100 %");
+                    self.hypr.gamma(percent).await?;
+                    Ok(serde_json::json!({"percent": percent}))
+                }
+                Request::SetToggle { toggle, on } => {
+                    match toggle {
+                        Toggle::Touchpad => {
+                            let name = self.hypr.touchpad().await.context("no touchpad found")?;
+                            self.hypr.eval(&lua_touchpad(&name, on)).await?;
+                            *self.touchpad_on.lock().unwrap() = Some(on);
+                        }
+                        Toggle::BootSound => with_retry(|| self.asusd.armoury_set_value("boot_sound", on as i32)).await?,
+                        Toggle::PanelOd => with_retry(|| self.asusd.armoury_set_value("panel_overdrive", on as i32)).await?,
+                        Toggle::Clamshell => {
+                            let mut cfg = self.config.lock().await;
+                            cfg.system.clamshell = on;
+                            cfg.save(&self.config_path)?;
+                            drop(cfg);
+                            let on_ac = self.refresh().await.lighting.on_ac == Some(true);
+                            self.clamshell.lock().await.update(on, on_ac).await;
+                        }
+                    }
+                    Ok(serde_json::json!({"toggle": toggle, "on": on}))
+                }
+                Request::SetSleepMode { mode } => {
+                    anyhow::ensure!(self.refresh().await.system.sleep_modes.contains(&mode), "{} sleep is not supported here", mode.kernel());
+                    self.svc.run(&[PKEXEC, ROOT_HELPER, "mem-sleep", mode.kernel()]).await?;
+                    let mut cfg = self.config.lock().await;
+                    cfg.system.sleep_mode = Some(mode);
+                    cfg.save(&self.config_path)?;
+                    Ok(serde_json::json!({"mode": mode}))
+                }
+                Request::SetSourceProfile { ac, battery } => {
+                    with_retry(|| self.asusd.set_source_profiles(ac.map(Profile::to_asusd), battery.map(Profile::to_asusd))).await?;
+                    Ok(serde_json::json!({"ac": ac, "battery": battery}))
+                }
+                Request::SetSourceRefresh { ac, battery } => {
+                    let panel = self.panel().await?;
+                    for hz in [ac, battery].into_iter().flatten() { lua_monitor(&panel, hz).map_err(anyhow::Error::msg)?; }
+                    let mut cfg = self.config.lock().await;
+                    if ac.is_some() { cfg.system.refresh_ac = ac; }
+                    if battery.is_some() { cfg.system.refresh_battery = battery; }
+                    cfg.save(&self.config_path)?;
+                    drop(cfg);
+                    self.sys_src.lock().unwrap().on_ac = None; // apply for the current source on the next tick
+                    Ok(serde_json::json!({"ac": ac, "battery": battery}))
+                }
+                _ => unreachable!(),
+            }
+        }.await;
+        match result { Ok(v) => Response::ok(v), Err(e) => Response::err(format!("{e:#}")) }
     }
 
     /// Keeps keyboard brightness per power source. Between flips it tracks the level the
@@ -202,9 +327,12 @@ impl Daemon {
         if self.mode.get() != ControlMode::Active {
             *st = ApplyState::default(); // re-apply after the next takeover
             *self.light.lock().unwrap() = LightState::default();
+            *self.sys_src.lock().unwrap() = SysSource::default();
+            self.clamshell.lock().await.update(false, false).await;
             return Vec::new();
         }
         self.follow_power_source(&snap).await;
+        self.follow_system(&snap).await;
         let now = tokio::time::Instant::now();
         if self.uv.lock().unwrap().is_none() && self.config.lock().await.modes.values().any(|m| m.uv_mv.is_some())
             && st.probe_retry_at.is_none_or(|t| now >= t)
@@ -400,6 +528,9 @@ impl Daemon {
         s.perf.undervolt = self.uv.lock().unwrap().map(|unlocked| UndervoltState { unlocked });
         s.apply_error = self.apply_error.lock().unwrap().clone();
         s.gpu.armoury_pending = self.gpu_record();
+        s.system.touchpad = *self.touchpad_on.lock().unwrap();
+        s.system.clamshell = self.config.lock().await.system.clamshell;
+        if gpu_detail { s.display = self.hypr.monitors().await.unwrap_or_default(); }
         s
     }
 
@@ -436,7 +567,7 @@ impl Daemon {
             | Request::KbdIdle | Request::KbdResume => self.lighting_request(req).await,
             Request::SetChargeLimit { .. } | Request::OneShotCharge | Request::SetRefresh { .. } | Request::SetGamma { .. }
             | Request::SetToggle { .. } | Request::SetSleepMode { .. } | Request::SetSourceProfile { .. }
-            | Request::SetSourceRefresh { .. } => Response::err("not implemented"),
+            | Request::SetSourceRefresh { .. } => self.system_request(req).await,
             Request::PlanGpuMode { mode } => match plan_switch(&self.refresh().await.gpu, mode) {
                 Ok(step) => Response::ok(serde_json::to_value(step).unwrap()),
                 Err(e) => Response::err(e),
@@ -573,6 +704,15 @@ impl Daemon {
 
 use crate::control::{PKEXEC, ROOT_HELPER};
 
+/// System bookkeeping (active mode).
+#[derive(Default)]
+struct SysSource {
+    /// Power source whose refresh rate is applied.
+    on_ac: Option<bool>,
+    /// Sleep mode re-applied this active run.
+    sleep_applied: bool,
+}
+
 /// Keyboard lighting bookkeeping (active mode).
 #[derive(Default)]
 struct LightState {
@@ -675,7 +815,7 @@ pub fn bind(path: &Path) -> anyhow::Result<UnixListener> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hw::fake::{FakeAsusd, FakeAura, FakeGfx, FakeNvidia, FakeServices, FakeSysfs};
+    use crate::hw::fake::{FakeAsusd, FakeAura, FakeGfx, FakeHypr, FakeNvidia, FakeServices, FakeSysfs};
     use armoury_proto::ControlMode;
     use std::path::PathBuf;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1389,5 +1529,113 @@ mod tests {
         set_brightness_sysfs(&r, "2"); // Fn press woke it
         assert!(r.d.handle(Request::KbdResume).await.ok);
         assert_eq!(acalls(&r), ["set_brightness 0"], "resume must not overwrite the user's choice");
+    }
+
+    struct SysRig { d: Arc<Daemon>, sys: Arc<FakeSysfs>, asusd: Arc<FakeAsusd>, svc: Arc<FakeServices>, hypr: Arc<FakeHypr>, dir: tempfile::TempDir }
+
+    fn sys_rig(active: bool, toml: &str) -> SysRig {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), toml).unwrap();
+        let sys = Arc::new(FakeSysfs::with(&[
+            ("sys/class/power_supply/ADP0/type", "Mains"),
+            ("sys/class/power_supply/ADP0/online", "1"),
+            ("sys/power/mem_sleep", "[s2idle] deep"),
+        ]));
+        let (asusd, svc, hypr) = (Arc::new(FakeAsusd::default()), Arc::new(FakeServices::default()), Arc::new(FakeHypr::default()));
+        let mut ctl = Control::load(dir.path());
+        if active { ctl.set(ControlMode::Active).unwrap(); }
+        let d = Daemon::new(Box::new(sys.clone()), Box::new(FakeGfx::default()), Box::new(svc.clone()),
+            Box::new(asusd.clone()), ctl, dir.path().join("config.toml"), Box::new(FakeNvidia::default()))
+            .with_hypr(Box::new(hypr.clone()))
+            .with_clamshell(crate::features::clamshell::Clamshell::new(vec!["sleep".into(), "30".into()]));
+        SysRig { d, sys, asusd, svc, hypr, dir }
+    }
+
+    fn sreq(v: serde_json::Value) -> Request { serde_json::from_value(v).unwrap() }
+    fn plug(r: &SysRig, on: bool) { r.sys.files.lock().unwrap().insert("sys/class/power_supply/ADP0/online".into(), if on { "1" } else { "0" }.into()); }
+
+    #[tokio::test]
+    async fn charge_limit_bounds() {
+        let r = sys_rig(true, "");
+        assert!(r.d.handle(Request::SetChargeLimit { percent: 80 }).await.ok);
+        assert!(r.d.handle(Request::SetChargeLimit { percent: 10 }).await.error.unwrap().contains("20"));
+        assert!(r.d.handle(Request::SetChargeLimit { percent: 101 }).await.error.is_some());
+        assert!(r.d.handle(Request::OneShotCharge).await.ok);
+        assert_eq!(*r.asusd.calls.lock().unwrap(), ["set_charge_limit 80", "one_shot_charge"]);
+    }
+
+    #[tokio::test]
+    async fn refresh_validated_against_panel() {
+        let r = sys_rig(true, "");
+        assert!(r.d.handle(Request::SetRefresh { hz: 60.0 }).await.ok);
+        assert!(r.hypr.evals.lock().unwrap()[0].contains("2560x1440@60"));
+        assert!(r.d.handle(Request::SetRefresh { hz: 144.0 }).await.error.unwrap().contains("not available"));
+        assert_eq!(r.hypr.evals.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn source_refresh_follows_power_once_per_flip() {
+        let r = sys_rig(true, "[system]\nrefresh_ac = 240.0\nrefresh_battery = 60.0\n");
+        r.d.tick().await; // on AC at 240 already → nothing
+        assert!(r.hypr.evals.lock().unwrap().is_empty(), "{:?}", r.hypr.evals.lock().unwrap());
+        plug(&r, false);
+        r.d.tick().await;
+        r.d.tick().await;
+        assert_eq!(r.hypr.evals.lock().unwrap().len(), 1);
+        assert!(r.hypr.evals.lock().unwrap()[0].contains("@60"));
+        plug(&r, true);
+        r.d.tick().await;
+        assert!(r.hypr.evals.lock().unwrap().last().unwrap().contains("@240"));
+    }
+
+    #[tokio::test]
+    async fn clamshell_follows_power() {
+        let r = sys_rig(true, "");
+        assert!(r.d.handle(Request::SetToggle { toggle: armoury_proto::Toggle::Clamshell, on: true }).await.ok);
+        r.d.tick().await;
+        assert!(r.d.clamshell_holding().await);
+        plug(&r, false);
+        r.d.tick().await;
+        assert!(!r.d.clamshell_holding().await, "released on battery");
+        plug(&r, true);
+        r.d.tick().await;
+        assert!(r.d.clamshell_holding().await);
+        assert!(std::fs::read_to_string(r.dir.path().join("config.toml")).unwrap().contains("clamshell = true"));
+    }
+
+    #[tokio::test]
+    async fn toggles_route_to_the_right_backend() {
+        let r = sys_rig(true, "");
+        assert!(r.d.handle(sreq(serde_json::json!({"cmd":"set_toggle","toggle":"touchpad","on":false}))).await.ok);
+        assert!(r.hypr.evals.lock().unwrap()[0].contains("enabled = false"));
+        assert!(r.d.handle(sreq(serde_json::json!({"cmd":"set_toggle","toggle":"panel_od","on":false}))).await.ok);
+        assert!(r.d.handle(sreq(serde_json::json!({"cmd":"set_toggle","toggle":"boot_sound","on":true}))).await.ok);
+        assert_eq!(*r.asusd.calls.lock().unwrap(), ["armoury_set_value panel_overdrive 0", "armoury_set_value boot_sound 1"]);
+        assert_eq!(r.d.refresh().await.system.touchpad, Some(false));
+    }
+
+    #[tokio::test]
+    async fn sleep_mode_set_saved_and_reapplied_at_start() {
+        let r = sys_rig(true, "");
+        assert!(r.d.handle(Request::SetSleepMode { mode: armoury_proto::SleepMode::Deep }).await.ok);
+        assert!(r.svc.calls.lock().unwrap().iter().any(|c| c.ends_with("mem-sleep deep")));
+        let r2 = sys_rig(true, "[system]\nsleep_mode = \"deep\"\n");
+        r2.d.tick().await;
+        r2.d.tick().await;
+        assert_eq!(r2.svc.calls.lock().unwrap().iter().filter(|c| c.ends_with("mem-sleep deep")).count(), 1, "once per start");
+    }
+
+    #[tokio::test]
+    async fn source_profiles_go_to_asusd() {
+        let r = sys_rig(true, "");
+        assert!(r.d.handle(sreq(serde_json::json!({"cmd":"set_source_profile","ac":"performance","battery":"quiet"}))).await.ok);
+        assert_eq!(*r.asusd.calls.lock().unwrap(), ["set_source_profiles Some(1) Some(2)"]);
+    }
+
+    #[tokio::test]
+    async fn system_writes_refused_in_observe() {
+        let r = sys_rig(false, "");
+        assert!(r.d.handle(Request::SetChargeLimit { percent: 80 }).await.error.unwrap().contains("observe"));
+        assert!(r.d.handle(Request::SetRefresh { hz: 60.0 }).await.error.unwrap().contains("observe"));
     }
 }
