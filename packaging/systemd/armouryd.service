@@ -1,0 +1,11 @@
+[Unit]
+Description=Omarchy Armoury daemon (ASUS ROG control)
+After=dbus.service
+
+[Service]
+ExecStart=%h/.local/bin/armouryd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

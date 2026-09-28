@@ -1,0 +1,6 @@
+// No subject.active check: armouryd runs in user@.service, outside the logind session.
+polkit.addRule(function (action, subject) {
+  if (action.id == "org.omarchy.armoury.root" && subject.user == "@USER@") {
+    return polkit.Result.YES;
+  }
+});

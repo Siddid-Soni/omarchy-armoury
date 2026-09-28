@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Path
+Target = usr/share/asusd/aura_support.ron
+
+[Action]
+Description = Re-applying Omarchy Armoury asusd lighting-zone fix...
+When = PostTransaction
+Exec = /usr/local/lib/omarchy-armoury/armoury-root asusd-support-fix
