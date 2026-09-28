@@ -1,6 +1,7 @@
 pub mod asusd;
 pub mod aura;
 pub mod fake;
+pub mod hypr;
 pub mod nvidia;
 pub mod services;
 pub mod supergfx;

@@ -162,6 +162,46 @@ impl super::Aura for FakeAura {
     }
 }
 
+pub struct FakeHypr {
+    pub monitors: Mutex<Vec<armoury_proto::DisplayInfo>>,
+    pub evals: Mutex<Vec<String>>,
+    pub gamma: Mutex<Vec<u8>>,
+    pub sunset_running: bool,
+}
+
+impl Default for FakeHypr {
+    /// This machine's panel: eDP-1 2560x1440, 240/60 Hz, scale 1.6.
+    fn default() -> Self {
+        Self {
+            monitors: Mutex::new(vec![armoury_proto::DisplayInfo {
+                output: "eDP-1".into(), width: 2560, height: 1440, refresh_hz: 240.0, rates: vec![240.0, 60.0], scale: 1.6,
+            }]),
+            evals: Mutex::new(Vec::new()),
+            gamma: Mutex::new(Vec::new()),
+            sunset_running: true,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl super::hypr::Hypr for FakeHypr {
+    async fn monitors(&self) -> anyhow::Result<Vec<armoury_proto::DisplayInfo>> { Ok(self.monitors.lock().unwrap().clone()) }
+    async fn touchpad(&self) -> Option<String> { Some("asue1403:00-04f3:319a-touchpad".into()) }
+    async fn eval(&self, lua: &str) -> anyhow::Result<()> {
+        self.evals.lock().unwrap().push(lua.to_string());
+        // mirror a refresh change so later reads see it
+        if let Some(hz) = lua.split('@').nth(1).and_then(|s| s.split('"').next()).and_then(|s| s.parse::<f32>().ok()) {
+            for m in self.monitors.lock().unwrap().iter_mut() { m.refresh_hz = hz; }
+        }
+        Ok(())
+    }
+    async fn gamma(&self, pct: u8) -> anyhow::Result<()> {
+        if !self.sunset_running { anyhow::bail!("hyprsunset is not running (turn on Omarchy's night light, or start hyprsunset)"); }
+        self.gamma.lock().unwrap().push(pct);
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 pub struct FakeNvidia {
     pub active: Mutex<Option<bool>>,
