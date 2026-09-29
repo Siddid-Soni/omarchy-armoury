@@ -65,15 +65,19 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
 
 Everything below happens only in active mode.
 
-**Entering a stock mode X:**
+**Entering a stock mode X:** only `set_profile(X)`. No curve rewrites, EPP or
+power-limit writes (a burst of full mode switches hung the EC on 2026-09-30).
+Mode changes are serialized: each one finishes, apply included, before the
+next starts, and every mode-key press is its own switch, in order.
 
-1. `set_profile(X)`
-2. Disable custom fan curves for X.
-3. Reset to stock:
-   - power limits: `set-limits` with no values, `cpu_boost=on`
-   - undervolt `0`, but only if it was changed
-   - NVIDIA clocks at stock, but only if they were changed and the dGPU is
-     awake
+**One-time cleanup**, only when leaving Manual (its base slot) or on the first
+apply after start/takeover (the current slot, since G-Helper may have left
+curves on):
+- Turn that slot's custom fan curves off.
+- If the policy didn't change (Manual on Turbo → Turbo), re-assert it once so
+  the firmware reloads its own power limits.
+- CPU boost back on, only if it's off.
+- Undervolt `0` and NVIDIA clocks back to stock, only if they were changed.
 
 **Entering Manual with profile P:**
 

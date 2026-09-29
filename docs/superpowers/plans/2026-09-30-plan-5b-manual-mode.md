@@ -414,12 +414,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stock_turns_curves_off_and_reasserts_mode() {
+    async fn stock_to_stock_sends_nothing_extra() {
         let (asusd, svc) = (FakeAsusd::default(), FakeServices::default());
-        let errs = apply_stock(Profile::Quiet, HwCtx::default(), &asusd, &svc).await;
+        let ctx = HwCtx { cpu_boost_now: Some(true), mode_just_set: true, uv_at_stock: true, nv_at_stock: true, ..Default::default() };
+        let errs = apply_stock(Profile::Quiet, None, ctx, &asusd, &svc).await;
         assert!(errs.is_empty(), "{errs:?}");
-        assert_eq!(*asusd.calls.lock().unwrap(), ["set_fan_curves_enabled 2 false", "set_profile 2"]);
-        assert!(svc.calls.lock().unwrap().iter().any(|c| c.ends_with("set-limits cpu_boost=on")));
+        assert!(asusd.calls.lock().unwrap().is_empty(), "no curves / EPP / policy re-assert");
+        assert!(svc.calls.lock().unwrap().is_empty(), "no root call when boost is already on");
+    }
+
+    #[tokio::test]
+    async fn leaving_manual_cleans_up_once() {
+        let (asusd, svc) = (FakeAsusd::default(), FakeServices::default());
+        // Manual ran on Turbo; the user picks Turbo (policy unchanged): curves off + re-assert
+        let ctx = HwCtx { cpu_boost_now: Some(false), ..Default::default() };
+        apply_stock(Profile::Performance, Some(Profile::Performance), ctx, &asusd, &svc).await;
+        assert_eq!(*asusd.calls.lock().unwrap(), ["set_fan_curves_enabled 1 false", "set_profile 1"]);
+        assert!(svc.calls.lock().unwrap().iter().any(|c| c.ends_with("set-limits cpu_boost=on")), "boost was off");
+        // Manual on Turbo → Silent: the policy already changed, so only the old slot's curves go off
+        let (asusd, svc) = (FakeAsusd::default(), FakeServices::default());
+        let ctx = HwCtx { cpu_boost_now: Some(true), mode_just_set: true, ..Default::default() };
+        apply_stock(Profile::Quiet, Some(Profile::Performance), ctx, &asusd, &svc).await;
+        assert_eq!(*asusd.calls.lock().unwrap(), ["set_fan_curves_enabled 1 false"]);
     }
 
     #[tokio::test]
@@ -473,14 +489,26 @@ use crate::features::perf::{apply_mode, HwCtx};
 use crate::hw::{with_retry, Asusd, Services};
 use armoury_proto::{Fan, FanCurve, ManualProfile, ModeSettings, Profile};
 
-pub async fn apply_stock(p: Profile, ctx: HwCtx, asusd: &dyn Asusd, svc: &dyn Services) -> Vec<String> {
+/// A stock mode is the firmware's own: switch_profile has already changed the policy, and
+/// nothing else is sent (no curves, EPP or PPT; the user's rule after the EC hang).
+/// Only when leaving Manual, or at start/takeover (`cleanup`: the slot whose custom
+/// curves may be on), is there a one-time cleanup: that slot's curves off, the policy
+/// re-asserted if it didn't change (so the firmware reloads its own PPT), and
+/// boost / undervolt / NVIDIA back to stock where they aren't already.
+pub async fn apply_stock(p: Profile, cleanup: Option<Profile>, ctx: HwCtx, asusd: &dyn Asusd, svc: &dyn Services) -> Vec<String> {
     let mut errors = Vec::new();
-    if let Err(e) = with_retry(|| asusd.set_fan_curves_enabled(p.to_asusd(), false)).await {
-        errors.push(format!("fan curves off: {e:#}"));
+    if let Some(slot) = cleanup {
+        if let Err(e) = with_retry(|| asusd.set_fan_curves_enabled(slot.to_asusd(), false)).await {
+            errors.push(format!("fan curves off: {e:#}"));
+        }
+        if slot == p && !ctx.mode_just_set {
+            if let Err(e) = with_retry(|| asusd.set_profile(p.to_asusd())).await {
+                errors.push(format!("re-assert mode: {e:#}"));
+            }
+        }
     }
-    if let Err(e) = with_retry(|| asusd.set_profile(p.to_asusd())).await {
-        errors.push(format!("re-assert mode: {e:#}"));
-    }
+    // no limits → apply_mode only restores boost (skipped when already on) and resets
+    // undervolt / NVIDIA if they were changed; it never touches asusd.
     errors.extend(apply_mode(p, &ModeSettings::default(), ctx, asusd, svc).await);
     errors
 }
@@ -648,7 +676,7 @@ Tests:
         clear(&r);
         fw(&r, "quiet"); // e.g. asusd's own switch
         r.d.tick().await;
-        assert!(acalls_of(&r).contains(&"set_fan_curves_enabled 2 false".to_string()), "{:?}", acalls_of(&r));
+        assert!(acalls_of(&r).contains(&"set_fan_curves_enabled 1 false".to_string()), "Manual's slot cleaned up: {:?}", acalls_of(&r));
         assert!(!r.d.config.lock().await.manual.enabled);
         assert_eq!(r.d.refresh().await.perf.mode, Some(ModeChoice::Quiet));
     }
@@ -775,10 +803,17 @@ enum Target { Stock(Profile), Manual { name: String, base: Profile } }
             return errs;
         }
         if !force && st.failed.as_ref() == Some(&target) && st.retry_at.is_some_and(|t| now < t) { return Vec::new(); }
-        let ctx = self.hw_ctx(dgpu_active, st);
+        let ctx = HwCtx { cpu_boost_now: snap.perf.cpu_boost, ..self.hw_ctx(dgpu_active, st) };
+        // one-time cleanup only when leaving Manual (its base slot) or on the first
+        // apply after start/takeover (G-Helper may have left the current slot's curves on)
+        let cleanup = match &st.applied {
+            Some(Target::Manual { base, .. }) => Some(*base),
+            None => Some(fw),
+            Some(Target::Stock(_)) => None,
+        };
         let errs = match &manual {
             Some(p) => manual::apply_manual(p, ctx, &*self.asusd, &*self.svc).await,
-            None => manual::apply_stock(fw, ctx, &*self.asusd, &*self.svc).await,
+            None => manual::apply_stock(fw, cleanup, ctx, &*self.asusd, &*self.svc).await,
         };
         self.note_apply(&target, &errs);
         if errs.is_empty() {
@@ -833,24 +868,32 @@ Add:
         }
     }
 
-    /// The user picked a mode (UI, CLI, mode key, power source). Never holds the apply lock.
-    async fn choose_mode(&self, choice: ModeChoice) -> anyhow::Result<()> {
+    /// The user picked a mode (UI, CLI, mode key). Takes the apply lock (via switch_profile /
+    /// reapply_manual), so it must never be called from inside tick_locked.
+    async fn choose_mode(&self, choice: ModeChoice) -> Response {
         match choice.stock() {
             Some(p) => {
                 {
                     let mut cfg = self.config.lock().await;
-                    if cfg.manual.enabled { cfg.manual.enabled = false; cfg.save(&self.config_path)?; }
+                    if cfg.manual.enabled {
+                        cfg.manual.enabled = false;
+                        if let Err(e) = cfg.save(&self.config_path) { return Response::err(format!("save config: {e}")); }
+                    }
                 }
-                with_retry(|| self.asusd.set_profile(p.to_asusd())).await?;
+                self.switch_profile(p).await // existing: policy change + apply, serialized
             }
             None => {
                 self.ensure_manual_profile().await;
-                let mut cfg = self.config.lock().await;
-                cfg.manual.enabled = true;
-                cfg.save(&self.config_path)?;
+                {
+                    let mut cfg = self.config.lock().await;
+                    cfg.manual.enabled = true;
+                    if let Err(e) = cfg.save(&self.config_path) { return Response::err(format!("save config: {e}")); }
+                }
+                let errs = self.reapply_manual().await;
+                if !errs.is_empty() { return Response::err(format!("Manual on, but applying failed: {}", errs.join("; "))); }
+                Response::ok(serde_json::to_value(self.refresh().await).unwrap())
             }
         }
-        Ok(())
     }
 
     /// Re-applies Manual from scratch (profile edited, activated or deleted).
@@ -888,18 +931,29 @@ In `snapshot()`, after the existing field fills:
         }
 ```
 
-- [ ] **Step 5: Implement the request handlers.** Replace the `SetProfile` and `NextProfile` arms, and delete the `FanCurves`, `SetFanCurve`, `ResetFanCurves`, `ModeSettings` and `SetModeSettings` arms and the `curves()` helper:
+- [ ] **Step 5: Implement the request handlers.** Replace the existing `next_mode` helper with `next_choice` (and update the mode-key arm in `on_hotkey` to call `self.choose_mode(next_choice(current))`, keeping its serialized "OSD first, then switch" shape):
+
+```rust
+/// Mode key order: Silent → Balanced → Turbo → Manual → Silent.
+fn next_choice(current: Option<ModeChoice>) -> ModeChoice {
+    let i = current.and_then(|c| ModeChoice::CYCLE.iter().position(|m| *m == c)).map_or(0, |i| (i + 1) % 4);
+    ModeChoice::CYCLE[i]
+}
+```
+
+In `tick_locked`, the "already applied" early-return path must clear `st.mode_just_set = false` before returning (the apply paths reset it by rebuilding `ApplyState`).
+
+Replace the `SetProfile` and `NextProfile` arms, and delete the `FanCurves`, `SetFanCurve`, `ResetFanCurves`, `ModeSettings` and `SetModeSettings` arms and the `curves()` helper:
 
 ```rust
             Request::SetProfile { profile } => {
                 if let Err(r) = self.write_guard().await { return r; }
-                self.snapshot_after(self.choose_mode(profile).await).await
+                self.choose_mode(profile).await
             }
             Request::NextProfile => {
                 if let Err(r) = self.write_guard().await { return r; }
                 let cur = self.refresh().await.perf.mode;
-                let i = cur.and_then(|c| ModeChoice::CYCLE.iter().position(|m| *m == c)).map_or(0, |i| (i + 1) % 4);
-                self.snapshot_after(self.choose_mode(ModeChoice::CYCLE[i]).await).await
+                self.choose_mode(next_choice(cur)).await
             }
             Request::LimitBounds => {
                 let b = self.bounds().await;
@@ -1033,7 +1087,7 @@ git add crates && git commit -m "feat(armouryd): Manual mode — profiles applie
 - Produces:
   - `Asusd::disable_source_switching(&self) -> anyhow::Result<()>`, replacing `set_source_profiles`
   - `SysSource.mode_on_ac: Option<bool>`
-  - `follow_source_mode(&self, snap: &Snapshot) -> bool`
+  - `follow_source_mode(&self, snap: &Snapshot, st: &mut ApplyState) -> bool`
 
 - [ ] **Step 1: Write failing tests.** Replace `source_profiles_go_to_asusd` in `ipc.rs` tests with:
 
@@ -1101,25 +1155,37 @@ git add crates && git commit -m "feat(armouryd): Manual mode — profiles applie
   - **Flip detection:** add:
 
 ```rust
-    /// On a real AC↔battery flip, enter the mode configured for the new source.
+    /// On a real AC↔battery flip, set up the mode configured for the new source; the rest of
+    /// this tick applies it. Runs inside tick_locked (apply lock held), so it changes the
+    /// policy directly instead of calling choose_mode, which would deadlock.
     /// The first tick after start/takeover only records the source.
-    async fn follow_source_mode(&self, snap: &Snapshot) -> bool {
+    async fn follow_source_mode(&self, snap: &Snapshot, st: &mut ApplyState) -> bool {
         let Some(ac) = snap.lighting.on_ac else { return false };
         let prev = self.sys_src.lock().unwrap().mode_on_ac.replace(ac);
         if prev != Some(!ac) { return false; }
         let want = { let c = self.config.lock().await; if ac { c.system.profile_ac } else { c.system.profile_battery } };
         let Some(choice) = want else { return false };
-        match self.choose_mode(choice).await {
-            Ok(()) => true,
-            Err(e) => { eprintln!("armouryd: power-source mode: {e:#}"); false }
+        if choice == ModeChoice::Manual { self.ensure_manual_profile().await; }
+        {
+            let mut cfg = self.config.lock().await;
+            cfg.manual.enabled = choice == ModeChoice::Manual;
+            if let Err(e) = cfg.save(&self.config_path) { eprintln!("armouryd: save config: {e}"); }
         }
+        if let Some(p) = choice.stock() {
+            if let Err(e) = with_retry(|| self.asusd.set_profile(p.to_asusd())).await {
+                eprintln!("armouryd: power-source mode: {e:#}");
+                return false;
+            }
+            st.mode_just_set = true;
+        }
+        true
     }
 ```
 
   - **Tick:** in `tick_locked`, right after `self.follow_system(&snap).await;`:
 
 ```rust
-        let snap = if self.follow_source_mode(&snap).await { self.refresh().await } else { snap };
+        let snap = if self.follow_source_mode(&snap, st).await { self.refresh().await } else { snap };
 ```
 
 - [ ] **Step 4: Run the tests.** `cargo test --workspace`. Expected: PASS.
