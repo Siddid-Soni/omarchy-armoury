@@ -22,6 +22,9 @@ pub struct HwCtx {
     /// armouryd set the thermal policy itself just before this apply: re-asserting it
     /// would only add another firmware round trip (and another asusd curve rewrite).
     pub mode_just_set: bool,
+    /// CPU boost as the kernel reports it now; the root call is skipped when a mode
+    /// without limits would only re-send the same boost state.
+    pub cpu_boost_now: Option<bool>,
 }
 
 pub async fn apply_mode(profile: Profile, s: &ModeSettings, ctx: HwCtx, asusd: &dyn Asusd, svc: &dyn Services) -> Vec<String> {
@@ -51,10 +54,13 @@ pub async fn apply_mode(profile: Profile, s: &ModeSettings, ctx: HwCtx, asusd: &
     let mut args: Vec<String> = Limit::ALL.iter().filter_map(|l| Some(format!("{}={}", l.key(), l.value(s)?))).collect();
     // no_turbo is kernel state no firmware reset touches: a mode without its own
     // setting gets the default (on) instead of inheriting the previous mode's value.
-    args.push(format!("cpu_boost={}", if s.cpu_boost.unwrap_or(true) { "on" } else { "off" }));
-    let mut argv = vec![PKEXEC, ROOT_HELPER, "set-limits"];
-    argv.extend(args.iter().map(String::as_str));
-    if let Err(e) = svc.run(&argv).await { errors.push(format!("power limits: {e:#}")); }
+    let boost = s.cpu_boost.unwrap_or(true);
+    if !args.is_empty() || ctx.cpu_boost_now != Some(boost) {
+        args.push(format!("cpu_boost={}", if boost { "on" } else { "off" }));
+        let mut argv = vec![PKEXEC, ROOT_HELPER, "set-limits"];
+        argv.extend(args.iter().map(String::as_str));
+        if let Err(e) = svc.run(&argv).await { errors.push(format!("power limits: {e:#}")); }
+    }
     if ctx.limits_only { return errors; }
     // MSR offsets and NVIDIA clocks persist across modes, so unset means stock (0 / off).
     if ctx.uv_unlocked && !(s.uv_mv.unwrap_or(0) == 0 && ctx.uv_at_stock) {

@@ -49,8 +49,6 @@ pub struct Daemon {
     sys_src: std::sync::Mutex<SysSource>,
     state_dir: PathBuf,
     last_reapply: std::sync::Mutex<tokio::time::Instant>,
-    /// Mode-key presses not yet applied (debounced).
-    mode_key: std::sync::Mutex<ModeKey>,
 }
 
 impl Daemon {
@@ -73,7 +71,6 @@ impl Daemon {
             lid_awake: std::sync::Mutex::new(None),
             sys_src: std::sync::Mutex::new(SysSource::default()),
             state_dir, last_reapply: std::sync::Mutex::new(tokio::time::Instant::now()),
-            mode_key: std::sync::Mutex::new(ModeKey::default()),
         })
     }
 
@@ -124,7 +121,7 @@ impl Daemon {
     }
 
     /// ROG key / Fn+F4 / Fn+F5. Ignored in observe mode (G-Helper owns the keys then).
-    pub async fn on_hotkey(self: &Arc<Self>, key: HotKey) {
+    pub async fn on_hotkey(&self, key: HotKey) {
         if self.mode.get() != ControlMode::Active { return; }
         let (action, command) = {
             let k = self.config.lock().await.keys.clone();
@@ -133,34 +130,15 @@ impl Daemon {
         match action {
             KeyAction::None => {}
             KeyAction::CycleMode => {
-                // Each press only moves the target and shows it; the firmware is switched once,
-                // after the key has been quiet for MODE_KEY_SETTLE. A burst of full mode switches
-                // (policy + asusd curve rewrites + PPT writes) hung the EC on the G533ZW.
-                let current = self.refresh().await.perf.profile;
-                let (next, generation) = {
-                    let mut k = self.mode_key.lock().unwrap();
-                    let n = next_mode(k.pending.or(current));
-                    k.pending = Some(n);
-                    k.generation += 1;
-                    (n, k.generation)
-                };
+                // Keys are handled one at a time and switch_profile holds the apply lock,
+                // so presses are serialized: each switch finishes before the next starts
+                // (overlapping switches hung the EC on the G533ZW).
+                let next = next_mode(self.refresh().await.perf.profile);
                 let (icon, label) = mode_look(next);
                 self.osd(icon, &format!("{label} mode")).await;
-                let me = Arc::clone(self);
-                tokio::spawn(async move {
-                    tokio::time::sleep(MODE_KEY_SETTLE).await;
-                    let target = {
-                        let mut k = me.mode_key.lock().unwrap();
-                        if k.generation != generation { return; } // a later press owns the switch
-                        k.pending.take()
-                    };
-                    let Some(p) = target else { return };
-                    if me.mode.get() != ControlMode::Active { return; }
-                    if !me.switch_profile(p).await.ok {
-                        let (icon, label) = mode_look(p);
-                        me.osd(icon, &format!("{label} mode (settings failed)")).await;
-                    }
-                });
+                if !self.switch_profile(next).await.ok {
+                    self.osd(icon, &format!("{label} mode (settings failed)")).await;
+                }
             }
             KeyAction::CycleBrightness => {
                 let next = (self.refresh().await.lighting.brightness.unwrap_or(0) + 1) % 4;
@@ -536,7 +514,7 @@ impl Daemon {
             return errs;
         }
         if !force && st.failed == Some(profile) && st.retry_at.is_some_and(|t| now < t) { return Vec::new(); }
-        let ctx = self.hw_ctx(dgpu_active, st);
+        let ctx = HwCtx { cpu_boost_now: snap.perf.cpu_boost, ..self.hw_ctx(dgpu_active, st) };
         let errs = apply_mode(profile, &settings, ctx, &*self.asusd, &*self.svc).await;
         self.note_apply(profile, &errs);
         if errs.is_empty() {
@@ -569,6 +547,7 @@ impl Daemon {
             uv_at_stock: st.uv_at_stock,
             nv_at_stock: st.nv_at_stock,
             mode_just_set: st.mode_just_set,
+            cpu_boost_now: None,
         }
     }
 
@@ -987,15 +966,6 @@ fn next_mode(current: Option<Profile>) -> Profile {
 
 fn mode_look(p: Profile) -> (&'static str, &'static str) {
     match p { Profile::Quiet => ("󰾆", "Silent"), Profile::Balanced => ("󰾅", "Balanced"), Profile::Performance => ("󰓅", "Turbo") }
-}
-
-/// Quiet time after the last mode-key press before the firmware is switched.
-const MODE_KEY_SETTLE: Duration = Duration::from_millis(700);
-
-#[derive(Default)]
-struct ModeKey {
-    pending: Option<Profile>,
-    generation: u64,
 }
 
 /// Loads config.toml. An unparsable file is moved to config.toml.bad (so the next
@@ -1968,31 +1938,31 @@ mod tests {
         r.asusd.calls.lock().unwrap().iter().filter(|c| c.starts_with("set_profile") || *c == "next_profile").cloned().collect()
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn fan_key_cycles_silent_balanced_turbo_with_osd() {
         let r = profile_rig("balanced");
+        *r.asusd.mirror.lock().unwrap() = Some(r.sys.clone());
         r.d.on_hotkey(armoury_proto::HotKey::Fan).await;
-        assert!(profile_sets(&r).is_empty(), "nothing touches the firmware until the key settles");
         assert!(svc_calls(&r).iter().any(|c| c.ends_with("-i 󰓅 -m Turbo mode")), "{:?}", svc_calls(&r));
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(profile_sets(&r), ["set_profile 1"], "Balanced → Turbo");
-        r.sys.files.lock().unwrap().insert("sys/firmware/acpi/platform_profile".into(), "performance".into());
         r.d.on_hotkey(armoury_proto::HotKey::Fan).await;
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(profile_sets(&r).last().unwrap(), "set_profile 2", "Turbo → Silent");
+        r.d.on_hotkey(armoury_proto::HotKey::Fan).await;
+        r.d.on_hotkey(armoury_proto::HotKey::Fan).await;
+        // every press is its own switch, in order, each finished before the next starts
+        assert_eq!(profile_sets(&r), ["set_profile 1", "set_profile 2", "set_profile 0", "set_profile 1"]);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn quick_fan_presses_switch_the_firmware_once() {
+    #[tokio::test]
+    async fn stock_switch_skips_cpu_boost_call_when_already_on() {
         let r = profile_rig("balanced");
-        for _ in 0..4 {
-            r.d.on_hotkey(armoury_proto::HotKey::Fan).await; // Turbo, Silent, Balanced, Turbo
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(profile_sets(&r), ["set_profile 1"], "only the final choice reaches the firmware");
-        let osd: Vec<String> = svc_calls(&r).into_iter().filter(|c| c.contains("omarchy-osd")).collect();
-        assert_eq!(osd.len(), 4, "every press shows where it's heading: {osd:?}");
+        *r.asusd.mirror.lock().unwrap() = Some(r.sys.clone());
+        r.sys.files.lock().unwrap().insert("sys/devices/system/cpu/intel_pstate/no_turbo".into(), "0".into());
+        r.d.tick().await;
+        r.svc.calls.lock().unwrap().clear();
+        assert!(r.d.handle(sreq(serde_json::json!({"cmd":"set_profile","profile":"quiet"}))).await.ok);
+        assert!(!svc_calls(&r).iter().any(|c| c.contains("set-limits")), "boost already on: no root call {:?}", svc_calls(&r));
+        r.sys.files.lock().unwrap().insert("sys/devices/system/cpu/intel_pstate/no_turbo".into(), "1".into());
+        assert!(r.d.handle(sreq(serde_json::json!({"cmd":"set_profile","profile":"balanced"}))).await.ok);
+        assert!(svc_calls(&r).iter().any(|c| c.ends_with("set-limits cpu_boost=on")), "boost was off: restore it {:?}", svc_calls(&r));
     }
 
     #[tokio::test]
