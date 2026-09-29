@@ -111,6 +111,18 @@ impl Daemon {
         if let Err(e) = self.svc.run(&[&osd.to_string_lossy(), "-i", icon, "-m", msg]).await { eprintln!("armouryd: osd: {e:#}"); }
     }
 
+    /// The firmware changed the keyboard backlight (Fn+F2/F3): show the new level.
+    pub async fn on_kbd_brightness(&self, level: u8) {
+        if self.mode.get() != ControlMode::Active { return; }
+        let name = ["off", "low", "medium", "high"].get(level as usize).copied().unwrap_or("?");
+        let pct = (level as u32 * 100 + 1) / 3;
+        let osd = self.omarchy_bin().join("omarchy-osd");
+        let (msg, p) = (format!("Keyboard {name}"), pct.to_string());
+        if let Err(e) = self.svc.run(&[&osd.to_string_lossy(), "-i", "keyboard", "-m", &msg, "-p", &p]).await {
+            eprintln!("armouryd: osd: {e:#}");
+        }
+    }
+
     /// ROG key / Fn+F4 / Fn+F5. Ignored in observe mode (G-Helper owns the keys then).
     pub async fn on_hotkey(self: &Arc<Self>, key: HotKey) {
         if self.mode.get() != ControlMode::Active { return; }
@@ -1999,6 +2011,16 @@ mod tests {
         let r = profile_rig("performance");
         assert!(r.d.handle(Request::NextProfile).await.ok);
         assert_eq!(profile_sets(&r), ["set_profile 2"], "Turbo → Silent, not asusd's own order");
+    }
+
+    #[tokio::test]
+    async fn firmware_brightness_change_shows_osd_when_active() {
+        let r = sys_rig(true, "");
+        r.d.on_kbd_brightness(2).await;
+        assert!(svc_calls(&r).iter().any(|c| c.ends_with("omarchy-osd -i keyboard -m Keyboard medium -p 67")), "{:?}", svc_calls(&r));
+        let o = sys_rig(false, "");
+        o.d.on_kbd_brightness(2).await;
+        assert!(!svc_calls(&o).iter().any(|c| c.contains("omarchy-osd")), "G-Helper owns the keys in observe mode");
     }
 
     #[tokio::test]

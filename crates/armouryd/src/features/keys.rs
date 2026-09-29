@@ -35,6 +35,49 @@ pub fn find_nkey(sys_root: &Path) -> Option<PathBuf> {
         .map(|n| PathBuf::from("/dev/input").join(n))
 }
 
+/// Set by the kernel when the firmware changes the keyboard backlight itself (Fn+F2/F3);
+/// pollable (POLLPRI), so waiting on it costs nothing and never calls into the EC.
+pub const KBD_HW_CHANGED: &str = "/sys/class/leds/asus::kbd_backlight/brightness_hw_changed";
+
+pub fn parse_level(raw: &[u8]) -> Option<u8> {
+    std::str::from_utf8(raw).ok()?.trim().parse::<u8>().ok().filter(|l| *l <= 3)
+}
+
+/// Forwards every firmware keyboard-brightness change (0–3). Reopens after errors.
+pub async fn run_kbd_watch(tx: tokio::sync::mpsc::Sender<u8>) {
+    use std::os::unix::fs::FileExt;
+    use tokio::io::{unix::AsyncFd, Interest};
+    let read = |f: &std::fs::File| -> std::io::Result<Option<u8>> {
+        let mut buf = [0u8; 8];
+        let n = f.read_at(&mut buf, 0)?;
+        Ok(parse_level(&buf[..n]))
+    };
+    let mut failures = 0u32;
+    loop {
+        let result: std::io::Result<()> = async {
+            let fd = AsyncFd::with_interest(std::fs::File::open(KBD_HW_CHANGED)?, Interest::PRIORITY)?;
+            read(fd.get_ref())?; // sysfs arms the notification on read
+            failures = 0;
+            loop {
+                let mut guard = fd.ready(Interest::PRIORITY).await?;
+                let level = read(guard.get_inner())?;
+                guard.clear_ready();
+                if let Some(l) = level {
+                    if tx.send(l).await.is_err() { return Ok(()); }
+                }
+            }
+        }.await;
+        match result {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("armouryd: keyboard brightness watch: {e}");
+                tokio::time::sleep(backoff(failures)).await;
+                failures += 1;
+            }
+        }
+    }
+}
+
 pub fn backoff(failures: u32) -> Duration {
     Duration::from_secs((2u64 << failures.min(4)).min(30))
 }
@@ -78,6 +121,13 @@ mod tests {
         b.extend(code.to_ne_bytes());
         b.extend(value.to_ne_bytes());
         b
+    }
+
+    #[test]
+    fn kbd_level_parsing() {
+        assert_eq!(parse_level(b"2\n"), Some(2));
+        assert_eq!(parse_level(b"x"), None);
+        assert_eq!(parse_level(b"9\n"), None, "levels are 0-3");
     }
 
     #[test]
