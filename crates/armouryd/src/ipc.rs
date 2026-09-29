@@ -145,6 +145,14 @@ impl Daemon {
             }
             KeyAction::OpenWindow => {
                 let shell = self.omarchy_bin().join("omarchy-shell");
+                let sh = shell.to_string_lossy();
+                // the key toggles: the window answers isOpen() only while it is loaded
+                let open = self.svc.output(&[&sh, "shell", "call", "asus.armoury", "isOpen", ""]).await
+                    .is_ok_and(|o| o.trim() == "open");
+                if open {
+                    if let Err(e) = self.svc.run(&[&sh, "shell", "hide", "asus.armoury"]).await { eprintln!("armouryd: hide window: {e:#}"); }
+                    return;
+                }
                 // summon exits 0 either way; it prints "ok" only when the panel exists
                 let opened = self.svc.output(&[&shell.to_string_lossy(), "shell", "summon", "asus.armoury", "{}"]).await
                     .is_ok_and(|o| o.trim() == "ok");
@@ -1938,6 +1946,16 @@ mod tests {
         r.d.on_hotkey(armoury_proto::HotKey::Rog).await;
         assert!(svc_calls(&r).iter().any(|c| c.ends_with("shell summon asus.armoury {}")), "{:?}", svc_calls(&r));
         assert!(!svc_calls(&r).iter().any(|c| c.contains("omarchy-osd")));
+    }
+
+    #[tokio::test]
+    async fn rog_key_closes_an_open_window() {
+        let r = sys_rig(true, "");
+        r.svc.outputs.lock().unwrap().insert("isOpen".into(), "open\n".into());
+        r.d.on_hotkey(armoury_proto::HotKey::Rog).await;
+        let calls = svc_calls(&r);
+        assert!(calls.iter().any(|c| c.ends_with("shell hide asus.armoury")), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("summon")), "{calls:?}");
     }
 
     #[tokio::test]

@@ -33,6 +33,13 @@ setup; touch "$T/rootstate/asusd-was-masked"
 run; rc=$?
 check "marker triggers handback" 'grep -q "armoury-root handback" "$T/log"'
 
+# 5. uninstall removes the SUPER+W bind file and only its loader line
+setup; mkdir -p "$T/home/.config/hypr"; touch "$T/home/.config/hypr/omarchy-armoury.lua"
+printf 'o.bind("SUPER + E", nil, "nautilus")\nif package.searchpath("hypr.omarchy-armoury", package.path) then require("hypr.omarchy-armoury") end -- omarchy-armoury\n' > "$T/home/.config/hypr/bindings.lua"
+run; rc=$?
+check "bind file removed" '[ ! -e "$T/home/.config/hypr/omarchy-armoury.lua" ]'
+check "loader line removed, user binds kept" '! grep -q omarchy-armoury "$T/home/.config/hypr/bindings.lua" && grep -q nautilus "$T/home/.config/hypr/bindings.lua"'
+
 # 4. uninstall removes the udev rule
 setup
 run; rc=$?

@@ -29,6 +29,8 @@ Item {
     root.opened = true
   }
   function close() { root.opened = false; root.page = "" }
+  // armouryd asks this so the ROG key can toggle the window
+  function isOpen() { return root.opened ? "open" : "closed" }
   function dismiss() {
     if (root.shell && typeof root.shell.hide === "function") root.shell.hide((root.manifest && root.manifest.id) || "asus.armoury")
     else close()

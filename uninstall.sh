@@ -26,6 +26,8 @@ rm -f ~/.local/bin/armouryd ~/.local/bin/armoury "$UNIT_DIR/armouryd.service"
 rm -f "$UNIT_DIR/$GHELPER_UNIT.d/omarchy-armoury.conf"
 rmdir "$UNIT_DIR/$GHELPER_UNIT.d" 2>/dev/null || true
 systemctl --user daemon-reload
+rm -f ~/.config/hypr/omarchy-armoury.lua
+[ -f ~/.config/hypr/bindings.lua ] && sed -i '/ -- omarchy-armoury$/d' ~/.config/hypr/bindings.lua
 
 sudo "$LIB/armoury-root" asusd-support-restore || echo "Could not restore aura_support.ron; run: sudo pacman -S asusctl" >&2
 sudo rm -rf "$LIB" "$ROOT_STATE"

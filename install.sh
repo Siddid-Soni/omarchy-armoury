@@ -13,6 +13,11 @@ install -Dm755 target/release/armoury ~/.local/bin/armoury
 install -Dm644 packaging/systemd/armouryd.service "$UNIT_DIR/armouryd.service"
 install -Dm644 packaging/systemd/ghelper-dropin.conf "$UNIT_DIR/app-ghelper@autostart.service.d/omarchy-armoury.conf"
 
+# SUPER+W also closes the Armoury window (see the file); loaded from the user's bindings.lua
+install -Dm644 packaging/hypr/omarchy-armoury.lua ~/.config/hypr/omarchy-armoury.lua
+HYPR_LINE='if package.searchpath("hypr.omarchy-armoury", package.path) then require("hypr.omarchy-armoury") end -- omarchy-armoury'
+grep -qxF "$HYPR_LINE" ~/.config/hypr/bindings.lua 2>/dev/null || printf '\n%s\n' "$HYPR_LINE" >> ~/.config/hypr/bindings.lua
+
 sudo install -Dm755 target/release/armoury-root "$LIB/armoury-root"
 sudo install -Dm644 packaging/polkit/org.omarchy.armoury.policy /usr/share/polkit-1/actions/org.omarchy.armoury.policy
 sed "s/@USER@/$USER/" packaging/polkit/50-omarchy-armoury.rules.in |
