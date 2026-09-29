@@ -16,8 +16,11 @@ Flickable {
   property var edit: ({})       // changes not yet applied
   property var detail: null    // detail Status (NVIDIA) while this page is open
 
+  contentWidth: width
   contentHeight: col.implicitHeight
   clip: true
+  interactive: false   // drags belong to sliders; WheelScroll scrolls
+  WheelScroll { flick: root }
 
   function load() {
     edit = ({})
@@ -38,7 +41,7 @@ Flickable {
   // NVIDIA details only while the page is open, every 5 s: reading them keeps the dGPU awake.
   Timer {
     interval: 5000
-    running: root.visible && root.snap && root.snap.gpu && root.snap.gpu.dgpu_active === true
+    running: !!(root.visible && root.snap && root.snap.gpu && root.snap.gpu.dgpu_active === true)
     repeat: true
     triggeredOnStart: true
     onTriggered: root.client.call({ cmd: "status" }, function(r) { if (r.ok) root.detail = r.data.gpu })
@@ -91,7 +94,7 @@ Flickable {
       onChanged: function(v) { root.set("epp", v) }
     }
     ValueSlider {
-      visible: root.snap && root.snap.perf && root.snap.perf.undervolt && root.snap.perf.undervolt.unlocked
+      visible: !!(root.snap && root.snap.perf && root.snap.perf.undervolt && root.snap.perf.undervolt.unlocked)
       fg: root.fg; label: "Undervolt (core + cache)"; unit: "mV"
       minimum: -150; maximum: 0
       value: root.val("uv_mv", 0)
@@ -99,7 +102,7 @@ Flickable {
       onCommitted: function(v) { root.set("uv_mv", v) }
     }
     Text {
-      visible: root.snap && root.snap.perf && root.snap.perf.undervolt && !root.snap.perf.undervolt.unlocked
+      visible: !!(root.snap && root.snap.perf && root.snap.perf.undervolt && !root.snap.perf.undervolt.unlocked)
       text: "Undervolt is locked by the BIOS on this laptop."
       color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption
     }

@@ -15,8 +15,11 @@ Flickable {
   property var panel: null      // built-in display from a detail Status (Hyprland)
   property int gamma: 100
 
+  contentWidth: width
   contentHeight: col.implicitHeight
   clip: true
+  interactive: false   // drags belong to sliders; WheelScroll scrolls
+  WheelScroll { flick: root }
 
   function reload() {
     client.call({ cmd: "config" }, function(r) { if (r.ok) root.cfg = r.data })
@@ -97,19 +100,27 @@ Flickable {
     }
 
     Section { text: "POWER SOURCE"; fg: root.fg }
+    Text {
+      width: parent.width
+      wrapMode: Text.WordWrap
+      text: "asusd switches to these modes when you plug in or unplug."
+      color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption
+    }
     ChoiceRow {
       fg: root.fg
       label: "Mode on AC"
       usable: root.usable
       options: root.modeOptions
-      onChosen: function(v) { root.client.run({ cmd: "set_source_profile", ac: v }) }
+      value: root.cfg.system ? root.cfg.system.profile_ac : undefined
+      onChosen: function(v) { root.client.run({ cmd: "set_source_profile", ac: v }, function() { root.reload() }) }
     }
     ChoiceRow {
       fg: root.fg
       label: "Mode on battery"
       usable: root.usable
       options: root.modeOptions
-      onChosen: function(v) { root.client.run({ cmd: "set_source_profile", battery: v }) }
+      value: root.cfg.system ? root.cfg.system.profile_battery : undefined
+      onChosen: function(v) { root.client.run({ cmd: "set_source_profile", battery: v }, function() { root.reload() }) }
     }
 
     Section { text: "SYSTEM"; fg: root.fg }

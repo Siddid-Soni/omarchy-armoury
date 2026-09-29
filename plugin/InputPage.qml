@@ -14,8 +14,11 @@ Flickable {
   property string rogCommand: ""
   property string fanCommand: ""
 
+  contentWidth: width
   contentHeight: col.implicitHeight
   clip: true
+  interactive: false   // drags belong to sliders; WheelScroll scrolls
+  WheelScroll { flick: root }
 
   function reload() {
     client.call({ cmd: "config" }, function(r) {

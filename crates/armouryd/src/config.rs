@@ -39,6 +39,9 @@ pub struct SystemConfig {
     /// Built-in panel refresh rate on AC / on battery.
     pub refresh_ac: Option<f32>,
     pub refresh_battery: Option<f32>,
+    /// Mode asusd switches to on AC / on battery (kept here so the UI can show it while asusd is stopped).
+    pub profile_ac: Option<armoury_proto::Profile>,
+    pub profile_battery: Option<armoury_proto::Profile>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

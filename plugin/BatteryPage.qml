@@ -12,8 +12,11 @@ Flickable {
   readonly property bool usable: client && client.active
   property int custom: 80
 
+  contentWidth: width
   contentHeight: col.implicitHeight
   clip: true
+  interactive: false   // drags belong to sliders; WheelScroll scrolls
+  WheelScroll { flick: root }
 
   function fmt(v, digits, unit) { return v === undefined || v === null ? "—" : Number(v).toFixed(digits) + (unit ? " " + unit : "") }
 

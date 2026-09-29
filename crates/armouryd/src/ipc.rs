@@ -290,6 +290,10 @@ impl Daemon {
                 }
                 Request::SetSourceProfile { ac, battery } => {
                     with_retry(|| self.asusd.set_source_profiles(ac.map(Profile::to_asusd), battery.map(Profile::to_asusd))).await?;
+                    let mut cfg = self.config.lock().await;
+                    if ac.is_some() { cfg.system.profile_ac = ac; }
+                    if battery.is_some() { cfg.system.profile_battery = battery; }
+                    cfg.save(&self.config_path)?;
                     Ok(serde_json::json!({"ac": ac, "battery": battery}))
                 }
                 Request::SetSourceRefresh { ac, battery } => {
@@ -1788,6 +1792,11 @@ mod tests {
         let r = sys_rig(true, "");
         assert!(r.d.handle(sreq(serde_json::json!({"cmd":"set_source_profile","ac":"performance","battery":"quiet"}))).await.ok);
         assert_eq!(*r.asusd.calls.lock().unwrap(), ["set_source_profiles Some(1) Some(2)"]);
+        let cfg = r.d.config.lock().await.system.clone();
+        assert_eq!((cfg.profile_ac, cfg.profile_battery), (Some(Profile::Performance), Some(Profile::Quiet)), "remembered for the UI");
+        assert!(r.d.handle(sreq(serde_json::json!({"cmd":"set_source_profile","battery":"balanced"}))).await.ok);
+        let cfg = r.d.config.lock().await.system.clone();
+        assert_eq!((cfg.profile_ac, cfg.profile_battery), (Some(Profile::Performance), Some(Profile::Balanced)));
     }
 
     #[tokio::test]

@@ -20,8 +20,11 @@ Flickable {
   property string speed: "med"
   property string direction: "right"
 
+  contentWidth: width
   contentHeight: col.implicitHeight
   clip: true
+  interactive: false   // drags belong to sliders; WheelScroll scrolls
+  WheelScroll { flick: root }
 
   function hex(c) { return c ? c.map(function(v) { return ("0" + v.toString(16)).slice(-2) }).join("") : "000000" }
   function rgb(h) { return [parseInt(h.substr(0, 2), 16), parseInt(h.substr(2, 2), 16), parseInt(h.substr(4, 2), 16)] }
@@ -49,6 +52,15 @@ Flickable {
   }
 
   function modeLabel(m) { return String(m).split("_").map(function(w) { return w.charAt(0).toUpperCase() + w.slice(1) }).join(" ") }
+  // Which settings each effect actually uses (asusd / rog-aura semantics).
+  readonly property var effectParams: ({
+    static: ["colour1"], breathe: ["colour1", "colour2", "speed"], rainbow_cycle: ["speed"],
+    rainbow_wave: ["speed", "direction"], star: ["colour1", "colour2", "speed"], rain: ["speed"],
+    highlight: ["colour1", "speed"], laser: ["colour1", "speed"], ripple: ["colour1", "speed"],
+    pulse: ["colour1"], comet: ["colour1"], flash: ["colour1"]
+  })
+  function uses(p) { var l = effectParams[mode]; return !l || l.indexOf(p) >= 0 }
+
   readonly property var presets: ["ff0000", "ff6a00", "ffd000", "00ff40", "00e5ff", "0050ff", "a000ff", "ff00a0", "ffffff"]
 
   Column {
@@ -93,6 +105,7 @@ Flickable {
       model: root.info ? [{ key: "colour1", label: "Colour" }, { key: "colour2", label: "Second colour" }] : []
       Column {
         required property var modelData
+        visible: root.uses(modelData.key)
         width: col.width
         spacing: Style.space(6)
         Text { text: modelData.label; color: root.fg; opacity: 0.7; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
@@ -124,7 +137,7 @@ Flickable {
       }
     }
     ChoiceRow {
-      visible: !!root.info
+      visible: !!root.info && root.uses("speed")
       fg: root.fg
       label: "Speed"
       usable: root.usable
@@ -133,7 +146,7 @@ Flickable {
       onChosen: function(v) { root.speed = v }
     }
     ChoiceRow {
-      visible: !!root.info
+      visible: !!root.info && root.uses("direction")
       fg: root.fg
       label: "Direction"
       usable: root.usable
