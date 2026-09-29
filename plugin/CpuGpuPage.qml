@@ -66,14 +66,18 @@ Flickable {
       minimum: root.range("pl1", 5, 150)[0]; maximum: root.range("pl1", 5, 150)[1]
       value: root.val("pl1", 45); unset: root.val("pl1", undefined) === undefined
       usable: root.usable
-      onCommitted: function(v) { root.set("pl1", v) }
+      // PL2 can never sit below PL1: it slides up with it
+      onLive: function(v) { if (v > root.val("pl2", 65)) root.set("pl2", v) }
+      onCommitted: function(v) { root.set("pl1", v); if (v > root.val("pl2", 65)) root.set("pl2", v) }
     }
     ValueSlider {
       fg: root.fg; label: "PL2 (boost)"; unit: "W"
       minimum: root.range("pl2", 5, 150)[0]; maximum: root.range("pl2", 5, 150)[1]
       value: root.val("pl2", 65); unset: root.val("pl2", undefined) === undefined
       usable: root.usable
-      onCommitted: function(v) { root.set("pl2", v) }
+      // PL1 can never sit above PL2: it slides down with it
+      onLive: function(v) { if (v < root.val("pl1", 45)) root.set("pl1", v) }
+      onCommitted: function(v) { root.set("pl2", v); if (v < root.val("pl1", 45)) root.set("pl1", v) }
     }
     ChoiceRow {
       fg: root.fg; label: "CPU boost"; usable: root.usable

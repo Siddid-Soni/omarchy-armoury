@@ -50,11 +50,8 @@ Item {
     WlrLayershell.layer: WlrLayer.Overlay
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
 
-    Rectangle {
-      anchors.fill: parent
-      color: Qt.rgba(0, 0, 0, 0.55)
-      MouseArea { anchors.fill: parent; onClicked: root.dismiss() }
-    }
+    // No dim behind the card; a click outside it still closes the window.
+    MouseArea { anchors.fill: parent; onClicked: root.dismiss() }
 
     Item {
       id: keys
@@ -68,7 +65,7 @@ Item {
         width: Math.min(parent.width - Style.space(48), Style.space(1040))
         height: Math.min(parent.height - Style.space(48), Style.space(720))
         radius: Style.space(10)
-        color: root.surface
+        color: Qt.rgba(root.surface.r, root.surface.g, root.surface.b, 1)   // opaque: nothing dims or shows through
         border.color: root.border
         border.width: 1
 

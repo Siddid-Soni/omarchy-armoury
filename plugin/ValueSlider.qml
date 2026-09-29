@@ -16,6 +16,7 @@ Column {
   property color fg: Color.foreground
   property string fontFamily: Style.font.family
   signal committed(real value)
+  signal live(real value)             // while dragging, so linked sliders can follow
 
   width: parent ? parent.width : 0
   spacing: Style.space(4)
@@ -53,6 +54,7 @@ Column {
     trackColor: Style.selectedFillFor(root.fg, Color.accent)
     fillColor: root.fg
     knobColor: root.fg
+    onMoved: function(v) { root.live(Math.round(v)) }
     onReleased: function(v) { root.unset = false; root.committed(Math.round(v)) }
   }
 }
