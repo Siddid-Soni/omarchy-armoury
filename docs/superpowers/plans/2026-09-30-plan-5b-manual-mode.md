@@ -964,12 +964,15 @@ Add `ModeChoice, ManualProfile, ManualView` to the proto imports and `use crate:
 
 ```rust
                 let s = self.refresh().await;
-                let mode = match s.perf.mode {
-                    Some(ModeChoice::Manual) => format!("Manual ({})", s.perf.manual_profile.unwrap_or_default()),
-                    Some(m) => m.label().to_string(),
-                    None => "Unknown".into(),
+                let (icon, mode) = match s.perf.mode {
+                    Some(ModeChoice::Manual) => ("󰈐", format!("Manual ({})", s.perf.manual_profile.unwrap_or_default())),
+                    Some(ModeChoice::Quiet) => ("󰾆", "Silent".to_string()),
+                    Some(ModeChoice::Balanced) => ("󰾅", "Balanced".to_string()),
+                    Some(ModeChoice::Performance) => ("󰓅", "Turbo".to_string()),
+                    None => ("󰢮", "Unknown".to_string()),
                 };
-                self.osd(&if r.ok { format!("{mode} mode") } else { format!("{mode} mode (settings failed)") }).await;
+                // omarchy-osd shows a muted speaker when no icon is given
+                self.osd(icon, &if r.ok { format!("{mode} mode") } else { format!("{mode} mode (settings failed)") }).await;
 ```
 
 - [ ] **Step 7: Update the CLI.** In `crates/armoury/src/main.rs`:

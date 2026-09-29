@@ -102,9 +102,10 @@ impl Daemon {
     pub async fn clamshell_holding(&self) -> bool { self.clamshell.lock().await.holding() }
 
     /// Omarchy's on-screen display.
-    async fn osd(&self, msg: &str) {
+    /// `icon` is an omarchy-osd icon name or a literal glyph; without one it shows a muted speaker.
+    async fn osd(&self, icon: &str, msg: &str) {
         let osd = self.omarchy_bin().join("omarchy-osd");
-        if let Err(e) = self.svc.run(&[&osd.to_string_lossy(), "-m", msg]).await { eprintln!("armouryd: osd: {e:#}"); }
+        if let Err(e) = self.svc.run(&[&osd.to_string_lossy(), "-i", icon, "-m", msg]).await { eprintln!("armouryd: osd: {e:#}"); }
     }
 
     /// ROG key / Fn+F5. Ignored in observe mode (G-Helper owns the keys then).
@@ -118,15 +119,15 @@ impl Daemon {
             KeyAction::None => {}
             KeyAction::CycleMode => {
                 let r = self.handle(Request::NextProfile).await;
-                let mode = self.refresh().await.perf.profile.map(|p| match p {
-                    Profile::Quiet => "Silent", Profile::Balanced => "Balanced", Profile::Performance => "Turbo",
-                }).unwrap_or("Unknown");
-                self.osd(&if r.ok { format!("{mode} mode") } else { format!("{mode} mode (settings failed)") }).await;
+                let (icon, mode) = self.refresh().await.perf.profile.map(|p| match p {
+                    Profile::Quiet => ("󰾆", "Silent"), Profile::Balanced => ("󰾅", "Balanced"), Profile::Performance => ("󰓅", "Turbo"),
+                }).unwrap_or(("󰢮", "Unknown"));
+                self.osd(icon, &if r.ok { format!("{mode} mode") } else { format!("{mode} mode (settings failed)") }).await;
             }
             KeyAction::CycleBrightness => {
                 let next = (self.refresh().await.lighting.brightness.unwrap_or(0) + 1) % 4;
                 if self.handle(Request::SetBrightness { level: next }).await.ok {
-                    self.osd(&format!("Keyboard {}", ["off", "low", "medium", "high"][next as usize])).await;
+                    self.osd("keyboard", &format!("Keyboard {}", ["off", "low", "medium", "high"][next as usize])).await;
                 }
             }
             KeyAction::CycleEffect => {
@@ -138,7 +139,7 @@ impl Daemon {
                         raw.0 = next;
                         if with_retry(|| self.aura.set_mode_data(raw.clone())).await.is_ok() {
                             let name = armoury_proto::AuraMode::from_code(next).map(|m| format!("{m:?}")).unwrap_or_default();
-                            self.osd(&format!("Lighting: {name}")).await;
+                            self.osd("keyboard", &format!("Lighting: {name}")).await;
                         }
                     }
                 }
@@ -157,7 +158,7 @@ impl Daemon {
                 let opened = self.svc.output(&[&shell.to_string_lossy(), "shell", "summon", "asus.armoury", "{}"]).await
                     .is_ok_and(|o| o.trim() == "ok");
                 if !opened {
-                    self.osd("Armoury window: coming with the UI").await;
+                    self.osd("󰢮", "Armoury window: coming with the UI").await;
                 }
             }
             KeyAction::Command => match command {
@@ -1529,7 +1530,7 @@ mod tests {
         assert_eq!(r.gfx.set_calls.lock().unwrap().len(), 1, "never blind-retried");
     }
 
-    struct LightRig { d: Arc<Daemon>, sys: Arc<FakeSysfs>, aura: Arc<FakeAura>, dir: tempfile::TempDir }
+    struct LightRig { d: Arc<Daemon>, sys: Arc<FakeSysfs>, aura: Arc<FakeAura>, svc: Arc<FakeServices>, dir: tempfile::TempDir }
 
     fn light_rig(active: bool, aura: FakeAura, toml: &str) -> LightRig {
         let dir = tempfile::tempdir().unwrap();
@@ -1540,12 +1541,13 @@ mod tests {
             ("sys/class/power_supply/ADP0/online", "1"),
         ]));
         let aura = Arc::new(aura);
+        let svc = Arc::new(FakeServices::default());
         let mut ctl = Control::load(dir.path());
         if active { ctl.set(ControlMode::Active).unwrap(); }
-        let d = Daemon::new(Box::new(sys.clone()), Box::new(FakeGfx::default()), Box::new(FakeServices::default()),
+        let d = Daemon::new(Box::new(sys.clone()), Box::new(FakeGfx::default()), Box::new(svc.clone()),
             Box::new(FakeAsusd::default()), ctl, dir.path().join("config.toml"), Box::new(FakeNvidia::default()))
             .with_aura(Box::new(aura.clone()));
-        LightRig { d, sys, aura, dir }
+        LightRig { d, sys, aura, svc, dir }
     }
 
     fn req(v: serde_json::Value) -> Request { serde_json::from_value(v).unwrap() }
@@ -1890,7 +1892,21 @@ mod tests {
         let r = sys_rig(true, "");
         r.d.on_hotkey(armoury_proto::HotKey::Fan).await;
         assert!(r.asusd.calls.lock().unwrap().contains(&"next_profile".to_string()));
-        assert!(svc_calls(&r).iter().any(|c| c.contains("omarchy-osd -m")), "{:?}", svc_calls(&r));
+        assert!(svc_calls(&r).iter().any(|c| c.contains("omarchy-osd -i")), "{:?}", svc_calls(&r));
+    }
+
+    #[tokio::test]
+    async fn osd_messages_carry_their_own_icon() {
+        // omarchy-osd shows a muted-speaker glyph when no icon is given
+        let r = sys_rig(true, "");
+        r.sys.files.lock().unwrap().insert("sys/firmware/acpi/platform_profile".into(), "balanced".into());
+        r.d.on_hotkey(armoury_proto::HotKey::Fan).await;
+        let osd: Vec<String> = svc_calls(&r).into_iter().filter(|c| c.contains("omarchy-osd")).collect();
+        assert!(osd.iter().any(|c| c.ends_with("omarchy-osd -i 󰾅 -m Balanced mode")), "{osd:?}");
+        let l = light_rig(true, FakeAura::default(), "[keys]\nrog = \"cycle_brightness\"\n");
+        l.d.on_hotkey(armoury_proto::HotKey::Rog).await;
+        let osd: Vec<String> = l.svc.calls.lock().unwrap().iter().filter(|c| c.contains("omarchy-osd")).cloned().collect();
+        assert!(osd.iter().any(|c| c.contains("omarchy-osd -i keyboard -m Keyboard")), "{osd:?}");
     }
 
     #[tokio::test]
