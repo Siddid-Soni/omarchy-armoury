@@ -57,7 +57,7 @@ Flickable {
       onChanged: function(v) { if (v !== "command") root.bindKey("rog", v, "") }
     }
     Row {
-      visible: root.cfg.keys && (root.cfg.keys.rog === "command" || rogField.activeFocus)
+      visible: !!root.cfg.keys && (root.cfg.keys.rog === "command" || rogField.activeFocus)
       width: parent.width
       spacing: Style.space(8)
       TextField { id: rogField; width: parent.width - rogSave.width - parent.spacing; text: root.rogCommand; foreground: root.fg }
@@ -72,7 +72,7 @@ Flickable {
       onChanged: function(v) { if (v !== "command") root.bindKey("fan", v, "") }
     }
     Row {
-      visible: root.cfg.keys && root.cfg.keys.fan === "command"
+      visible: !!root.cfg.keys && root.cfg.keys.fan === "command"
       width: parent.width
       spacing: Style.space(8)
       TextField { id: fanField; width: parent.width - fanSave.width - parent.spacing; text: root.fanCommand; foreground: root.fg }

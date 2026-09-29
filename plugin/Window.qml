@@ -14,7 +14,7 @@ Item {
   property bool opened: false
   property string page: ""
 
-  readonly property var snap: client.snap
+  readonly property var snap: armoury.snap
   readonly property color fg: Color.foreground
   readonly property color dim: Qt.darker(Color.foreground, 1.5)
   readonly property color surface: Color.popups.background
@@ -24,7 +24,8 @@ Item {
   function open(payloadJson) {
     var p = {}
     try { p = JSON.parse(payloadJson || "{}") || {} } catch (e) {}
-    root.page = p.page ? String(p.page) : ""
+    var pg = p.page ? String(p.page) : ""
+    root.page = pageTitle(pg) !== "" ? pg : ""
     root.opened = true
   }
   function close() { root.opened = false; root.page = "" }
@@ -36,7 +37,7 @@ Item {
   function modeLabel(p) { return p === "quiet" ? "Silent" : p === "balanced" ? "Balanced" : p === "performance" ? "Turbo" : "—" }
   function gpuLabel(m) { return m === "AsusMuxDgpu" ? "Ultimate" : (m || "—") }
 
-  ArmouryClient { id: client }
+  ArmouryClient { id: armoury }
 
   PanelWindow {
     visible: root.opened
@@ -102,11 +103,11 @@ Item {
                 font.bold: true
               }
               Text {
-                text: (!client.online ? "armouryd not running"
+                text: (!armoury.online ? "armouryd not running"
                   : root.modeLabel(root.snap.perf.profile) + " · GPU " + root.gpuLabel(root.snap.gpu.mode)
                     + (root.snap.gpu.pending ? " → " + root.gpuLabel(root.snap.gpu.pending) + " after reboot" : "")
                     + (root.snap.keystone ? " · Keystone" : "")
-                    + (client.active ? "" : " · watching (G-Helper in control)")).toUpperCase()
+                    + (armoury.active ? "" : " · watching (G-Helper in control)")).toUpperCase()
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -119,14 +120,14 @@ Item {
 
             Button {
               id: controlBtn
-              visible: client.online
+              visible: armoury.online
               anchors.verticalCenter: parent.verticalCenter
-              text: client.active ? "Hand back to G-Helper" : "Take over"
+              text: armoury.active ? "Hand back to G-Helper" : "Take over"
               fontSize: Style.font.bodySmall
               foreground: root.fg
               fontFamily: root.fontFamily
               bordered: true
-              onClicked: client.run({ cmd: client.active ? "handback" : "takeover" })
+              onClicked: armoury.run({ cmd: armoury.active ? "handback" : "takeover" })
             }
             Button {
               id: closeBtn
@@ -139,10 +140,10 @@ Item {
           }
 
           Text {
-            visible: client.lastError !== ""
+            visible: armoury.lastError !== ""
             width: parent.width
             wrapMode: Text.WordWrap
-            text: client.lastError
+            text: armoury.lastError
             color: Color.urgent
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -153,7 +154,7 @@ Item {
           // ---------- Body ----------
           Item {
             width: parent.width
-            height: card.height - header.height - Style.space(20) * 2 - Style.space(16) * 3 - (client.lastError !== "" ? Style.space(24) : 0)
+            height: card.height - header.height - Style.space(20) * 2 - Style.space(16) * 3 - (armoury.lastError !== "" ? Style.space(24) : 0)
 
             // Dashboard tiles
             Grid {
@@ -235,12 +236,12 @@ Item {
     return ({ fans: "Fans", cpugpu: "CPU / GPU", lighting: "Lighting", battery: "Battery", input: "Input", system: "System" })[p] || ""
   }
 
-  Component { id: fansPage; FansPage { client: client; fg: root.fg; fontFamily: root.fontFamily } }
-  Component { id: cpuGpuPage; CpuGpuPage { client: client; fg: root.fg; fontFamily: root.fontFamily } }
-  Component { id: lightingPage; LightingPage { client: client; fg: root.fg; fontFamily: root.fontFamily } }
-  Component { id: batteryPage; BatteryPage { client: client; fg: root.fg; fontFamily: root.fontFamily } }
-  Component { id: inputPage; InputPage { client: client; fg: root.fg; fontFamily: root.fontFamily } }
-  Component { id: systemPage; SystemPage { client: client; fg: root.fg; fontFamily: root.fontFamily } }
+  Component { id: fansPage; FansPage { client: armoury; fg: root.fg; fontFamily: root.fontFamily } }
+  Component { id: cpuGpuPage; CpuGpuPage { client: armoury; fg: root.fg; fontFamily: root.fontFamily } }
+  Component { id: lightingPage; LightingPage { client: armoury; fg: root.fg; fontFamily: root.fontFamily } }
+  Component { id: batteryPage; BatteryPage { client: armoury; fg: root.fg; fontFamily: root.fontFamily } }
+  Component { id: inputPage; InputPage { client: armoury; fg: root.fg; fontFamily: root.fontFamily } }
+  Component { id: systemPage; SystemPage { client: armoury; fg: root.fg; fontFamily: root.fontFamily } }
 
   component Tile: Rectangle {
     property string pageId: ""

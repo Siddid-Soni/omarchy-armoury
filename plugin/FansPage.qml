@@ -19,7 +19,7 @@ Item {
     dirty = false
     client.call({ cmd: "fan_curves", profile: profile }, function(r) {
       if (r.ok) { root.curves = r.data; root.error = "" }
-      else root.error = (r.error || "") + (root.usable ? "" : " — fan curves need Take over (asusd).")
+      else root.error = root.usable ? (r.error || "Could not read fan curves") : "Fan curves are read from asusd — press Take over to edit them."
     })
   }
   Component.onCompleted: load()

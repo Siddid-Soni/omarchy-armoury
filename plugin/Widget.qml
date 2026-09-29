@@ -14,6 +14,10 @@ Panel {
   ipcTarget: "asus.armoury"
   manageIpc: false
 
+  // The bar sizes widgets from their implicit size (as omarchy.power does).
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
+
   ArmouryClient { id: client }
 
   readonly property var snap: client.snap
@@ -68,7 +72,7 @@ Panel {
     client.call({ cmd: "set_gpu_mode", mode: id }, function(r) { root.gpuMessage = r.ok ? r.data.message : (r.error || "Failed") })
   }
 
-  function toggle(which, on) { client.run({ cmd: "set_toggle", toggle: which, on: on }) }
+  function setToggle(which, on) { client.run({ cmd: "set_toggle", toggle: which, on: on }) }
 
   // ---------- keyboard idle dim (Omarchy has no hypridle; its shell uses IdleMonitor too) ----------
   readonly property int idleSeconds: Number(setting("kbdIdleSeconds", 60))
@@ -309,24 +313,24 @@ Panel {
             Toggle {
               icon: "󰟸"; label: "Touchpad"
               on: grid.sys.touchpad !== false
-              onClicked: root.toggle("touchpad", !on)
+              onClicked: root.setToggle("touchpad", !on)
             }
             Toggle {
               icon: "󰌢"; label: "Lid awake (AC)"
               on: grid.sys.clamshell === true
-              onClicked: root.toggle("clamshell", !on)
+              onClicked: root.setToggle("clamshell", !on)
             }
             Toggle {
               icon: "󰍹"; label: "Overdrive"
               visible: grid.sys.panel_od !== undefined && grid.sys.panel_od !== null
               on: grid.sys.panel_od === true
-              onClicked: root.toggle("panel_od", !on)
+              onClicked: root.setToggle("panel_od", !on)
             }
             Toggle {
               icon: "󰕾"; label: "Boot sound"
               visible: grid.sys.boot_sound !== undefined && grid.sys.boot_sound !== null
               on: grid.sys.boot_sound === true
-              onClicked: root.toggle("boot_sound", !on)
+              onClicked: root.setToggle("boot_sound", !on)
             }
             Toggle {
               icon: "󰝚"; label: "Music"

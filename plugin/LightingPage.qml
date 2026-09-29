@@ -60,7 +60,7 @@ Flickable {
       visible: root.error !== ""
       width: parent.width
       wrapMode: Text.WordWrap
-      text: root.error + (root.usable ? "" : " — effects and zones need Take over (asusd).")
+      text: root.usable ? root.error : "Effects and zones are set through asusd — press Take over to edit them."
       color: root.fg; opacity: 0.7; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall
     }
 
