@@ -19,6 +19,9 @@ pub struct HwCtx {
     /// Stock undervolt / NVIDIA clocks were the last values sent; skip re-sending stock.
     pub uv_at_stock: bool,
     pub nv_at_stock: bool,
+    /// armouryd set the thermal policy itself just before this apply: re-asserting it
+    /// would only add another firmware round trip (and another asusd curve rewrite).
+    pub mode_just_set: bool,
 }
 
 pub async fn apply_mode(profile: Profile, s: &ModeSettings, ctx: HwCtx, asusd: &dyn Asusd, svc: &dyn Services) -> Vec<String> {
@@ -28,8 +31,10 @@ pub async fn apply_mode(profile: Profile, s: &ModeSettings, ctx: HwCtx, asusd: &
         // The firmware only honours PPT written right after a thermal-policy change
         // (measured on the G533ZW: a 15 W cap written mid-mode is ignored, the same
         // write after a mode switch holds exactly). Re-assert the mode first, as g-helper does.
-        if let Err(e) = with_retry(|| asusd.set_profile(profile.to_asusd())).await {
-            errors.push(format!("re-assert mode: {e:#}"));
+        if !ctx.mode_just_set {
+            if let Err(e) = with_retry(|| asusd.set_profile(profile.to_asusd())).await {
+                errors.push(format!("re-assert mode: {e:#}"));
+            }
         }
         tokio::time::sleep(POLICY_SETTLE).await;
     }

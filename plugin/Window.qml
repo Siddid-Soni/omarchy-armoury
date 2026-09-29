@@ -199,7 +199,7 @@ Item {
               Tile {
                 pageId: "input"; icon: "󰘳"; title: "Input"
                 lines: root.snap ? [
-                  "ROG key · Fn+F5",
+                  "ROG key · Fn+F4 · Fn+F5",
                   "Touchpad " + (root.snap.system && root.snap.system.touchpad === false ? "off" : "on"),
                   "Keyboard idle dim"
                 ] : []

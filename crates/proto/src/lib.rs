@@ -180,6 +180,8 @@ pub enum HotKey {
     Rog,
     /// Fn+F5 fan key (KEY_PROG4)
     Fan,
+    /// Fn+F4 Aura key (KEY_PROG3)
+    Aura,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

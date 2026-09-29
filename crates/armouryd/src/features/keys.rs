@@ -7,14 +7,15 @@ use tokio::io::AsyncReadExt;
 pub const NKEY_NAME: &str = "ASUSTek Computer Inc. N-KEY Device";
 const EV_KEY: u16 = 1;
 const KEY_PROG1: u16 = 148; // ROG key
+const KEY_PROG3: u16 = 202; // Fn+F4 (Aura)
 const KEY_PROG4: u16 = 203; // Fn+F5
 const EVENT_SIZE: usize = 24; // struct input_event on 64-bit
 
 pub fn hotkey(code: u16) -> Option<HotKey> {
-    match code { KEY_PROG1 => Some(HotKey::Rog), KEY_PROG4 => Some(HotKey::Fan), _ => None }
+    match code { KEY_PROG1 => Some(HotKey::Rog), KEY_PROG3 => Some(HotKey::Aura), KEY_PROG4 => Some(HotKey::Fan), _ => None }
 }
 
-/// Key-down events for our two hotkeys; auto-repeat (value 2) and releases are ignored.
+/// Key-down events for our hotkeys; auto-repeat (value 2) and releases are ignored.
 pub fn presses(raw: &[u8]) -> Vec<HotKey> {
     raw.chunks_exact(EVENT_SIZE).filter_map(|e| {
         let typ = u16::from_ne_bytes([e[16], e[17]]);
@@ -39,7 +40,7 @@ pub fn backoff(failures: u32) -> Duration {
 }
 
 /// Reads the N-KEY device forever (no grab, so every key still reaches Hyprland) and
-/// forwards ROG / Fn+F5 presses. Reopens after errors (resume, replug) with a backoff.
+/// forwards ROG / Fn+F4 / Fn+F5 presses. Reopens after errors (resume, replug) with a backoff.
 pub async fn run_reader(tx: tokio::sync::mpsc::Sender<HotKey>) {
     let mut failures = 0u32;
     loop {
@@ -77,6 +78,11 @@ mod tests {
         b.extend(code.to_ne_bytes());
         b.extend(value.to_ne_bytes());
         b
+    }
+
+    #[test]
+    fn aura_key_code() {
+        assert_eq!(hotkey(202), Some(HotKey::Aura)); // Fn+F4, captured on the G533ZW
     }
 
     #[test]

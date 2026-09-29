@@ -13,6 +13,7 @@ Flickable {
   property var cfg: ({})
   property string rogCommand: ""
   property string fanCommand: ""
+  property string auraCommand: ""
 
   contentWidth: width
   contentHeight: col.implicitHeight
@@ -26,6 +27,7 @@ Flickable {
       root.cfg = r.data
       root.rogCommand = r.data.keys.rog_command || ""
       root.fanCommand = r.data.keys.fan_command || ""
+      root.auraCommand = r.data.keys.aura_command || ""
     })
   }
   Component.onCompleted: reload()
@@ -80,6 +82,21 @@ Flickable {
       spacing: Style.space(8)
       TextField { id: fanField; width: parent.width - fanSave.width - parent.spacing; text: root.fanCommand; foreground: root.fg }
       Button { id: fanSave; text: "Save"; bordered: true; foreground: root.fg; enabled: root.usable; onClicked: root.bindKey("fan", "command", fanField.text) }
+    }
+    Dropdown {
+      width: parent.width
+      label: "Fn+F4 (Aura)"
+      options: root.actions
+      value: root.cfg.keys ? root.cfg.keys.aura : ""
+      enabled: root.usable
+      onChanged: function(v) { if (v !== "command") root.bindKey("aura", v, "") }
+    }
+    Row {
+      visible: !!root.cfg.keys && root.cfg.keys.aura === "command"
+      width: parent.width
+      spacing: Style.space(8)
+      TextField { id: auraField; width: parent.width - auraSave.width - parent.spacing; text: root.auraCommand; foreground: root.fg }
+      Button { id: auraSave; text: "Save"; bordered: true; foreground: root.fg; enabled: root.usable; onClicked: root.bindKey("aura", "command", auraField.text) }
     }
     Text {
       width: parent.width

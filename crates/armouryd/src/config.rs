@@ -19,13 +19,22 @@ pub struct Config {
 pub struct KeysConfig {
     pub rog: armoury_proto::KeyAction,
     pub fan: armoury_proto::KeyAction,
+    pub aura: armoury_proto::KeyAction,
     pub rog_command: Option<String>,
     pub fan_command: Option<String>,
+    pub aura_command: Option<String>,
 }
 
 impl Default for KeysConfig {
     fn default() -> Self {
-        Self { rog: armoury_proto::KeyAction::OpenWindow, fan: armoury_proto::KeyAction::CycleMode, rog_command: None, fan_command: None }
+        Self {
+            rog: armoury_proto::KeyAction::OpenWindow,
+            fan: armoury_proto::KeyAction::CycleMode,
+            aura: armoury_proto::KeyAction::CycleEffect,
+            rog_command: None,
+            fan_command: None,
+            aura_command: None,
+        }
     }
 }
 

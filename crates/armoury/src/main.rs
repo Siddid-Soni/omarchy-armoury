@@ -257,7 +257,7 @@ enum LightAction {
 enum KeysAction {
     /// Bind a key: none|open-window|cycle-mode|cycle-brightness|cycle-effect|command
     Set {
-        #[arg(value_parser = ["rog", "fan"])]
+        #[arg(value_parser = ["rog", "fan", "aura"])]
         key: String,
         #[arg(value_parser = parse_key_action)]
         action: KeyAction,
@@ -520,10 +520,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 let a = v[k].as_str().unwrap_or("-").replace('_', "-");
                 match v[format!("{k}_command")].as_str() { Some(c) if a == "command" => format!("command: {c}"), _ => a }
             };
-            println!("ROG key    {}\nFn+F5      {}", show("rog"), show("fan"));
+            println!("ROG key    {}\nFn+F4      {}\nFn+F5      {}", show("rog"), show("aura"), show("fan"));
         }
         Cmd::Keys { action: Some(KeysAction::Set { key, action, command }) } => {
-            let key = if key == "rog" { HotKey::Rog } else { HotKey::Fan };
+            let key = match key.as_str() { "rog" => HotKey::Rog, "aura" => HotKey::Aura, _ => HotKey::Fan };
             call(&Request::SetKeyBinding { key, action, command })?;
         }
         Cmd::Kbd { action: KbdAction::Idle } => { call(&Request::KbdIdle)?; }

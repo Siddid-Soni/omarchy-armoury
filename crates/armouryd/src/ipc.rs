@@ -49,6 +49,8 @@ pub struct Daemon {
     sys_src: std::sync::Mutex<SysSource>,
     state_dir: PathBuf,
     last_reapply: std::sync::Mutex<tokio::time::Instant>,
+    /// Mode-key presses not yet applied (debounced).
+    mode_key: std::sync::Mutex<ModeKey>,
 }
 
 impl Daemon {
@@ -71,6 +73,7 @@ impl Daemon {
             lid_awake: std::sync::Mutex::new(None),
             sys_src: std::sync::Mutex::new(SysSource::default()),
             state_dir, last_reapply: std::sync::Mutex::new(tokio::time::Instant::now()),
+            mode_key: std::sync::Mutex::new(ModeKey::default()),
         })
     }
 
@@ -108,21 +111,44 @@ impl Daemon {
         if let Err(e) = self.svc.run(&[&osd.to_string_lossy(), "-i", icon, "-m", msg]).await { eprintln!("armouryd: osd: {e:#}"); }
     }
 
-    /// ROG key / Fn+F5. Ignored in observe mode (G-Helper owns the keys then).
-    pub async fn on_hotkey(&self, key: HotKey) {
+    /// ROG key / Fn+F4 / Fn+F5. Ignored in observe mode (G-Helper owns the keys then).
+    pub async fn on_hotkey(self: &Arc<Self>, key: HotKey) {
         if self.mode.get() != ControlMode::Active { return; }
         let (action, command) = {
             let k = self.config.lock().await.keys.clone();
-            match key { HotKey::Rog => (k.rog, k.rog_command), HotKey::Fan => (k.fan, k.fan_command) }
+            match key { HotKey::Rog => (k.rog, k.rog_command), HotKey::Fan => (k.fan, k.fan_command), HotKey::Aura => (k.aura, k.aura_command) }
         };
         match action {
             KeyAction::None => {}
             KeyAction::CycleMode => {
-                let r = self.handle(Request::NextProfile).await;
-                let (icon, mode) = self.refresh().await.perf.profile.map(|p| match p {
-                    Profile::Quiet => ("󰾆", "Silent"), Profile::Balanced => ("󰾅", "Balanced"), Profile::Performance => ("󰓅", "Turbo"),
-                }).unwrap_or(("󰢮", "Unknown"));
-                self.osd(icon, &if r.ok { format!("{mode} mode") } else { format!("{mode} mode (settings failed)") }).await;
+                // Each press only moves the target and shows it; the firmware is switched once,
+                // after the key has been quiet for MODE_KEY_SETTLE. A burst of full mode switches
+                // (policy + asusd curve rewrites + PPT writes) hung the EC on the G533ZW.
+                let current = self.refresh().await.perf.profile;
+                let (next, generation) = {
+                    let mut k = self.mode_key.lock().unwrap();
+                    let n = next_mode(k.pending.or(current));
+                    k.pending = Some(n);
+                    k.generation += 1;
+                    (n, k.generation)
+                };
+                let (icon, label) = mode_look(next);
+                self.osd(icon, &format!("{label} mode")).await;
+                let me = Arc::clone(self);
+                tokio::spawn(async move {
+                    tokio::time::sleep(MODE_KEY_SETTLE).await;
+                    let target = {
+                        let mut k = me.mode_key.lock().unwrap();
+                        if k.generation != generation { return; } // a later press owns the switch
+                        k.pending.take()
+                    };
+                    let Some(p) = target else { return };
+                    if me.mode.get() != ControlMode::Active { return; }
+                    if !me.switch_profile(p).await.ok {
+                        let (icon, label) = mode_look(p);
+                        me.osd(icon, &format!("{label} mode (settings failed)")).await;
+                    }
+                });
             }
             KeyAction::CycleBrightness => {
                 let next = (self.refresh().await.lighting.brightness.unwrap_or(0) + 1) % 4;
@@ -530,6 +556,7 @@ impl Daemon {
             limits_only: false,
             uv_at_stock: st.uv_at_stock,
             nv_at_stock: st.nv_at_stock,
+            mode_just_set: st.mode_just_set,
         }
     }
 
@@ -633,14 +660,21 @@ impl Daemon {
         move |l| found.iter().find(|(k, _)| *k == l).map(|(_, b)| *b).unwrap()
     }
 
-    async fn snapshot_after(&self, r: anyhow::Result<()>) -> Response {
-        if let Err(e) = r { return Response::err(format!("{e:#}")); }
-        let errs = self.tick_inner(true).await;
+    /// Changes the thermal policy and applies the new mode as one step under the apply
+    /// lock, so a second mode change never starts while the previous one is still writing.
+    async fn switch_profile(&self, p: Profile) -> Response {
+        let mut st = self.apply.lock().await;
+        if let Err(e) = with_retry(|| self.asusd.set_profile(p.to_asusd())).await { return Response::err(format!("{e:#}")); }
+        st.mode_just_set = true;
+        let errs = self.tick_locked(&mut st, true).await;
+        st.mode_just_set = false;
+        drop(st);
         if !errs.is_empty() {
             return Response::err(format!("mode changed, but its settings failed: {}", errs.join("; ")));
         }
         Response::ok(serde_json::to_value(self.refresh().await).unwrap())
     }
+
 
     /// Collects a fresh snapshot (no NVML) and publishes it to subscribers only if it changed.
     pub async fn refresh(&self) -> Snapshot {
@@ -695,11 +729,12 @@ impl Daemon {
             }
             Request::SetProfile { profile } => {
                 if let Err(r) = self.write_guard().await { return r; }
-                self.snapshot_after(with_retry(|| self.asusd.set_profile(profile.to_asusd())).await).await
+                self.switch_profile(profile).await
             }
             Request::NextProfile => {
                 if let Err(r) = self.write_guard().await { return r; }
-                self.snapshot_after(with_retry(|| self.asusd.next_profile()).await).await
+                let current = self.refresh().await.perf.profile;
+                self.switch_profile(next_mode(current)).await
             }
             Request::FanCurves { profile } => self.curves(profile).await,
             Request::Lighting | Request::SetBrightness { .. } | Request::SetEffect { .. } | Request::SetZonePower { .. }
@@ -727,6 +762,7 @@ impl Daemon {
                 match key {
                     HotKey::Rog => { cfg.keys.rog = action; if command.is_some() { cfg.keys.rog_command = command; } }
                     HotKey::Fan => { cfg.keys.fan = action; if command.is_some() { cfg.keys.fan_command = command; } }
+                    HotKey::Aura => { cfg.keys.aura = action; if command.is_some() { cfg.keys.aura_command = command; } }
                 }
                 match cfg.save(&self.config_path) {
                     Ok(()) => Response::ok(serde_json::to_value(cfg.keys.clone()).unwrap()),
@@ -924,6 +960,30 @@ struct ApplyState {
     uv_at_stock: bool,
     nv_at_stock: bool,
     probe_retry_at: Option<tokio::time::Instant>,
+    /// Set by switch_profile for the apply that follows its own policy change.
+    mode_just_set: bool,
+}
+
+/// Mode key order: Silent → Balanced → Turbo → Silent.
+fn next_mode(current: Option<Profile>) -> Profile {
+    match current {
+        Some(Profile::Quiet) => Profile::Balanced,
+        Some(Profile::Balanced) => Profile::Performance,
+        Some(Profile::Performance) | None => Profile::Quiet,
+    }
+}
+
+fn mode_look(p: Profile) -> (&'static str, &'static str) {
+    match p { Profile::Quiet => ("󰾆", "Silent"), Profile::Balanced => ("󰾅", "Balanced"), Profile::Performance => ("󰓅", "Turbo") }
+}
+
+/// Quiet time after the last mode-key press before the firmware is switched.
+const MODE_KEY_SETTLE: Duration = Duration::from_millis(700);
+
+#[derive(Default)]
+struct ModeKey {
+    pending: Option<Profile>,
+    generation: u64,
 }
 
 /// Loads config.toml. An unparsable file is moved to config.toml.bad (so the next
@@ -1887,22 +1947,75 @@ mod tests {
         assert!(r.asusd.calls.lock().unwrap().is_empty() && svc_calls(&r).is_empty());
     }
 
-    #[tokio::test]
-    async fn fan_key_cycles_mode_with_osd() {
+    fn profile_rig(p: &str) -> SysRig {
         let r = sys_rig(true, "");
+        r.sys.files.lock().unwrap().insert("sys/firmware/acpi/platform_profile".into(), p.into());
+        r
+    }
+    fn profile_sets(r: &SysRig) -> Vec<String> {
+        r.asusd.calls.lock().unwrap().iter().filter(|c| c.starts_with("set_profile") || *c == "next_profile").cloned().collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fan_key_cycles_silent_balanced_turbo_with_osd() {
+        let r = profile_rig("balanced");
         r.d.on_hotkey(armoury_proto::HotKey::Fan).await;
-        assert!(r.asusd.calls.lock().unwrap().contains(&"next_profile".to_string()));
-        assert!(svc_calls(&r).iter().any(|c| c.contains("omarchy-osd -i")), "{:?}", svc_calls(&r));
+        assert!(profile_sets(&r).is_empty(), "nothing touches the firmware until the key settles");
+        assert!(svc_calls(&r).iter().any(|c| c.ends_with("-i 󰓅 -m Turbo mode")), "{:?}", svc_calls(&r));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(profile_sets(&r), ["set_profile 1"], "Balanced → Turbo");
+        r.sys.files.lock().unwrap().insert("sys/firmware/acpi/platform_profile".into(), "performance".into());
+        r.d.on_hotkey(armoury_proto::HotKey::Fan).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(profile_sets(&r).last().unwrap(), "set_profile 2", "Turbo → Silent");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quick_fan_presses_switch_the_firmware_once() {
+        let r = profile_rig("balanced");
+        for _ in 0..4 {
+            r.d.on_hotkey(armoury_proto::HotKey::Fan).await; // Turbo, Silent, Balanced, Turbo
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(profile_sets(&r), ["set_profile 1"], "only the final choice reaches the firmware");
+        let osd: Vec<String> = svc_calls(&r).into_iter().filter(|c| c.contains("omarchy-osd")).collect();
+        assert_eq!(osd.len(), 4, "every press shows where it's heading: {osd:?}");
+    }
+
+    #[tokio::test]
+    async fn own_switch_changes_the_policy_once() {
+        let r = sys_rig(true, "[modes.performance]\npl1 = 60\npl2 = 80\n");
+        r.sys.files.lock().unwrap().insert("sys/firmware/acpi/platform_profile".into(), "balanced".into());
+        *r.asusd.mirror.lock().unwrap() = Some(r.sys.clone());
+        let resp = r.d.handle(sreq(serde_json::json!({"cmd":"set_profile","profile":"performance"}))).await;
+        assert!(resp.ok, "{resp:?}");
+        assert_eq!(profile_sets(&r), ["set_profile 1"], "no re-assert right after our own switch");
+        assert!(svc_calls(&r).iter().any(|c| c.ends_with("set-limits pl1=60 pl2=80 cpu_boost=on")), "{:?}", svc_calls(&r));
+    }
+
+    #[tokio::test]
+    async fn next_profile_request_uses_our_order() {
+        let r = profile_rig("performance");
+        assert!(r.d.handle(Request::NextProfile).await.ok);
+        assert_eq!(profile_sets(&r), ["set_profile 2"], "Turbo → Silent, not asusd's own order");
+    }
+
+    #[tokio::test]
+    async fn aura_key_cycles_lighting_effect() {
+        let r = light_rig(true, FakeAura::default(), "");
+        r.d.on_hotkey(armoury_proto::HotKey::Aura).await;
+        assert!(acalls(&r).iter().any(|c| c.starts_with("set_mode_data")), "{:?}", acalls(&r));
+        assert!(r.svc.calls.lock().unwrap().iter().any(|c| c.contains("-i keyboard -m Lighting")));
     }
 
     #[tokio::test]
     async fn osd_messages_carry_their_own_icon() {
         // omarchy-osd shows a muted-speaker glyph when no icon is given
-        let r = sys_rig(true, "");
-        r.sys.files.lock().unwrap().insert("sys/firmware/acpi/platform_profile".into(), "balanced".into());
+        let r = profile_rig("balanced");
         r.d.on_hotkey(armoury_proto::HotKey::Fan).await;
         let osd: Vec<String> = svc_calls(&r).into_iter().filter(|c| c.contains("omarchy-osd")).collect();
-        assert!(osd.iter().any(|c| c.ends_with("omarchy-osd -i 󰾅 -m Balanced mode")), "{osd:?}");
+        assert!(osd.iter().any(|c| c.ends_with("omarchy-osd -i 󰓅 -m Turbo mode")), "{osd:?}");
         let l = light_rig(true, FakeAura::default(), "[keys]\nrog = \"cycle_brightness\"\n");
         l.d.on_hotkey(armoury_proto::HotKey::Rog).await;
         let osd: Vec<String> = l.svc.calls.lock().unwrap().iter().filter(|c| c.contains("omarchy-osd")).cloned().collect();

@@ -240,6 +240,8 @@ pub struct FakeAsusd {
     pub calls: Mutex<Vec<String>>,
     pub curves: Mutex<HashMap<u32, Vec<RawCurve>>>,
     pub fail_on: Mutex<Option<String>>,
+    /// When set, set_profile updates this fake's platform_profile file, as the firmware does.
+    pub mirror: Mutex<Option<std::sync::Arc<FakeSysfs>>>,
 }
 
 impl FakeAsusd {
@@ -254,7 +256,13 @@ impl FakeAsusd {
 
 #[async_trait::async_trait]
 impl Asusd for FakeAsusd {
-    async fn set_profile(&self, p: u32) -> anyhow::Result<()> { self.record(format!("set_profile {p}")) }
+    async fn set_profile(&self, p: u32) -> anyhow::Result<()> {
+        self.record(format!("set_profile {p}"))?;
+        if let (Some(sys), Some(prof)) = (self.mirror.lock().unwrap().as_ref(), armoury_proto::Profile::from_asusd(p)) {
+            sys.files.lock().unwrap().insert("sys/firmware/acpi/platform_profile".into(), prof.sysfs().into());
+        }
+        Ok(())
+    }
     async fn next_profile(&self) -> anyhow::Result<()> { self.record("next_profile".into()) }
     async fn fan_curves(&self, profile: u32) -> anyhow::Result<Vec<RawCurve>> {
         Ok(self.curves.lock().unwrap().get(&profile).cloned().unwrap_or_default())
