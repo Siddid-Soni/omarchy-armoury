@@ -51,6 +51,9 @@ pub fn validate(s: &ModeSettings, b: impl Fn(Limit) -> Bounds) -> Result<(), Str
     for (v, what) in [(s.gpu_core_lock, "GPU core lock"), (s.gpu_mem_lock, "GPU memory lock")] {
         if let Some(m) = v { if m != 0 && !(200..=3000).contains(&m) { return Err(format!("{what} must be 0 (off) or 200–3000 MHz")); } }
     }
+    if let (Some(a), Some(b)) = (s.pl1, s.pl2) {
+        if a > b { return Err(format!("PL1 ({a} W) can't be above PL2 ({b} W)")); }
+    }
     if let (Some(p1), Some(p2)) = (s.pl1, s.pl2) {
         if p1 > p2 { return Err("PL1 must not exceed PL2".into()); }
     }
@@ -92,5 +95,11 @@ mod tests {
         assert!(validate(&ModeSettings { gpu_core_offset: Some(900), ..Default::default() }, fb).is_err());
         assert!(validate(&ModeSettings { gpu_mem_lock: Some(50), ..Default::default() }, fb).is_err());
         assert!(validate(&ModeSettings { uv_mv: Some(-40), gpu_core_offset: Some(100), gpu_core_lock: Some(0), ..Default::default() }, fb).is_ok());
+    }
+
+    #[test]
+    fn pl1_above_pl2_rejected() {
+        let s = ModeSettings { pl1: Some(90), pl2: Some(80), ..Default::default() };
+        assert!(validate(&s, |_| Bounds { min: 5, max: 150 }).unwrap_err().contains("PL1"));
     }
 }

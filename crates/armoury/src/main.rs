@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-use armoury_proto::{HotKey, KeyAction, SleepMode, Toggle, AuraEffect, AuraMode, AuraZone, ControlMode, LightingInfo, ZonePower, Epp, Fan, FanCurve, GpuMode, GpuStep, GpuSwitchResult, ModeSettings, Profile, Request, Response, Snapshot, socket_path};
+use armoury_proto::{HotKey, KeyAction, ModeChoice, SleepMode, Toggle, AuraEffect, AuraMode, AuraZone, ControlMode, LightingInfo, ZonePower, Epp, Fan, FanCurve, GpuMode, GpuStep, GpuSwitchResult, ModeSettings, Profile, Request, Response, Snapshot, socket_path};
 use clap::{Parser, Subcommand};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -177,10 +177,10 @@ enum DisplayAction {
 enum AutoAction {
     /// Mode asusd switches to on AC / on battery
     Profile {
-        #[arg(long, value_parser = parse_profile)]
-        ac: Option<Profile>,
-        #[arg(long, value_parser = parse_profile)]
-        battery: Option<Profile>,
+        #[arg(long, value_parser = parse_mode_choice)]
+        ac: Option<ModeChoice>,
+        #[arg(long, value_parser = parse_mode_choice)]
+        battery: Option<ModeChoice>,
     },
     /// Refresh rate on AC / on battery
     Refresh {
@@ -265,6 +265,10 @@ enum KeysAction {
         #[arg(long)]
         command: Option<String>,
     },
+}
+
+fn parse_mode_choice(s: &str) -> Result<ModeChoice, String> {
+    serde_json::from_value(serde_json::Value::String(s.to_string())).map_err(|_| "expected quiet, balanced, performance or manual".to_string())
 }
 
 fn parse_key_action(s: &str) -> Result<KeyAction, String> {

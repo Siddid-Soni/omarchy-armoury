@@ -139,6 +139,8 @@ pub fn perf_state(sys: &dyn Sysfs) -> PerfState {
         power_draw_w: battery.and_then(|b| num(format!("{}/{b}/power_now", sysfs::POWER_SUPPLY_DIR))).map(|uw| uw as f32 / 1_000_000.0),
         cpu_boost: sys.read(sysfs::NO_TURBO).map(|v| v == "0"),
         undervolt: None,
+        mode: None, // filled in by the daemon (it knows whether Manual is on)
+        manual_profile: None,
     }
 }
 

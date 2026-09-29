@@ -252,6 +252,28 @@ impl Profile {
     }
 }
 
+/// A mode the user picks: the three firmware modes or Manual (a saved profile on a base mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModeChoice { Quiet, Balanced, Performance, Manual }
+
+impl ModeChoice {
+    /// Order of the mode key (Fn+F5) cycle.
+    pub const CYCLE: [ModeChoice; 4] = [Self::Quiet, Self::Balanced, Self::Performance, Self::Manual];
+    pub fn stock(self) -> Option<Profile> {
+        match self { Self::Quiet => Some(Profile::Quiet), Self::Balanced => Some(Profile::Balanced), Self::Performance => Some(Profile::Performance), Self::Manual => None }
+    }
+    pub fn label(self) -> &'static str {
+        match self { Self::Quiet => "Silent", Self::Balanced => "Balanced", Self::Performance => "Turbo", Self::Manual => "Manual" }
+    }
+}
+
+impl From<Profile> for ModeChoice {
+    fn from(p: Profile) -> Self {
+        match p { Profile::Quiet => Self::Quiet, Profile::Balanced => Self::Balanced, Profile::Performance => Self::Performance }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Epp { Default, Performance, BalancePerformance, BalancePower, Power }
@@ -281,6 +303,7 @@ pub struct FanCurve {
     pub fan: Fan,
     pub temps: [u8; 8],
     pub percent: [u8; 8],
+    #[serde(default)]
     pub enabled: bool,
 }
 
@@ -315,6 +338,29 @@ pub struct ModeSettings {
     pub gpu_mem_lock: Option<u32>,
 }
 
+fn default_base() -> Profile { Profile::Performance }
+
+/// A saved Manual-mode profile: which firmware mode it runs on, its fan curves and its tuning.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManualProfile {
+    pub name: String,
+    #[serde(default = "default_base")]
+    pub base: Profile,
+    #[serde(default)]
+    pub curves: Vec<FanCurve>,
+    #[serde(default)]
+    pub settings: ModeSettings,
+}
+
+/// What the UI sees of Manual mode.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ManualView {
+    pub enabled: bool,
+    pub active: Option<String>,
+    pub profiles: Vec<ManualProfile>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NvStatus {
     pub core_mhz: u32,
@@ -343,6 +389,12 @@ pub struct UndervoltState {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PerfState {
     pub profile: Option<Profile>,
+    /// The mode the user is in (Manual only while armouryd is active).
+    #[serde(default)]
+    pub mode: Option<ModeChoice>,
+    /// Active manual profile name (even while a stock mode is on).
+    #[serde(default)]
+    pub manual_profile: Option<String>,
     pub choices: Vec<Profile>,
     pub cpu_temp_c: Option<f32>,
     pub cpu_fan_rpm: Option<u32>,
@@ -443,7 +495,7 @@ pub enum Request {
     SetGamma { percent: u8 },
     SetToggle { toggle: Toggle, on: bool },
     SetSleepMode { mode: SleepMode },
-    SetSourceProfile { ac: Option<Profile>, battery: Option<Profile> },
+    SetSourceProfile { ac: Option<ModeChoice>, battery: Option<ModeChoice> },
     SetSourceRefresh { ac: Option<f32>, battery: Option<f32> },
     Keys,
     /// armouryd's saved settings (read-only view for the UI).
@@ -577,7 +629,7 @@ mod tests {
         let r: Request = serde_json::from_str(r#"{"cmd":"set_sleep_mode","mode":"deep"}"#).unwrap();
         assert_eq!(r, Request::SetSleepMode { mode: SleepMode::Deep });
         let r: Request = serde_json::from_str(r#"{"cmd":"set_source_profile","ac":"performance","battery":"quiet"}"#).unwrap();
-        assert_eq!(r, Request::SetSourceProfile { ac: Some(Profile::Performance), battery: Some(Profile::Quiet) });
+        assert_eq!(r, Request::SetSourceProfile { ac: Some(ModeChoice::Performance), battery: Some(ModeChoice::Quiet) });
         let r: Request = serde_json::from_str(r#"{"cmd":"set_toggle","toggle":"touchpad","on":false}"#).unwrap();
         assert_eq!(r, Request::SetToggle { toggle: Toggle::Touchpad, on: false });
         let s = Snapshot::default();
@@ -591,5 +643,24 @@ mod tests {
         let r: Request = serde_json::from_str(r#"{"cmd":"set_key_binding","key":"rog","action":"command","command":"kitty"}"#).unwrap();
         assert!(matches!(r, Request::SetKeyBinding { key: HotKey::Rog, action: KeyAction::Command, command: Some(_) }));
         assert_eq!(serde_json::to_string(&Request::Keys).unwrap(), r#"{"cmd":"keys"}"#);
+    }
+
+    #[test]
+    fn mode_choice_wire_names_and_cycle() {
+        assert_eq!(serde_json::to_string(&ModeChoice::Manual).unwrap(), "\"manual\"");
+        assert_eq!(serde_json::from_str::<ModeChoice>("\"performance\"").unwrap(), ModeChoice::Performance);
+        assert_eq!(ModeChoice::CYCLE, [ModeChoice::Quiet, ModeChoice::Balanced, ModeChoice::Performance, ModeChoice::Manual]);
+        assert_eq!(ModeChoice::Manual.stock(), None);
+        assert_eq!(ModeChoice::Quiet.stock(), Some(Profile::Quiet));
+        assert_eq!(ModeChoice::from(Profile::Performance).label(), "Turbo");
+    }
+
+    #[test]
+    fn manual_profile_defaults() {
+        let p: ManualProfile = serde_json::from_str(r#"{"name":"A"}"#).unwrap();
+        assert_eq!((p.base, p.curves.len(), p.settings), (Profile::Performance, 0, ModeSettings::default()));
+        // curves in a profile need no `enabled` flag
+        let c: FanCurve = serde_json::from_str(r#"{"fan":"cpu","temps":[1,2,3,4,5,6,7,8],"percent":[0,0,0,0,0,0,0,0]}"#).unwrap();
+        assert!(!c.enabled);
     }
 }
