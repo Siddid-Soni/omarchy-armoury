@@ -14,6 +14,7 @@ Item {
   property var curves: []       // [{fan, temps, percent, enabled}]
   property bool dirty: false
   property string error: ""
+  readonly property real graphHeight: Math.max(Style.space(170), (height - top.height - Style.space(90)) / Math.max(1, curves.length) - Style.space(30))
 
   function load() {
     dirty = false
@@ -102,7 +103,7 @@ Item {
         FanGraph {
           id: graph
           width: parent.width
-          height: Math.max(Style.space(170), (root.height - top.height - Style.space(90)) / Math.max(1, root.curves.length) - Style.space(30))
+          height: root.graphHeight
           temps: fanCol.modelData.temps
           percent: fanCol.modelData.percent
           lineColor: fanCol.index === 0 ? Color.accent : Qt.lighter(Color.urgent, 1.1)

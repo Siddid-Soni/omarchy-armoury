@@ -62,7 +62,7 @@ Item {
       for (var t = 20; t <= 100; t += 20) {
         var x = root.px(t)
         ctx.beginPath(); ctx.moveTo(x, root.py(0)); ctx.lineTo(x, root.py(100)); ctx.stroke()
-        ctx.fillText(t + "°", x - 8, root.height - 6)
+        ctx.fillText(t + "°", t === 100 ? x - 26 : x - 8, root.height - 6)
       }
       ctx.strokeStyle = root.lineColor
       ctx.lineWidth = 2

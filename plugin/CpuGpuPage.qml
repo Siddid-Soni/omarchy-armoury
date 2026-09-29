@@ -86,7 +86,7 @@ Flickable {
         { label: "Balance performance", value: "balance_performance" }, { label: "Balance power", value: "balance_power" },
         { label: "Power saving", value: "power" }
       ]
-      value: root.val("epp", "")
+      value: root.val("epp", "default")
       enabled: root.usable
       onChanged: function(v) { root.set("epp", v) }
     }
