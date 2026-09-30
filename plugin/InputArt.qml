@@ -62,6 +62,7 @@ Item {
     Grid {
       anchors.fill: parent
       anchors.margins: Style.space(10)
+      anchors.bottomMargin: padLabel.height + Style.space(12)   // room for the label under the grid
       columns: 5
       rows: 4
       spacing: Style.space(4)
@@ -87,6 +88,7 @@ Item {
       color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.35)
     }
     Text {
+      id: padLabel
       anchors.bottom: parent.bottom
       anchors.horizontalCenter: parent.horizontalCenter
       anchors.bottomMargin: Style.space(6)
