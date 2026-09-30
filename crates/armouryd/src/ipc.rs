@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::control::{Control, ModeHandle, handback, takeover};
-use crate::features::fan;
+use crate::features::{fan, manual};
 use crate::features::limits::{self, Bounds, Limit};
 use crate::features::perf::{HwCtx, apply_mode, apply_nv, nv_is_stock};
 use crate::features::lighting::{effect_from_raw, effect_to_raw, power_from_raw, set_zone, validate_effect};
@@ -10,7 +10,7 @@ use crate::hw::{Asusd, Aura, Gfx, Nvidia, Services, Sysfs, with_retry};
 use crate::state::collect;
 use anyhow::{Context, bail};
 use crate::features::gpu::plan_switch;
-use armoury_proto::{HotKey, KeyAction, Toggle, ControlMode, Event, GpuMode, GpuStep, GpuSwitchResult, ModeChoice, ModeSettings, Profile, Request, Response, Snapshot, UndervoltState};
+use armoury_proto::{HotKey, KeyAction, Toggle, ControlMode, Event, GpuMode, GpuStep, GpuSwitchResult, ManualProfile, ManualView, ModeChoice, ModeSettings, Profile, Request, Response, Snapshot, UndervoltState};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -133,10 +133,19 @@ impl Daemon {
                 // Keys are handled one at a time and switch_profile holds the apply lock,
                 // so presses are serialized: each switch finishes before the next starts
                 // (overlapping switches hung the EC on the G533ZW).
-                let next = next_mode(self.refresh().await.perf.profile);
-                let (icon, label) = mode_look(next);
+                let next = next_choice(self.refresh().await.perf.mode);
+                let icon = mode_look(next);
+                let label = match next {
+                    ModeChoice::Manual => {
+                        self.ensure_manual_profile().await;
+                        let name = self.config.lock().await.manual.active_profile().map(|p| p.name.clone()).unwrap_or_default();
+                        format!("Manual ({name})")
+                    }
+                    m => m.label().to_string(),
+                };
+                // omarchy-osd shows a muted speaker when no icon is given
                 self.osd(icon, &format!("{label} mode")).await;
-                if !self.switch_profile(next).await.ok {
+                if !self.choose_mode(next).await.ok {
                     self.osd(icon, &format!("{label} mode (settings failed)")).await;
                 }
             }
@@ -490,36 +499,48 @@ impl Daemon {
                 Some(false) => {}
             }
         }
-        let Some(profile) = snap.perf.profile else { return Vec::new() };
+        let Some(fw) = snap.perf.profile else { return Vec::new() };
         let dgpu_active = snap.gpu.dgpu_active == Some(true);
         let woke = dgpu_active && !st.dgpu_was_active;
         st.dgpu_was_active = dgpu_active;
-        let (settings, secs) = {
-            let cfg = self.config.lock().await;
-            (cfg.mode(profile), cfg.reapply_power_secs)
-        };
+        let (target, manual) = self.resolve_target(fw, st).await;
+        let settings = manual.as_ref().map(|p| p.settings).unwrap_or_default();
+        let base = manual.as_ref().map_or(fw, |p| p.base);
+        let secs = self.config.lock().await.reapply_power_secs;
         let due = secs > 0 && now.duration_since(*self.last_reapply.lock().unwrap()) >= Duration::from_secs(secs as u64);
-        if st.applied == Some(profile) {
+        if st.applied.as_ref() == Some(&target) {
+            st.mode_just_set = false;
             let mut errs = Vec::new();
             if woke && !(nv_is_stock(&settings) && st.nv_at_stock) {
                 // NVIDIA settings could not be sent while the dGPU slept; send them now it is awake.
                 errs = apply_nv(&settings, &*self.svc).await;
                 st.nv_at_stock = errs.is_empty() && nv_is_stock(&settings);
             }
-            if due {
-                errs.extend(apply_mode(profile, &settings, HwCtx { limits_only: true, ..self.hw_ctx(dgpu_active, st) }, &*self.asusd, &*self.svc).await);
+            if due && manual.is_some() {
+                // only Manual carries limits; stock modes are the firmware's own
+                errs.extend(apply_mode(base, &settings, HwCtx { limits_only: true, curves_on: true, ..self.hw_ctx(dgpu_active, st) }, &*self.asusd, &*self.svc).await);
                 *self.last_reapply.lock().unwrap() = now;
             }
-            self.note_apply(profile, &errs);
+            self.note_apply(&target, &errs);
             return errs;
         }
-        if !force && st.failed == Some(profile) && st.retry_at.is_some_and(|t| now < t) { return Vec::new(); }
+        if !force && st.failed.as_ref() == Some(&target) && st.retry_at.is_some_and(|t| now < t) { return Vec::new(); }
         let ctx = HwCtx { cpu_boost_now: snap.perf.cpu_boost, ..self.hw_ctx(dgpu_active, st) };
-        let errs = apply_mode(profile, &settings, ctx, &*self.asusd, &*self.svc).await;
-        self.note_apply(profile, &errs);
+        // one-time cleanup only when leaving Manual (its base slot) or on the first
+        // apply after start/takeover (G-Helper may have left the current slot's curves on)
+        let cleanup = match &st.applied {
+            Some(Target::Manual { base, .. }) => Some(*base),
+            None => Some(fw),
+            Some(Target::Stock(_)) => None,
+        };
+        let errs = match &manual {
+            Some(p) => manual::apply_manual(p, ctx, &*self.asusd, &*self.svc).await,
+            None => manual::apply_stock(fw, cleanup, ctx, &*self.asusd, &*self.svc).await,
+        };
+        self.note_apply(&target, &errs);
         if errs.is_empty() {
             *st = ApplyState {
-                applied: Some(profile),
+                applied: Some(target),
                 dgpu_was_active: dgpu_active,
                 uv_at_stock: if ctx.uv_unlocked { settings.uv_mv.unwrap_or(0) == 0 } else { st.uv_at_stock },
                 nv_at_stock: if dgpu_active { nv_is_stock(&settings) } else { st.nv_at_stock },
@@ -528,15 +549,16 @@ impl Daemon {
             };
             *self.last_reapply.lock().unwrap() = now;
         } else {
-            *st = ApplyState { failed: Some(profile), retry_at: Some(now + RETRY_BACKOFF), dgpu_was_active: dgpu_active, probe_retry_at: st.probe_retry_at, ..Default::default() };
+            *st = ApplyState { failed: Some(target), retry_at: Some(now + RETRY_BACKOFF), dgpu_was_active: dgpu_active, probe_retry_at: st.probe_retry_at, ..Default::default() };
         }
         errs
     }
 
     /// Records the outcome for `Snapshot.apply_error` and the journal.
-    fn note_apply(&self, profile: Profile, errs: &[String]) {
-        for e in errs { eprintln!("armouryd: apply {}: {e}", profile.sysfs()); }
-        *self.apply_error.lock().unwrap() = (!errs.is_empty()).then(|| format!("{}: {}", profile.sysfs(), errs.join("; ")));
+    fn note_apply(&self, target: &Target, errs: &[String]) {
+        let label = match target { Target::Stock(p) => p.sysfs().to_string(), Target::Manual { name, .. } => format!("manual ({name})") };
+        for e in errs { eprintln!("armouryd: apply {label}: {e}"); }
+        *self.apply_error.lock().unwrap() = (!errs.is_empty()).then(|| format!("{label}: {}", errs.join("; ")));
     }
 
     fn hw_ctx(&self, dgpu_active: bool, st: &ApplyState) -> HwCtx {
@@ -636,13 +658,6 @@ impl Daemon {
         self.control.lock().await.require_active().map_err(|e| Response::err(e.to_string()))
     }
 
-    async fn curves(&self, p: Profile) -> Response {
-        match with_retry(|| self.asusd.fan_curves(p.to_asusd())).await {
-            Ok(raw) => Response::ok(serde_json::to_value(raw.iter().filter_map(fan::from_raw).collect::<Vec<_>>()).unwrap()),
-            Err(e) => Response::err(format!("fan curves: {e:#}")),
-        }
-    }
-
     /// Firmware ranges where reported, fallbacks otherwise.
     async fn bounds(&self) -> impl Fn(Limit) -> Bounds + use<> {
         let mut found = Vec::new();
@@ -667,6 +682,80 @@ impl Daemon {
         Response::ok(serde_json::to_value(self.refresh().await).unwrap())
     }
 
+    /// Manual when it's on, unless the firmware mode was changed away from the applied
+    /// manual base by something else: then Manual is switched off and that stock mode is kept.
+    async fn resolve_target(&self, fw: Profile, st: &ApplyState) -> (Target, Option<ManualProfile>) {
+        // one lock per statement: two guards in one expression would deadlock
+        let needs_profile = { let c = self.config.lock().await; c.manual.enabled && c.manual.profiles.is_empty() };
+        if needs_profile { self.ensure_manual_profile().await; }
+        let mut cfg = self.config.lock().await;
+        if !cfg.manual.enabled { return (Target::Stock(fw), None); }
+        if let Some(Target::Manual { base, .. }) = &st.applied {
+            if *base != fw {
+                cfg.manual.enabled = false;
+                if let Err(e) = cfg.save(&self.config_path) { eprintln!("armouryd: save config: {e}"); }
+                eprintln!("armouryd: mode changed to {} outside armouryd; leaving Manual", fw.sysfs());
+                return (Target::Stock(fw), None);
+            }
+        }
+        match cfg.manual.active_profile().cloned() {
+            Some(p) => (Target::Manual { name: p.name.clone(), base: p.base }, Some(p)),
+            None => (Target::Stock(fw), None),
+        }
+    }
+
+    /// Creates "Manual 1" from asusd's current Turbo curves when no profile exists yet.
+    async fn ensure_manual_profile(&self) {
+        if !self.config.lock().await.manual.profiles.is_empty() { return; }
+        let raw = with_retry(|| self.asusd.fan_curves(Profile::Performance.to_asusd())).await.unwrap_or_default();
+        let mut cfg = self.config.lock().await;
+        if cfg.manual.profiles.is_empty() {
+            let _ = cfg.manual.save(manual::default_profile("Manual 1", &raw), None);
+            if let Err(e) = cfg.save(&self.config_path) { eprintln!("armouryd: save config: {e}"); }
+        }
+    }
+
+    /// The user picked a mode (UI, CLI, mode key). Takes the apply lock (via switch_profile /
+    /// reapply_manual), so it must never be called from inside tick_locked.
+    async fn choose_mode(&self, choice: ModeChoice) -> Response {
+        match choice.stock() {
+            Some(p) => {
+                {
+                    let mut cfg = self.config.lock().await;
+                    if cfg.manual.enabled {
+                        cfg.manual.enabled = false;
+                        if let Err(e) = cfg.save(&self.config_path) { return Response::err(format!("save config: {e}")); }
+                    }
+                }
+                self.switch_profile(p).await
+            }
+            None => {
+                self.ensure_manual_profile().await;
+                {
+                    let mut cfg = self.config.lock().await;
+                    cfg.manual.enabled = true;
+                    if let Err(e) = cfg.save(&self.config_path) { return Response::err(format!("save config: {e}")); }
+                }
+                let errs = self.reapply_manual().await;
+                if !errs.is_empty() { return Response::err(format!("Manual on, but applying failed: {}", errs.join("; "))); }
+                Response::ok(serde_json::to_value(self.refresh().await).unwrap())
+            }
+        }
+    }
+
+    /// Re-applies Manual from scratch (profile edited, activated or deleted).
+    async fn reapply_manual(&self) -> Vec<String> {
+        let mut st = self.apply.lock().await;
+        st.applied = None;
+        st.failed = None;
+        self.tick_locked(&mut st, true).await
+    }
+
+    async fn manual_view(&self) -> ManualView {
+        let m = self.config.lock().await.manual.clone();
+        let active = m.active_profile().map(|p| p.name.clone());
+        ManualView { enabled: m.enabled, active, profiles: m.profiles }
+    }
 
     /// Collects a fresh snapshot (no NVML) and publishes it to subscribers only if it changed.
     pub async fn refresh(&self) -> Snapshot {
@@ -685,6 +774,11 @@ impl Daemon {
         s.apply_error = self.apply_error.lock().unwrap().clone();
         s.gpu.armoury_pending = self.gpu_record();
         s.system.touchpad = Some(self.touchpad_enabled());
+        {
+            let cfg = self.config.lock().await;
+            s.perf.mode = if mode == ControlMode::Active && cfg.manual.enabled { Some(ModeChoice::Manual) } else { s.perf.profile.map(ModeChoice::from) };
+            s.perf.manual_profile = cfg.manual.active_profile().map(|p| p.name.clone());
+        }
         s.system.clamshell = match self.lid_tool() {
             Some(tool) => {
                 if gpu_detail {
@@ -721,14 +815,68 @@ impl Daemon {
             }
             Request::SetProfile { profile } => {
                 if let Err(r) = self.write_guard().await { return r; }
-                self.switch_profile(profile).await
+                self.choose_mode(profile).await
             }
             Request::NextProfile => {
                 if let Err(r) = self.write_guard().await { return r; }
-                let current = self.refresh().await.perf.profile;
-                self.switch_profile(next_mode(current)).await
+                let cur = self.refresh().await.perf.mode;
+                self.choose_mode(next_choice(cur)).await
             }
-            Request::FanCurves { profile } => self.curves(profile).await,
+            Request::LimitBounds => {
+                let b = self.bounds().await;
+                let bounds: serde_json::Map<String, serde_json::Value> =
+                    Limit::ALL.iter().map(|l| (l.key().to_string(), serde_json::json!([b(*l).min, b(*l).max]))).collect();
+                Response::ok(serde_json::Value::Object(bounds))
+            }
+            Request::ManualProfiles => Response::ok(serde_json::to_value(self.manual_view().await).unwrap()),
+            Request::DefaultCurves { base } => {
+                if let Err(r) = self.write_guard().await { return r; }
+                if let Err(e) = with_retry(|| self.asusd.reset_fan_curves(base.to_asusd())).await { return Response::err(format!("{e:#}")); }
+                let raw = match with_retry(|| self.asusd.fan_curves(base.to_asusd())).await { Ok(r) => r, Err(e) => return Response::err(format!("{e:#}")) };
+                // the reset also cleared Manual's curves if they live in that slot
+                let in_slot = { let c = self.config.lock().await; c.manual.enabled && c.manual.active_profile().is_some_and(|p| p.base == base) };
+                if in_slot { self.reapply_manual().await; }
+                Response::ok(serde_json::to_value(raw.iter().filter_map(fan::from_raw).collect::<Vec<_>>()).unwrap())
+            }
+            Request::SaveManualProfile { profile, original_name } => {
+                if let Err(r) = self.write_guard().await { return r; }
+                if let Err(e) = manual::validate_profile(&profile, self.bounds().await) { return Response::err(e); }
+                let reapply = {
+                    let mut cfg = self.config.lock().await;
+                    let was_active = cfg.manual.active_profile().map(|p| p.name.clone());
+                    if let Err(e) = cfg.manual.save(profile.clone(), original_name.as_deref()) { return Response::err(e); }
+                    if let Err(e) = cfg.save(&self.config_path) { return Response::err(format!("save config: {e}")); }
+                    cfg.manual.enabled && (was_active == original_name.or(Some(profile.name.clone())))
+                };
+                if reapply {
+                    let errs = self.reapply_manual().await;
+                    if !errs.is_empty() { return Response::err(format!("saved, but applying failed: {}", errs.join("; "))); }
+                }
+                Response::ok(serde_json::to_value(self.manual_view().await).unwrap())
+            }
+            Request::ActivateManualProfile { name } => {
+                if let Err(r) = self.write_guard().await { return r; }
+                {
+                    let mut cfg = self.config.lock().await;
+                    if let Err(e) = cfg.manual.activate(&name) { return Response::err(e); }
+                    if let Err(e) = cfg.save(&self.config_path) { return Response::err(format!("save config: {e}")); }
+                }
+                let errs = self.reapply_manual().await;
+                if !errs.is_empty() { return Response::err(format!("activated, but applying failed: {}", errs.join("; "))); }
+                Response::ok(serde_json::to_value(self.manual_view().await).unwrap())
+            }
+            Request::DeleteManualProfile { name } => {
+                if let Err(r) = self.write_guard().await { return r; }
+                let reapply = {
+                    let mut cfg = self.config.lock().await;
+                    let was_active = cfg.manual.active_profile().is_some_and(|p| p.name == name);
+                    if let Err(e) = cfg.manual.delete(&name) { return Response::err(e); }
+                    if let Err(e) = cfg.save(&self.config_path) { return Response::err(format!("save config: {e}")); }
+                    was_active && cfg.manual.enabled
+                };
+                if reapply { self.reapply_manual().await; }
+                Response::ok(serde_json::to_value(self.manual_view().await).unwrap())
+            }
             Request::Lighting | Request::SetBrightness { .. } | Request::SetEffect { .. } | Request::SetZonePower { .. }
             | Request::KbdIdle | Request::KbdResume => self.lighting_request(req).await,
             Request::SetChargeLimit { .. } | Request::OneShotCharge | Request::SetRefresh { .. } | Request::SetGamma { .. }
@@ -793,52 +941,6 @@ impl Daemon {
                 let errs = self.tick_locked(&mut st, true).await;
                 if !errs.is_empty() { return Response::err(errs.join("; ")); }
                 Response::ok(serde_json::json!({"unlocked": unlocked}))
-            }
-            Request::SetFanCurve { profile, curve } => {
-                if let Err(r) = self.write_guard().await { return r; }
-                if let Err(e) = fan::validate(&curve) { return Response::err(e); }
-                if let Err(e) = with_retry(|| self.asusd.set_fan_curve(profile.to_asusd(), fan::to_raw(&curve))).await {
-                    return Response::err(format!("{e:#}"));
-                }
-                self.curves(profile).await
-            }
-            Request::ResetFanCurves { profile } => {
-                if let Err(r) = self.write_guard().await { return r; }
-                if let Err(e) = with_retry(|| self.asusd.reset_fan_curves(profile.to_asusd())).await { return Response::err(format!("{e:#}")); }
-                self.curves(profile).await
-            }
-            Request::ModeSettings { profile } => {
-                let b = self.bounds().await;
-                let bounds: serde_json::Map<String, serde_json::Value> =
-                    Limit::ALL.iter().map(|l| (l.key().to_string(), serde_json::json!([b(*l).min, b(*l).max]))).collect();
-                Response::ok(serde_json::json!({"settings": self.config.lock().await.mode(profile), "bounds": bounds}))
-            }
-            Request::SetModeSettings { profile, settings } => {
-                if let Err(r) = self.write_guard().await { return r; }
-                let mut st = self.apply.lock().await; // check → apply → save as one step
-                let merged = merge(self.config.lock().await.mode(profile), settings);
-                if let Err(e) = limits::validate(&merged, self.bounds().await) { return Response::err(e); }
-                let snap = self.refresh().await;
-                if snap.perf.profile == Some(profile) {
-                    // apply everything stored, not just the delta, so earlier drift is repaired
-                    let dgpu_active = snap.gpu.dgpu_active == Some(true);
-                    let ctx = self.hw_ctx(dgpu_active, &st);
-                    let errs = apply_mode(profile, &merged, ctx, &*self.asusd, &*self.svc).await;
-                    self.note_apply(profile, &errs);
-                    if !errs.is_empty() { return Response::err(errs.join("; ")); }
-                    *st = ApplyState {
-                        applied: Some(profile),
-                        dgpu_was_active: dgpu_active,
-                        uv_at_stock: if ctx.uv_unlocked { merged.uv_mv.unwrap_or(0) == 0 } else { st.uv_at_stock },
-                        nv_at_stock: if dgpu_active { nv_is_stock(&merged) } else { st.nv_at_stock },
-                        probe_retry_at: st.probe_retry_at,
-                        ..Default::default()
-                    };
-                }
-                let cfg = self.config.lock().await;
-                let _ = merged; // per-mode settings are gone; Task 3 removes this request
-                if let Err(e) = cfg.save(&self.config_path) { return Response::err(format!("save config: {e}")); }
-                Response::ok(serde_json::to_value(merged).unwrap())
             }
         }
     }
@@ -941,10 +1043,10 @@ const PROBE_BACKOFF: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 struct ApplyState {
-    /// Profile whose settings are in force.
-    applied: Option<Profile>,
-    /// Profile whose last apply failed, and when to try it again.
-    failed: Option<Profile>,
+    /// What is in force.
+    applied: Option<Target>,
+    /// What last failed to apply, and when to try it again.
+    failed: Option<Target>,
     retry_at: Option<tokio::time::Instant>,
     /// dGPU state at the last tick, to catch it waking up.
     dgpu_was_active: bool,
@@ -956,17 +1058,18 @@ struct ApplyState {
     mode_just_set: bool,
 }
 
-/// Mode key order: Silent → Balanced → Turbo → Silent.
-fn next_mode(current: Option<Profile>) -> Profile {
-    match current {
-        Some(Profile::Quiet) => Profile::Balanced,
-        Some(Profile::Balanced) => Profile::Performance,
-        Some(Profile::Performance) | None => Profile::Quiet,
-    }
+/// What the apply loop keeps in force.
+#[derive(Debug, Clone, PartialEq)]
+enum Target { Stock(Profile), Manual { name: String, base: Profile } }
+
+/// Mode key order: Silent → Balanced → Turbo → Manual → Silent.
+fn next_choice(current: Option<ModeChoice>) -> ModeChoice {
+    let i = current.and_then(|c| ModeChoice::CYCLE.iter().position(|m| *m == c)).map_or(0, |i| (i + 1) % 4);
+    ModeChoice::CYCLE[i]
 }
 
-fn mode_look(p: Profile) -> (&'static str, &'static str) {
-    match p { Profile::Quiet => ("󰾆", "Silent"), Profile::Balanced => ("󰾅", "Balanced"), Profile::Performance => ("󰓅", "Turbo") }
+fn mode_look(m: ModeChoice) -> &'static str {
+    match m { ModeChoice::Quiet => "󰾆", ModeChoice::Balanced => "󰾅", ModeChoice::Performance => "󰓅", ModeChoice::Manual => "󰈐" }
 }
 
 /// Loads config.toml. An unparsable file is moved to config.toml.bad (so the next
@@ -990,23 +1093,6 @@ fn load_config(path: &Path) -> (Config, Option<String>) {
 /// User-facing GPU mode name (AsusMuxDgpu is "Ultimate" in G-Helper and the UI).
 fn gpu_name(m: GpuMode) -> &'static str {
     match m { GpuMode::Integrated => "integrated", GpuMode::Hybrid => "hybrid", GpuMode::AsusMuxDgpu => "ultimate", _ => "other" }
-}
-
-/// Fields present in `new` overwrite `old`.
-fn merge(old: ModeSettings, new: ModeSettings) -> ModeSettings {
-    ModeSettings {
-        pl1: new.pl1.or(old.pl1),
-        pl2: new.pl2.or(old.pl2),
-        nv_boost: new.nv_boost.or(old.nv_boost),
-        nv_temp: new.nv_temp.or(old.nv_temp),
-        epp: new.epp.or(old.epp),
-        cpu_boost: new.cpu_boost.or(old.cpu_boost),
-        uv_mv: new.uv_mv.or(old.uv_mv),
-        gpu_core_offset: new.gpu_core_offset.or(old.gpu_core_offset),
-        gpu_mem_offset: new.gpu_mem_offset.or(old.gpu_mem_offset),
-        gpu_core_lock: new.gpu_core_lock.or(old.gpu_core_lock),
-        gpu_mem_lock: new.gpu_mem_lock.or(old.gpu_mem_lock),
-    }
 }
 
 async fn write_line<T: serde::Serialize>(w: &mut OwnedWriteHalf, v: &T) -> anyhow::Result<()> {
@@ -1153,6 +1239,11 @@ mod tests {
         assert!(r.expect("status blocked by control lock").ok);
     }
 
+    /// A config whose Manual is on, with one profile on Balanced (the rig's current mode).
+    fn manual_on(pre: &str, settings: &str) -> String {
+        format!("{pre}[manual]\nenabled = true\nactive = \"T\"\n[[manual.profiles]]\nname = \"T\"\nbase = \"balanced\"\nsettings = {{ {settings} }}\n")
+    }
+
     struct Rig { d: Arc<Daemon>, sys: Arc<FakeSysfs>, asusd: Arc<FakeAsusd>, svc: Arc<FakeServices>, dir: tempfile::TempDir }
 
     fn rig(active: bool) -> Rig {
@@ -1167,14 +1258,11 @@ mod tests {
         Rig { d, sys, asusd, svc, dir }
     }
 
-    fn set_mode(profile: &str, pl1: i32, pl2: i32) -> Request {
-        serde_json::from_value(serde_json::json!({"cmd":"set_mode_settings","profile":profile,"settings":{"pl1":pl1,"pl2":pl2}})).unwrap()
-    }
-
     #[tokio::test]
     async fn observe_mode_never_applies() {
         let r = rig(false);
-        let resp = r.d.handle(set_mode("balanced", 60, 80)).await;
+        let p: ManualProfile = serde_json::from_value(serde_json::json!({"name":"T","settings":{"pl1":60,"pl2":80}})).unwrap();
+        let resp = r.d.handle(Request::SaveManualProfile { profile: p, original_name: None }).await;
         assert!(!resp.ok && resp.error.unwrap().contains("observe"));
         r.sys.files.lock().unwrap().insert("sys/firmware/acpi/platform_profile".into(), "performance".into());
         r.d.tick().await;
@@ -1185,42 +1273,24 @@ mod tests {
         r.svc.calls.lock().unwrap().iter().filter(|c| c.contains("set-limits")).cloned().collect()
     }
 
-    #[tokio::test]
-    #[ignore = "rewritten in Task 3"]
-    async fn set_mode_settings_applies_current_and_saves() {
-        let r = rig(true);
-        r.d.tick().await; // first tick records current profile (nothing stored yet)
-        let resp = r.d.handle(set_mode("balanced", 60, 80)).await;
-        assert!(resp.ok, "{resp:?}");
-        assert!(limit_calls(&r).last().unwrap().ends_with("set-limits pl1=60 pl2=80 cpu_boost=on"), "{:?}", limit_calls(&r));
-        let text = std::fs::read_to_string(r.dir.path().join("config.toml")).unwrap();
-        assert!(text.contains("pl1 = 60"), "{text}");
-    }
 
     #[tokio::test]
     async fn set_mode_settings_for_other_mode_only_saves() {
+        // saving a profile that isn't in use only saves it
         let r = rig(true);
         r.d.tick().await;
-        assert!(r.d.handle(set_mode("performance", 120, 150)).await.ok);
+        let p: ManualProfile = serde_json::from_value(serde_json::json!({"name":"Later","settings":{"pl1":120,"pl2":150}})).unwrap();
+        assert!(r.d.handle(Request::SaveManualProfile { profile: p, original_name: None }).await.ok);
         assert!(!limit_calls(&r).iter().any(|c| c.contains("pl1=")), "{:?}", limit_calls(&r));
+        assert_eq!(r.d.config.lock().await.manual.profiles.len(), 1);
     }
 
-    #[tokio::test]
-    #[ignore = "rewritten in Task 3"]
-    async fn external_profile_change_applies_mode() {
-        let r = rig(true);
-        r.d.tick().await;
-        assert!(r.d.handle(set_mode("performance", 120, 150)).await.ok);
-        r.sys.files.lock().unwrap().insert("sys/firmware/acpi/platform_profile".into(), "performance".into()); // Fn+F5
-        r.d.tick().await;
-        assert!(limit_calls(&r).last().unwrap().ends_with("set-limits pl1=120 pl2=150 cpu_boost=on"), "{:?}", limit_calls(&r));
-    }
 
     #[tokio::test]
-    #[ignore = "rewritten in Task 3"]
     async fn invalid_settings_rejected_and_not_saved() {
         let r = rig(true);
-        let resp = r.d.handle(set_mode("balanced", 140, 100)).await;
+        let bad: ManualProfile = serde_json::from_value(serde_json::json!({"name":"X","settings":{"pl1":140,"pl2":100}})).unwrap();
+        let resp = r.d.handle(Request::SaveManualProfile { profile: bad, original_name: None }).await;
         assert!(resp.error.unwrap().contains("PL1 must not exceed PL2"));
         assert!(!r.dir.path().join("config.toml").exists());
         assert!(limit_calls(&r).is_empty());
@@ -1228,32 +1298,32 @@ mod tests {
 
     #[tokio::test]
     async fn failed_set_does_not_save() {
-        let r = rig(true);
+        // renamed in spirit: a failed apply keeps the saved profile and reports the failure
+        let r = rig_with_config(&manual_on("", "pl1 = 45, pl2 = 65"), true);
         r.d.tick().await;
         *r.svc.fail_on.lock().unwrap() = Some("set-limits".into());
-        let resp = r.d.handle(set_mode("balanced", 60, 80)).await;
+        let p: ManualProfile = serde_json::from_value(serde_json::json!({"name":"T","base":"balanced","settings":{"pl1":60,"pl2":80}})).unwrap();
+        let resp = r.d.handle(Request::SaveManualProfile { profile: p, original_name: Some("T".into()) }).await;
         assert!(!resp.ok && resp.error.unwrap().contains("power limits"));
-        assert!(!r.dir.path().join("config.toml").exists());
+        assert_eq!(r.d.config.lock().await.manual.profiles[0].settings.pl1, Some(60), "the edit is kept");
     }
 
     #[tokio::test]
     async fn fan_curve_validation_and_set() {
         let r = rig(true);
-        let bad = serde_json::json!({"cmd":"set_fan_curve","profile":"quiet","curve":{"fan":"cpu","temps":[40,50,60,70,80,90,95,97],"percent":[50,40,50,60,70,80,90,100],"enabled":true}});
-        let resp = r.d.handle(serde_json::from_value(bad).unwrap()).await;
+        let with_curve = |percent: serde_json::Value| -> ManualProfile { serde_json::from_value(serde_json::json!(
+            {"name":"C","curves":[{"fan":"cpu","temps":[40,50,60,70,80,90,95,97],"percent":percent}]})).unwrap() };
+        let resp = r.d.handle(Request::SaveManualProfile { profile: with_curve(serde_json::json!([50,40,50,60,70,80,90,100])), original_name: None }).await;
         assert!(resp.error.unwrap().contains("fan speed"));
-        let good = serde_json::json!({"cmd":"set_fan_curve","profile":"quiet","curve":{"fan":"cpu","temps":[40,50,60,70,80,90,95,97],"percent":[0,10,20,30,40,60,80,100],"enabled":true}});
-        let resp = r.d.handle(serde_json::from_value(good).unwrap()).await;
+        let resp = r.d.handle(Request::SaveManualProfile { profile: with_curve(serde_json::json!([0,10,20,30,40,60,80,100])), original_name: None }).await;
         assert!(resp.ok, "{resp:?}");
-        assert_eq!(resp.data.unwrap()[0]["percent"][7], 100);
-        assert!(r.asusd.calls.lock().unwrap().contains(&"set_fan_curve 2 CPU".to_string()));
+        assert_eq!(resp.data.unwrap()["profiles"][0]["curves"][0]["percent"][7], 100);
     }
 
     #[tokio::test(start_paused = true)]
     async fn reapply_timer() {
-        let r = rig(true);
+        let r = rig_with_config(&manual_on("", "pl1 = 60, pl2 = 80"), true);
         r.d.tick().await;
-        assert!(r.d.handle(set_mode("balanced", 60, 80)).await.ok);
         r.svc.calls.lock().unwrap().clear();
         r.d.config.lock().await.reapply_power_secs = 10;
         tokio::time::advance(Duration::from_secs(5)).await;
@@ -1267,7 +1337,7 @@ mod tests {
     #[tokio::test]
     async fn set_profile_reports_apply_failure() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("config.toml"), "[modes.balanced]\npl1 = 45\npl2 = 65\n").unwrap();
+        std::fs::write(dir.path().join("config.toml"), manual_on("", "pl1 = 45, pl2 = 65").replace("enabled = true", "enabled = false")).unwrap();
         let sys = Arc::new(FakeSysfs::with(&[("sys/firmware/acpi/platform_profile", "balanced")]));
         let svc = FakeServices::default();
         *svc.fail_on.lock().unwrap() = Some("set-limits".into());
@@ -1275,9 +1345,9 @@ mod tests {
         ctl.set(ControlMode::Active).unwrap();
         let d = Daemon::new(Box::new(sys), Box::new(FakeGfx::default()), Box::new(svc),
             Box::new(FakeAsusd::default()), ctl, dir.path().join("config.toml"), Box::new(FakeNvidia::default()));
-        let resp = d.handle(Request::SetProfile { profile: Profile::Balanced }).await;
+        let resp = d.handle(Request::SetProfile { profile: ModeChoice::Manual }).await;
         let err = resp.error.expect("apply failure must be reported");
-        assert!(err.contains("settings failed") && err.contains("power limits"), "{err}");
+        assert!(err.contains("applying failed") && err.contains("power limits"), "{err}");
     }
 
     fn rig_with_config(toml: &str, active: bool) -> Rig {
@@ -1319,33 +1389,22 @@ mod tests {
         assert_eq!(limit_calls(&r).len(), 2, "no re-apply once it worked");
     }
 
-    #[tokio::test]
-    #[ignore = "rewritten in Task 3"]
-    async fn set_mode_settings_applies_merged() {
-        let r = rig_with_config("[modes.balanced]\npl1 = 45\npl2 = 65\ncpu_boost = false\n", true);
-        let req = serde_json::from_value(serde_json::json!({"cmd":"set_mode_settings","profile":"balanced","settings":{"pl2":60}})).unwrap();
-        assert!(r.d.handle(req).await.ok);
-        assert!(limit_calls(&r).last().unwrap().ends_with("set-limits pl1=45 pl2=60 cpu_boost=off"), "{:?}", limit_calls(&r));
-    }
 
     #[tokio::test]
-    #[ignore = "rewritten in Task 3"]
     async fn invalid_config_values_dropped_and_reported() {
-        let r = rig_with_config("[modes.performance]\npl1 = 200\npl2 = 150\n[modes.balanced]\npl1 = 45\npl2 = 65\n", true);
-        assert_eq!(r.d.config.lock().await.mode(Profile::Performance), ModeSettings::default());
-        assert_eq!(r.d.config.lock().await.mode(Profile::Balanced).pl1, Some(45));
-        let s = r.d.refresh().await;
-        assert!(s.config_error.unwrap().contains("performance"));
+        let r = rig_with_config("[[manual.profiles]]\nname = \"Hot\"\nsettings = { pl1 = 200, pl2 = 150 }\n[[manual.profiles]]\nname = \"Ok\"\nsettings = { pl1 = 45, pl2 = 65 }\n", true);
+        let names: Vec<String> = r.d.config.lock().await.manual.profiles.iter().map(|p| p.name.clone()).collect();
+        assert_eq!(names, ["Ok"]);
+        assert!(r.d.refresh().await.config_error.unwrap().contains("Hot"));
     }
 
     #[tokio::test]
-    #[ignore = "rewritten in Task 3"]
     async fn corrupt_config_moved_aside_and_reported() {
-        let r = rig_with_config("modes = 7\n", true);
+        let r = rig_with_config("reapply_power_secs = \"often\"\n", true);
         assert!(r.dir.path().join("config.toml.bad").exists());
         assert!(r.d.refresh().await.config_error.unwrap().contains("config.toml.bad"));
-        assert!(r.d.handle(set_mode("balanced", 60, 80)).await.ok);
-        assert_eq!(std::fs::read_to_string(r.dir.path().join("config.toml.bad")).unwrap(), "modes = 7\n");
+        assert!(r.d.handle(sreq(serde_json::json!({"cmd":"set_profile","profile":"quiet"}))).await.ok);
+        assert_eq!(std::fs::read_to_string(r.dir.path().join("config.toml.bad")).unwrap(), "reapply_power_secs = \"often\"\n");
     }
 
     struct NvRig { d: Arc<Daemon>, svc: Arc<FakeServices>, nv: Arc<FakeNvidia> }
@@ -1366,9 +1425,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "rewritten in Task 3"]
     async fn nv_applied_when_dgpu_wakes() {
-        let r = rig_with_nv("[modes.balanced]\ngpu_core_offset = 50\n", "locked\n");
+        let r = rig_with_nv(&manual_on("", "gpu_core_offset = 50"), "locked\n");
         r.d.tick().await;
         assert!(!r.svc.calls.lock().unwrap().iter().any(|c| c.contains("nv-clocks")));
         *r.nv.active.lock().unwrap() = Some(true);
@@ -1377,9 +1435,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "rewritten in Task 3"]
     async fn probe_result_reported_and_used() {
-        let r = rig_with_nv("[modes.balanced]\nuv_mv = -30\n", "unlocked\n");
+        let r = rig_with_nv(&manual_on("", "uv_mv = -30"), "unlocked\n");
         r.d.tick().await;
         let calls = r.svc.calls.lock().unwrap().clone();
         assert!(calls.iter().any(|c| c.ends_with("undervolt probe")));
@@ -1388,9 +1445,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "rewritten in Task 3"]
     async fn locked_probe_never_sends_undervolt() {
-        let r = rig_with_nv("[modes.balanced]\nuv_mv = -30\n", "locked\n");
+        let r = rig_with_nv(&manual_on("", "uv_mv = -30"), "locked\n");
         r.d.tick().await;
         assert!(!r.svc.calls.lock().unwrap().iter().any(|c| c.contains("undervolt set")));
         assert_eq!(r.d.refresh().await.perf.undervolt, Some(armoury_proto::UndervoltState { unlocked: false }));
@@ -1411,9 +1467,8 @@ mod tests {
     fn calls(r: &NvRig) -> Vec<String> { r.svc.calls.lock().unwrap().clone() }
 
     #[tokio::test]
-    #[ignore = "rewritten in Task 3"]
     async fn probe_request_reapplies_undervolt() {
-        let r = rig_with_nv("[modes.balanced]\nuv_mv = -30\n", "unlocked\n");
+        let r = rig_with_nv(&manual_on("", "uv_mv = -30"), "unlocked\n");
         r.d.tick().await;
         r.svc.calls.lock().unwrap().clear();
         assert!(r.d.handle(Request::ProbeUndervolt).await.ok);
@@ -1423,9 +1478,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    #[ignore = "rewritten in Task 3"]
     async fn reapply_timer_touches_only_limits() {
-        let r = rig_with_nv("reapply_power_secs = 5\n[modes.balanced]\npl1 = 45\npl2 = 65\nuv_mv = -30\ngpu_core_offset = 50\n", "unlocked\n");
+        let r = rig_with_nv(&manual_on("reapply_power_secs = 5
+", "pl1 = 45, pl2 = 65, uv_mv = -30, gpu_core_offset = 50"), "unlocked\n");
         *r.nv.active.lock().unwrap() = Some(true);
         r.d.tick().await;
         r.svc.calls.lock().unwrap().clear();
@@ -1437,9 +1492,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "rewritten in Task 3"]
     async fn handback_resets_undervolt_and_gpu_clocks() {
-        let r = rig_with_nv("[modes.balanced]\nuv_mv = -30\ngpu_core_offset = 50\n", "unlocked\n");
+        let r = rig_with_nv(&manual_on("", "uv_mv = -30, gpu_core_offset = 50"), "unlocked\n");
         *r.nv.active.lock().unwrap() = Some(true);
         r.d.tick().await;
         r.svc.calls.lock().unwrap().clear();
@@ -1468,9 +1522,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    #[ignore = "rewritten in Task 3"]
     async fn failed_probe_is_retried_not_cached() {
-        let r = rig_with_nv("[modes.balanced]\nuv_mv = -30\n", "unlocked\n");
+        let r = rig_with_nv(&manual_on("", "uv_mv = -30"), "unlocked\n");
         *r.svc.fail_on.lock().unwrap() = Some("undervolt probe".into());
         r.d.tick().await;
         assert_eq!(r.d.refresh().await.perf.undervolt, None);
@@ -1954,6 +2007,7 @@ mod tests {
 
     #[tokio::test]
     async fn fan_key_cycles_silent_balanced_turbo_with_osd() {
+        // Balanced → Turbo → Manual (created on Turbo) → Silent → Balanced
         let r = profile_rig("balanced");
         *r.asusd.mirror.lock().unwrap() = Some(r.sys.clone());
         r.d.on_hotkey(armoury_proto::HotKey::Fan).await;
@@ -1962,7 +2016,7 @@ mod tests {
         r.d.on_hotkey(armoury_proto::HotKey::Fan).await;
         r.d.on_hotkey(armoury_proto::HotKey::Fan).await;
         // every press is its own switch, in order, each finished before the next starts
-        assert_eq!(profile_sets(&r), ["set_profile 1", "set_profile 2", "set_profile 0", "set_profile 1"]);
+        assert_eq!(profile_sets(&r), ["set_profile 1", "set_profile 1", "set_profile 2", "set_profile 0"]);
     }
 
     #[tokio::test]
@@ -1980,22 +2034,21 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "rewritten in Task 3"]
     async fn own_switch_changes_the_policy_once() {
-        let r = sys_rig(true, "[modes.performance]\npl1 = 60\npl2 = 80\n");
+        let r = sys_rig(true, "");
         r.sys.files.lock().unwrap().insert("sys/firmware/acpi/platform_profile".into(), "balanced".into());
         *r.asusd.mirror.lock().unwrap() = Some(r.sys.clone());
         let resp = r.d.handle(sreq(serde_json::json!({"cmd":"set_profile","profile":"performance"}))).await;
         assert!(resp.ok, "{resp:?}");
         assert_eq!(profile_sets(&r), ["set_profile 1"], "no re-assert right after our own switch");
-        assert!(svc_calls(&r).iter().any(|c| c.ends_with("set-limits pl1=60 pl2=80 cpu_boost=on")), "{:?}", svc_calls(&r));
     }
 
     #[tokio::test]
     async fn next_profile_request_uses_our_order() {
         let r = profile_rig("performance");
         assert!(r.d.handle(Request::NextProfile).await.ok);
-        assert_eq!(profile_sets(&r), ["set_profile 2"], "Turbo → Silent, not asusd's own order");
+        assert_eq!(r.d.refresh().await.perf.mode, Some(ModeChoice::Manual), "Turbo → Manual, not asusd's own order");
+        assert!(!r.asusd.calls.lock().unwrap().contains(&"next_profile".to_string()));
     }
 
     #[tokio::test]
@@ -2108,5 +2161,150 @@ mod tests {
         assert_eq!(v["system"]["refresh_ac"], 240.0);
         assert_eq!(v["lighting"]["keep_on"], true);
         assert_eq!(v["keys"]["fan"], "cycle_mode");
+    }
+
+    fn mrig(active: bool, toml: &str) -> Rig {
+        let r = rig(active);
+        std::fs::write(r.dir.path().join("config.toml"), toml).unwrap();
+        let (cfg, _) = crate::config::Config::load(&r.dir.path().join("config.toml"));
+        *r.d.config.try_lock().unwrap() = cfg;
+        *r.asusd.mirror.lock().unwrap() = Some(r.sys.clone());
+        r
+    }
+    fn fw(r: &Rig, p: &str) { r.sys.files.lock().unwrap().insert("sys/firmware/acpi/platform_profile".into(), p.into()); }
+    fn acalls_of(r: &Rig) -> Vec<String> { r.asusd.calls.lock().unwrap().clone() }
+    fn clear(r: &Rig) { r.asusd.calls.lock().unwrap().clear(); r.svc.calls.lock().unwrap().clear(); }
+
+    const GAMING: &str = r#"
+[manual]
+enabled = false
+active = "Gaming"
+[[manual.profiles]]
+name = "Gaming"
+base = "performance"
+settings = { pl1 = 20, pl2 = 40 }
+[[manual.profiles.curves]]
+fan = "cpu"
+temps = [30, 40, 50, 60, 70, 80, 90, 100]
+percent = [0, 10, 20, 35, 55, 75, 90, 100]
+"#;
+
+    fn set(p: &str) -> Request { sreq(serde_json::json!({"cmd":"set_profile","profile":p})) }
+    #[tokio::test]
+    async fn stock_mode_turns_curves_off() {
+        let r = mrig(true, "");
+        r.d.tick().await; // firmware balanced
+        assert!(acalls_of(&r).contains(&"set_fan_curves_enabled 0 false".to_string()), "{:?}", acalls_of(&r));
+        clear(&r);
+        r.d.tick().await;
+        assert!(acalls_of(&r).is_empty(), "applied once, not every tick: {:?}", acalls_of(&r));
+    }
+
+    #[tokio::test]
+    async fn entering_manual_applies_the_profile_and_stays() {
+        let r = mrig(true, GAMING);
+        r.d.tick().await;
+        clear(&r);
+        let resp = r.d.handle(set("manual")).await;
+        assert!(resp.ok, "{resp:?}");
+        let calls = acalls_of(&r);
+        assert_eq!(&calls[..3], ["set_profile 1", "set_fan_curve 1 CPU", "set_fan_curves_enabled 1 true"], "{calls:?}");
+        assert!(limit_calls(&r).last().unwrap().ends_with("set-limits pl1=20 pl2=40 cpu_boost=on"));
+        clear(&r);
+        r.d.tick().await; // our own switch to the base (balanced → performance) is not an outside change
+        assert!(acalls_of(&r).is_empty(), "{:?}", acalls_of(&r));
+        let s = r.d.refresh().await;
+        assert_eq!((s.perf.mode, s.perf.manual_profile.as_deref()), (Some(ModeChoice::Manual), Some("Gaming")));
+        assert!(r.d.config.lock().await.manual.enabled);
+    }
+
+    #[tokio::test]
+    async fn outside_mode_change_leaves_manual() {
+        let r = mrig(true, GAMING);
+        r.d.tick().await;
+        assert!(r.d.handle(set("manual")).await.ok);
+        clear(&r);
+        fw(&r, "quiet"); // e.g. asusd's own switch
+        r.d.tick().await;
+        assert!(acalls_of(&r).contains(&"set_fan_curves_enabled 1 false".to_string()), "Manual's slot cleaned up: {:?}", acalls_of(&r));
+        assert!(!r.d.config.lock().await.manual.enabled);
+        assert_eq!(r.d.refresh().await.perf.mode, Some(ModeChoice::Quiet));
+    }
+
+    #[tokio::test]
+    async fn takeover_re_enters_manual() {
+        let r = mrig(true, &GAMING.replace("enabled = false", "enabled = true"));
+        r.d.tick().await; // first active tick (firmware still balanced)
+        assert_eq!(acalls_of(&r)[0], "set_profile 1", "{:?}", acalls_of(&r));
+        assert!(r.d.config.lock().await.manual.enabled, "re-entering is not an outside change");
+    }
+
+    #[tokio::test]
+    async fn stock_choice_leaves_manual() {
+        let r = mrig(true, GAMING);
+        r.d.tick().await;
+        assert!(r.d.handle(set("manual")).await.ok);
+        clear(&r);
+        assert!(r.d.handle(set("performance")).await.ok); // same firmware mode as the base
+        assert!(acalls_of(&r).contains(&"set_fan_curves_enabled 1 false".to_string()), "{:?}", acalls_of(&r));
+        assert_eq!(r.d.refresh().await.perf.mode, Some(ModeChoice::Performance));
+    }
+
+    #[tokio::test]
+    async fn next_profile_cycles_through_manual() {
+        let r = mrig(true, GAMING);
+        fw(&r, "performance");
+        r.d.tick().await;
+        assert!(r.d.handle(Request::NextProfile).await.ok);
+        assert_eq!(r.d.refresh().await.perf.mode, Some(ModeChoice::Manual));
+        assert!(r.d.handle(Request::NextProfile).await.ok);
+        assert_eq!(r.d.refresh().await.perf.mode, Some(ModeChoice::Quiet));
+    }
+
+    #[tokio::test]
+    async fn first_manual_entry_creates_a_profile_from_turbo_curves() {
+        let r = mrig(true, "");
+        r.asusd.curves.lock().unwrap().insert(1, vec![("CPU".into(), [0, 25, 51, 76, 102, 153, 204, 255], [30, 40, 50, 60, 70, 80, 90, 100], true)]);
+        r.d.tick().await;
+        assert!(r.d.handle(set("manual")).await.ok);
+        let m = r.d.config.lock().await.manual.clone();
+        assert_eq!((m.active.as_deref(), m.profiles.len()), (Some("Manual 1"), 1));
+    }
+
+    #[tokio::test]
+    async fn saving_the_active_profile_reapplies_it() {
+        let r = mrig(true, GAMING);
+        r.d.tick().await;
+        assert!(r.d.handle(set("manual")).await.ok);
+        clear(&r);
+        let mut p = r.d.config.lock().await.manual.profiles[0].clone();
+        p.settings.pl1 = Some(30);
+        let resp = r.d.handle(Request::SaveManualProfile { profile: p, original_name: Some("Gaming".into()) }).await;
+        assert!(resp.ok, "{resp:?}");
+        assert!(limit_calls(&r).last().unwrap().contains("pl1=30"), "{:?}", limit_calls(&r));
+        let bad = { let mut q = r.d.config.lock().await.manual.profiles[0].clone(); q.settings.pl1 = Some(90); q.settings.pl2 = Some(50); q };
+        assert!(!r.d.handle(Request::SaveManualProfile { profile: bad, original_name: None }).await.ok);
+    }
+
+    #[tokio::test]
+    async fn activate_other_profile_switches_base() {
+        let r = mrig(true, &format!("{GAMING}\n[[manual.profiles]]\nname = \"Quiet work\"\nbase = \"quiet\"\n"));
+        r.d.tick().await;
+        assert!(r.d.handle(set("manual")).await.ok);
+        clear(&r);
+        assert!(r.d.handle(Request::ActivateManualProfile { name: "Quiet work".into() }).await.ok);
+        assert_eq!(acalls_of(&r)[0], "set_profile 2", "{:?}", acalls_of(&r));
+        r.d.tick().await;
+        assert!(r.d.config.lock().await.manual.enabled, "switching base for a new profile is ours");
+    }
+
+    #[tokio::test]
+    async fn manual_writes_refused_in_observe_but_listing_works() {
+        let r = mrig(false, GAMING);
+        assert!(!r.d.handle(set("manual")).await.ok);
+        assert!(!r.d.handle(Request::ActivateManualProfile { name: "Gaming".into() }).await.ok);
+        let v = r.d.handle(Request::ManualProfiles).await;
+        assert!(v.ok && v.data.unwrap()["profiles"][0]["name"] == "Gaming");
+        assert_eq!(r.d.refresh().await.perf.mode, Some(ModeChoice::Balanced), "Manual shows only while active");
     }
 }

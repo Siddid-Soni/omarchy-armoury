@@ -51,9 +51,6 @@ pub fn validate(s: &ModeSettings, b: impl Fn(Limit) -> Bounds) -> Result<(), Str
     for (v, what) in [(s.gpu_core_lock, "GPU core lock"), (s.gpu_mem_lock, "GPU memory lock")] {
         if let Some(m) = v { if m != 0 && !(200..=3000).contains(&m) { return Err(format!("{what} must be 0 (off) or 200–3000 MHz")); } }
     }
-    if let (Some(a), Some(b)) = (s.pl1, s.pl2) {
-        if a > b { return Err(format!("PL1 ({a} W) can't be above PL2 ({b} W)")); }
-    }
     if let (Some(p1), Some(p2)) = (s.pl1, s.pl2) {
         if p1 > p2 { return Err("PL1 must not exceed PL2".into()); }
     }

@@ -1,4 +1,3 @@
-use armoury_proto::{ModeSettings, Profile};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -93,8 +92,6 @@ impl Config {
         std::fs::rename(tmp, path)
     }
 
-    /// Stock settings for every mode until the manual-mode apply loop lands (Task 3 removes this).
-    pub fn mode(&self, _p: Profile) -> ModeSettings { ModeSettings::default() }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -151,7 +148,7 @@ impl ManualConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use armoury_proto::Epp;
+    use armoury_proto::{Epp, ModeSettings};
 
     #[test]
     fn round_trip() {

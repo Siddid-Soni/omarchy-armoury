@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-use armoury_proto::{HotKey, KeyAction, ModeChoice, SleepMode, Toggle, AuraEffect, AuraMode, AuraZone, ControlMode, LightingInfo, ZonePower, Epp, Fan, FanCurve, GpuMode, GpuStep, GpuSwitchResult, ModeSettings, Profile, Request, Response, Snapshot, socket_path};
+use armoury_proto::{HotKey, KeyAction, ManualView, ModeChoice, SleepMode, Toggle, AuraEffect, AuraMode, AuraZone, ControlMode, LightingInfo, ZonePower, GpuMode, GpuStep, GpuSwitchResult, Request, Response, Snapshot, socket_path};
 use clap::{Parser, Subcommand};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -31,12 +31,10 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<ProfileAction>,
     },
-    /// Show or edit a mode's fan curves
-    Fan {
-        #[arg(value_parser = parse_profile)]
-        profile: Profile,
+    /// List manual-mode profiles (* in use, - active but a stock mode is on)
+    Manual {
         #[command(subcommand)]
-        action: Option<FanAction>,
+        action: Option<ManualAction>,
     },
     /// Battery info, charge limit, one-shot full charge
     Battery {
@@ -90,66 +88,22 @@ enum Cmd {
         #[command(subcommand)]
         action: GpuAction,
     },
-    /// Show or edit a mode's power limits, EPP, CPU boost, undervolt and GPU clocks
-    Mode {
-        #[arg(value_parser = parse_profile)]
-        profile: Profile,
-        #[command(subcommand)]
-        action: Option<ModeAction>,
-    },
 }
 
 #[derive(Subcommand)]
 enum ProfileAction {
+    /// quiet | balanced | performance | manual
     Set {
-        #[arg(value_parser = parse_profile)]
-        profile: Profile,
+        #[arg(value_parser = parse_mode_choice)]
+        profile: ModeChoice,
     },
     Next,
 }
 
 #[derive(Subcommand)]
-enum FanAction {
-    /// 8 points as TEMP:PERCENT, e.g. 40:0,50:10,60:20,70:30,80:40,90:60,95:80,97:100
-    Set {
-        #[arg(value_parser = parse_fan)]
-        fan: Fan,
-        points: String,
-    },
-    Reset,
-}
-
-#[derive(Subcommand)]
-enum ModeAction {
-    Set {
-        #[arg(long)]
-        pl1: Option<i32>,
-        #[arg(long)]
-        pl2: Option<i32>,
-        #[arg(long)]
-        nv_boost: Option<i32>,
-        #[arg(long)]
-        nv_temp: Option<i32>,
-        #[arg(long, value_parser = parse_epp)]
-        epp: Option<Epp>,
-        #[arg(long, value_parser = ["on", "off"])]
-        cpu_boost: Option<String>,
-        /// CPU undervolt, mV (-150..0; applied only if the BIOS allows it)
-        #[arg(long, allow_hyphen_values = true)]
-        uv: Option<i32>,
-        /// GPU core clock offset, MHz
-        #[arg(long, allow_hyphen_values = true)]
-        gpu_core: Option<i32>,
-        /// GPU memory clock offset, MHz
-        #[arg(long, allow_hyphen_values = true)]
-        gpu_mem: Option<i32>,
-        /// Max GPU core clock, MHz, or off
-        #[arg(long, value_parser = parse_lock)]
-        gpu_core_lock: Option<u32>,
-        /// Max GPU memory clock, MHz, or off
-        #[arg(long, value_parser = parse_lock)]
-        gpu_mem_lock: Option<u32>,
-    },
+enum ManualAction {
+    /// Make a profile active and switch to Manual
+    Activate { name: String },
 }
 
 #[derive(Subcommand)]
@@ -340,37 +294,6 @@ fn describe_step(step: &GpuStep) -> String {
         GpuStep::Supergfx { to } => format!("supergfxd switches to {to:?}; reboot to finish"),
         GpuStep::FirstOfTwo { first, then } => format!("two steps: 1) {} 2) after reboot, switch to {then:?}", describe_step(first)),
     }
-}
-
-fn parse_lock(s: &str) -> Result<u32, String> {
-    if s == "off" { return Ok(0); }
-    s.parse().map_err(|_| format!("expected MHz or off, got {s:?}"))
-}
-
-fn parse_profile(s: &str) -> Result<Profile, String> {
-    Profile::from_sysfs(s).ok_or_else(|| format!("unknown mode {s} (quiet|balanced|performance)"))
-}
-
-fn parse_fan(s: &str) -> Result<Fan, String> {
-    serde_json::from_value(serde_json::json!(s)).map_err(|_| format!("unknown fan {s} (cpu|gpu|mid)"))
-}
-
-fn parse_epp(s: &str) -> Result<Epp, String> {
-    serde_json::from_value(serde_json::json!(s))
-        .map_err(|_| format!("unknown EPP {s} (default|performance|balance_performance|balance_power|power)"))
-}
-
-fn parse_curve(fan: Fan, s: &str) -> Result<FanCurve, String> {
-    let pts: Vec<&str> = s.split(',').map(str::trim).collect();
-    if pts.len() != 8 { return Err(format!("need exactly 8 TEMP:PERCENT points, got {}", pts.len())); }
-    let mut temps = [0u8; 8];
-    let mut percent = [0u8; 8];
-    for (i, p) in pts.iter().enumerate() {
-        let (t, v) = p.split_once(':').ok_or_else(|| format!("point {p:?} is not TEMP:PERCENT"))?;
-        temps[i] = t.trim_end_matches('c').parse().map_err(|_| format!("bad temperature in {p:?}"))?;
-        percent[i] = v.trim_end_matches('%').parse().map_err(|_| format!("bad percent in {p:?}"))?;
-    }
-    Ok(FanCurve { fan, temps, percent, enabled: true })
 }
 
 fn read_timeout(req: &Request) -> std::time::Duration {
@@ -567,37 +490,18 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 Some(ProfileAction::Next) => Request::NextProfile,
             };
             let s: Snapshot = serde_json::from_value(call(&req)?)?;
-            println!("{}", s.perf.profile.map(|p| p.sysfs()).unwrap_or("-"));
+            println!("{}", s.perf.mode.map(|m| m.label()).unwrap_or("-"));
         }
-        Cmd::Fan { profile, action } => {
+        Cmd::Manual { action } => {
             let req = match action {
-                None => Request::FanCurves { profile },
-                Some(FanAction::Set { fan, points }) => {
-                    Request::SetFanCurve { profile, curve: parse_curve(fan, &points).map_err(anyhow::Error::msg)? }
-                }
-                Some(FanAction::Reset) => Request::ResetFanCurves { profile },
+                None => Request::ManualProfiles,
+                Some(ManualAction::Activate { name }) => Request::ActivateManualProfile { name },
             };
-            let curves: Vec<FanCurve> = serde_json::from_value(call(&req)?)?;
-            for c in curves {
-                let pts: Vec<String> = c.temps.iter().zip(c.percent).map(|(t, p)| format!("{t}:{p}")).collect();
-                println!("{:?} {} {}", c.fan, if c.enabled { "on " } else { "off" }, pts.join(","));
+            let v: ManualView = serde_json::from_value(call(&req)?)?;
+            for p in v.profiles {
+                let mark = if v.active.as_deref() == Some(p.name.as_str()) { if v.enabled { "* " } else { "- " } } else { "  " };
+                println!("{mark}{} (on {})", p.name, ModeChoice::from(p.base).label());
             }
-        }
-        Cmd::Mode { profile, action } => {
-            let req = match action {
-                None => Request::ModeSettings { profile },
-                Some(ModeAction::Set { pl1, pl2, nv_boost, nv_temp, epp, cpu_boost, uv, gpu_core, gpu_mem, gpu_core_lock, gpu_mem_lock }) => {
-                    Request::SetModeSettings {
-                        profile,
-                        settings: ModeSettings {
-                            pl1, pl2, nv_boost, nv_temp, epp,
-                            cpu_boost: cpu_boost.map(|v| v == "on"),
-                            uv_mv: uv, gpu_core_offset: gpu_core, gpu_mem_offset: gpu_mem, gpu_core_lock, gpu_mem_lock,
-                        },
-                    }
-                }
-            };
-            println!("{}", serde_json::to_string_pretty(&call(&req)?)?);
         }
     }
     Ok(())
@@ -638,16 +542,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_curve_points() {
-        let c = parse_curve(armoury_proto::Fan::Gpu, "40:0,50:10%,60:20,70:30,80:40,90:60,95:80,97:100").unwrap();
-        assert_eq!(c.temps, [40, 50, 60, 70, 80, 90, 95, 97]);
-        assert_eq!(c.percent[1], 10);
-        assert!(c.enabled);
-        assert!(parse_curve(armoury_proto::Fan::Cpu, "40:0,50:10").unwrap_err().contains("8"));
-        assert!(parse_curve(armoury_proto::Fan::Cpu, "a:b,1:1,1:1,1:1,1:1,1:1,1:1,1:1").is_err());
-    }
-
-    #[test]
     fn summary_has_perf_line() {
         let mut s = Snapshot::default();
         s.perf.profile = Some(armoury_proto::Profile::Performance);
@@ -656,13 +550,6 @@ mod tests {
         s.perf.gpu_fan_rpm = Some(5200);
         s.perf.power_draw_w = Some(18.25);
         assert!(summary(&s).contains("Mode       performance · CPU 72°C · fans 3300/5200 rpm · 18.2 W"), "{}", summary(&s));
-    }
-
-    #[test]
-    fn lock_parsing() {
-        assert_eq!(parse_lock("off"), Ok(0));
-        assert_eq!(parse_lock("1500"), Ok(1500));
-        assert!(parse_lock("fast").is_err());
     }
 
     #[test]

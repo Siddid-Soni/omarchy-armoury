@@ -473,13 +473,20 @@ pub enum Request {
     Subscribe,
     Takeover,
     Handback,
-    SetProfile { profile: Profile },
+    /// Silent / Balanced / Turbo, or Manual (the active manual profile).
+    SetProfile { profile: ModeChoice },
+    /// Next mode in ModeChoice::CYCLE.
     NextProfile,
-    FanCurves { profile: Profile },
-    SetFanCurve { profile: Profile, curve: FanCurve },
-    ResetFanCurves { profile: Profile },
-    ModeSettings { profile: Profile },
-    SetModeSettings { profile: Profile, settings: ModeSettings },
+    /// Firmware bounds for the power-limit settings: {key: [min, max]}.
+    LimitBounds,
+    /// Resets asusd's curves for `base` to the firmware defaults and returns them (for the editor).
+    DefaultCurves { base: Profile },
+    ManualProfiles,
+    /// Creates or overwrites a profile; `original_name` set to another name renames it.
+    SaveManualProfile { profile: ManualProfile, #[serde(default)] original_name: Option<String> },
+    /// Makes a profile active and switches to Manual.
+    ActivateManualProfile { name: String },
+    DeleteManualProfile { name: String },
     ProbeUndervolt,
     SetGpuMode { mode: GpuMode },
     PlanGpuMode { mode: GpuMode },
@@ -576,23 +583,20 @@ mod tests {
     #[test]
     fn new_requests_wire_format() {
         let r: Request = serde_json::from_str(r#"{"cmd":"set_profile","profile":"quiet"}"#).unwrap();
-        assert_eq!(r, Request::SetProfile { profile: Profile::Quiet });
+        assert_eq!(r, Request::SetProfile { profile: ModeChoice::Quiet });
         let r: Request = serde_json::from_str(
-            r#"{"cmd":"set_mode_settings","profile":"performance","settings":{"pl1":120,"epp":"balance_power"}}"#,
+            r#"{"cmd":"save_manual_profile","profile":{"name":"G","settings":{"pl1":120,"epp":"balance_power"}}}"#,
         ).unwrap();
-        assert_eq!(r, Request::SetModeSettings {
-            profile: Profile::Performance,
-            settings: ModeSettings { pl1: Some(120), epp: Some(Epp::BalancePower), ..Default::default() },
-        });
+        let Request::SaveManualProfile { profile, original_name: None } = r else { panic!("{r:?}") };
+        assert_eq!(profile.settings, ModeSettings { pl1: Some(120), epp: Some(Epp::BalancePower), ..Default::default() });
         let v = serde_json::to_value(ModeSettings { pl2: Some(150), ..Default::default() }).unwrap();
         assert_eq!(v, serde_json::json!({"pl2": 150}));
     }
 
     #[test]
     fn tuning_fields_wire_format() {
-        let r: Request = serde_json::from_str(r#"{"cmd":"set_mode_settings","profile":"performance","settings":{"uv_mv":-40,"gpu_core_offset":100,"gpu_core_lock":0}}"#).unwrap();
-        assert_eq!(r, Request::SetModeSettings { profile: Profile::Performance, settings: ModeSettings {
-            uv_mv: Some(-40), gpu_core_offset: Some(100), gpu_core_lock: Some(0), ..Default::default() } });
+        let p: ManualProfile = serde_json::from_str(r#"{"name":"G","settings":{"uv_mv":-40,"gpu_core_offset":100,"gpu_core_lock":0}}"#).unwrap();
+        assert_eq!(p.settings, ModeSettings { uv_mv: Some(-40), gpu_core_offset: Some(100), gpu_core_lock: Some(0), ..Default::default() });
         assert_eq!(serde_json::to_string(&Request::ProbeUndervolt).unwrap(), r#"{"cmd":"probe_undervolt"}"#);
     }
 
@@ -662,5 +666,15 @@ mod tests {
         // curves in a profile need no `enabled` flag
         let c: FanCurve = serde_json::from_str(r#"{"fan":"cpu","temps":[1,2,3,4,5,6,7,8],"percent":[0,0,0,0,0,0,0,0]}"#).unwrap();
         assert!(!c.enabled);
+    }
+
+    #[test]
+    fn manual_requests_parse() {
+        let r: Request = serde_json::from_str(r#"{"cmd":"set_profile","profile":"manual"}"#).unwrap();
+        assert_eq!(r, Request::SetProfile { profile: ModeChoice::Manual });
+        let r: Request = serde_json::from_str(r#"{"cmd":"save_manual_profile","profile":{"name":"G","base":"quiet"},"original_name":"F"}"#).unwrap();
+        assert!(matches!(r, Request::SaveManualProfile { ref original_name, .. } if original_name.as_deref() == Some("F")));
+        let r: Request = serde_json::from_str(r#"{"cmd":"activate_manual_profile","name":"G"}"#).unwrap();
+        assert_eq!(r, Request::ActivateManualProfile { name: "G".into() });
     }
 }
