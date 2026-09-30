@@ -350,10 +350,10 @@ impl Daemon {
         }
         if event == KeystoneEvent::Insert && flash { self.flash_keystone().await; }
         if let Err(e) = self.keystone_light(event, action.light).await { eprintln!("armouryd: Keystone lighting: {e:#}"); }
-        if let Some(cmd) = action.command.filter(|c| !c.trim().is_empty()) {
-            if let Err(e) = self.svc.spawn(&["/usr/bin/systemd-run", "--user", "--scope", "--quiet", "--collect", "/bin/sh", "-c", &cmd], "").await {
-                eprintln!("armouryd: Keystone command: {e:#}");
-            }
+        if let Some(cmd) = action.command.filter(|c| !c.trim().is_empty())
+            && let Err(e) = self.svc.spawn(&["/usr/bin/systemd-run", "--user", "--scope", "--quiet", "--collect", "/bin/sh", "-c", &cmd], "").await
+        {
+            eprintln!("armouryd: Keystone command: {e:#}");
         }
         if event == KeystoneEvent::Remove && action.lock {
             let lock = self.omarchy_bin().join("omarchy-system-lock");
