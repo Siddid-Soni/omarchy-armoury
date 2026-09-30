@@ -1,7 +1,11 @@
 //! Multitouch protocol B → the first finger's Down / Move / Up (other fingers ignored).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Raw { Slot(i32), TrackingId(i32), X(i32), Y(i32), Syn }
+pub enum Raw {
+    Slot(i32), TrackingId(i32), X(i32), Y(i32), Syn,
+    /// SYN_DROPPED: the kernel lost events (possibly the lift).
+    Dropped,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Touch { Down { x: i32, y: i32 }, Move { x: i32, y: i32 }, Up }
@@ -32,6 +36,13 @@ impl MtDecoder {
             }
             Raw::X(x) => { self.slots[self.slot].1 = x; None }
             Raw::Y(y) => { self.slots[self.slot].2 = y; None }
+            Raw::Dropped => {
+                // the lift may be among the lost events: end the touch rather than risk a key
+                // repeating on its own; the next frame starts a fresh touch
+                let ended = self.first.is_some() && self.down_sent;
+                *self = Self::default();
+                ended.then_some(Touch::Up)
+            }
             Raw::Syn => {
                 let f = self.first?;
                 let (id, x, y) = self.slots[f];
@@ -70,5 +81,15 @@ mod tests {
         assert_eq!(run(&mut d, &[Slot(0), TrackingId(-1), Syn]), [Touch::Up]);
         // after the first lifts, a new finger becomes the first
         assert_eq!(run(&mut d, &[Slot(1), TrackingId(3), X(5), Y(6), Syn]), [Touch::Down { x: 5, y: 6 }]);
+    }
+
+    #[test]
+    fn dropped_events_end_the_touch() {
+        // SYN_DROPPED: the kernel lost events (maybe the lift); treat the finger as gone
+        let mut d = MtDecoder::default();
+        run(&mut d, &[Slot(0), TrackingId(1), X(100), Y(100), Syn]);
+        assert_eq!(d.feed(Dropped), Some(Touch::Up));
+        assert_eq!(d.feed(Dropped), None, "nothing down: nothing to end");
+        assert_eq!(run(&mut d, &[Slot(0), TrackingId(2), X(5), Y(6), Syn]), [Touch::Down { x: 5, y: 6 }], "fresh state after a drop");
     }
 }

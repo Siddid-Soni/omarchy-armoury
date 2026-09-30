@@ -49,4 +49,13 @@ check "udev rule removed" 'grep -q "sudo rm -f .*/etc/udev/rules.d/70-omarchy-ar
 R="$repo/packaging/udev/70-omarchy-armoury.rules"
 check "udev rules grant only via uaccess (N-KEY, touchpad, i2c, uinput)" 'grep -q "ATTRS{name}==\"ASUSTek Computer Inc. N-KEY Device\"" "$R" && grep -q "ASUE\* Touchpad" "$R" && grep -q "SUBSYSTEM==\"i2c-dev\", TAG+=\"uaccess\"" "$R" && grep -q "KERNEL==\"uinput\"" "$R" && ! grep -q "MODE=" "$R"'
 
+# 6. uninstall removes the i2c-dev module-load file (the NumberPad backlight needs i2c-dev once G-Helper is gone)
+setup
+run; rc=$?
+check "i2c-dev module-load file removed" 'grep -q "sudo rm -f .*/etc/modules-load.d/omarchy-armoury.conf" "$T/log"'
+
+# 7. install ships that file, loads i2c-dev now, and re-triggers every device class the udev rules cover
+I="$repo/install.sh"
+check "install loads i2c-dev and refreshes uinput/i2c access" 'grep -q "modules-load.d/omarchy-armoury.conf" "$I" && grep -q "modprobe i2c-dev" "$I" && grep -q "subsystem-match=misc" "$I" && grep -q "subsystem-match=i2c-dev" "$I" && grep -q "^i2c-dev$" "$repo/packaging/modules-load/omarchy-armoury.conf"'
+
 exit $fail

@@ -11,7 +11,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-pub enum Cmd { Env { active: bool, touchpad_enabled: bool }, Set(bool), Config(NumpadConfig) }
+pub enum Cmd {
+    Env { active: bool, touchpad_enabled: bool },
+    Set(bool),
+    Config(NumpadConfig),
+    /// Handback: turn everything off (ungrab, light off) and ack, before G-Helper starts.
+    Release(tokio::sync::oneshot::Sender<()>),
+}
 
 #[async_trait::async_trait]
 pub trait NumpadIo: Send {
@@ -57,6 +63,7 @@ pub async fn run_worker(
                 Some(Cmd::Env { active: a, touchpad_enabled: t }) => { active = a; tp_on = t; }
                 Some(Cmd::Config(c)) => cfg = c,
                 Some(Cmd::Set(_)) => {}
+                Some(Cmd::Release(ack)) => { let _ = ack.send(()); }
                 None => return,
             }
         }
@@ -80,6 +87,9 @@ pub async fn run_worker(
         let area = io.area();
         let layout = io.layout();
         let _ = pad.set_allowed(tp_on || cfg.allow_when_touchpad_off); // a fresh pad is off: this only records the rule
+        // a previous armouryd (stopped or crashed while on) may have left the light on
+        let _ = apply(&mut *io, &*hypr, vec![Action::Light(super::layout::LIGHT_OFF)]).await;
+        let mut release_ack: Option<tokio::sync::oneshot::Sender<()>> = None;
         let mut tick = tokio::time::interval(TICK);
         let result: std::io::Result<()> = loop {
             let actions = tokio::select! {
@@ -115,6 +125,7 @@ pub async fn run_worker(
                         pad.set_allowed(tp_on || cfg.allow_when_touchpad_off)
                     }
                     Some(Cmd::Set(on)) => pad.set_on(on, &settings(&cfg, kb), tokio::time::Instant::now().into_std()),
+                    Some(Cmd::Release(ack)) => { active = false; release_ack = Some(ack); break Ok(()); }
                 },
             };
             if let Err(e) = apply(&mut *io, &*hypr, actions).await { break Err(e); }
@@ -124,6 +135,7 @@ pub async fn run_worker(
         let _ = apply(&mut *io, &*hypr, pad.set_allowed(false)).await;
         drop(io);
         *state.lock().unwrap() = NumpadState::Unavailable;
+        if let Some(ack) = release_ack.take() { let _ = ack.send(()); }
         if let Err(e) = result {
             eprintln!("armouryd: NumberPad device: {e}");
             let now = tokio::time::Instant::now();
@@ -214,6 +226,7 @@ impl NumpadIo for EvdevIo {
                 (EventType::ABSOLUTE, c) if c == AbsoluteAxisCode::ABS_MT_POSITION_X.0 => Raw::X(ev.value()),
                 (EventType::ABSOLUTE, c) if c == AbsoluteAxisCode::ABS_MT_POSITION_Y.0 => Raw::Y(ev.value()),
                 (EventType::SYNCHRONIZATION, 0) => Raw::Syn,
+                (EventType::SYNCHRONIZATION, 3) => Raw::Dropped, // SYN_DROPPED
                 _ => continue,
             };
             return Ok(raw);
@@ -294,7 +307,8 @@ mod tests {
         assert_eq!(*r.state.lock().unwrap(), NumpadState::On);
         touch(&r, 1000, 800); lift(&r); settle().await; // "5"
         let l = log(&r);
-        assert_eq!(&l[..4], ["grab true", "light 0x01", &format!("light {:#04x}", level_byte(8)), "key 69 true"], "{l:?}");
+        assert_eq!(l[0], "light 0x00", "a new session clears a light a previous armouryd left on: {l:?}");
+        assert_eq!(&l[1..5], ["grab true", "light 0x01", &format!("light {:#04x}", level_byte(8)), "key 69 true"], "{l:?}");
         assert!(l.contains(&"key 76 true".to_string()) && l.contains(&"key 76 false".to_string()), "{l:?}");
         touch(&r, 4000, 50); settle().await;
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
@@ -359,5 +373,20 @@ mod tests {
         assert_eq!((own.repeat_delay, own.repeat_every), (Some(Duration::from_millis(800)), Duration::from_millis(100)));
         let off = settings(&NumpadConfig { key_repeat: false, ..NumpadConfig::default() }, kb);
         assert_eq!(off.repeat_delay, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn release_turns_off_and_acks_before_returning() {
+        let r = start();
+        r.cmds.send(Cmd::Env { active: true, touchpad_enabled: true }).await.unwrap();
+        r.cmds.send(Cmd::Set(true)).await.unwrap(); settle().await;
+        let (ack, done) = tokio::sync::oneshot::channel();
+        r.cmds.send(Cmd::Release(ack)).await.unwrap();
+        done.await.expect("worker acks the release");
+        assert!(log(&r).ends_with(&[format!("light {LIGHT_OFF:#04x}"), "grab false".to_string()]), "{:?}", log(&r));
+        assert_eq!(*r.state.lock().unwrap(), NumpadState::Unavailable);
+        let (ack, done) = tokio::sync::oneshot::channel();
+        r.cmds.send(Cmd::Release(ack)).await.unwrap();
+        done.await.expect("already released: acks at once");
     }
 }

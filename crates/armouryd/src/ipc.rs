@@ -107,6 +107,19 @@ impl Daemon {
         Arc::new(d)
     }
 
+    /// Before G-Helper starts: the NumberPad worker ungrabs and turns its light off, and confirms.
+    /// Bounded so a stuck worker can't block the handback.
+    async fn release_numpad(&self) {
+        let Some(tx) = &self.numpad_tx else { return };
+        let (ack, done) = tokio::sync::oneshot::channel();
+        let sent = tokio::time::timeout(Duration::from_secs(2), tx.send(numpad::worker::Cmd::Release(ack))).await;
+        if matches!(sent, Ok(Ok(()))) && tokio::time::timeout(Duration::from_secs(2), done).await.is_ok() {
+            *self.numpad_env.lock().unwrap() = Some((false, self.touchpad_enabled()));
+        } else {
+            eprintln!("armouryd: NumberPad didn't confirm release before handback");
+        }
+    }
+
     fn numpad_send(&self, c: numpad::worker::Cmd) -> bool {
         self.numpad_tx.as_ref().is_some_and(|tx| tx.try_send(c).is_ok())
     }
@@ -900,7 +913,10 @@ impl Daemon {
             }
             Request::Subscribe => Response::ok(serde_json::Value::Null),
             Request::Takeover | Request::Handback => {
-                if req == Request::Handback && self.mode.get() == ControlMode::Active { self.reset_to_stock().await; }
+                if req == Request::Handback && self.mode.get() == ControlMode::Active {
+                    self.release_numpad().await;
+                    self.reset_to_stock().await;
+                }
                 let result = {
                     let mut ctl = self.control.lock().await;
                     if req == Request::Takeover { takeover(&mut ctl, &*self.svc).await } else { handback(&mut ctl, &*self.svc).await }
@@ -2608,5 +2624,24 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
         assert_eq!(envs, [(true, true)]);
         r.d.tick().await;
         assert!(rx.try_recv().is_err(), "unchanged: not re-sent");
+    }
+
+    #[tokio::test]
+    async fn handback_releases_the_numberpad_before_g_helper_starts() {
+        use crate::features::numpad::worker::Cmd;
+        let (r, mut rx, _s) = numpad_rig(true, "");
+        let svc = r.svc.clone();
+        let seen = tokio::spawn(async move {
+            while let Some(c) = rx.recv().await {
+                if let Cmd::Release(ack) = c {
+                    let before = !svc.calls.lock().unwrap().iter().any(|c| c.contains("handback"));
+                    let _ = ack.send(());
+                    return before;
+                }
+            }
+            false
+        });
+        r.d.handle(Request::Handback).await;
+        assert!(seen.await.unwrap(), "NumberPad released (ungrabbed, dark) before the handback started G-Helper");
     }
 }

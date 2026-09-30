@@ -111,6 +111,8 @@ impl Pad {
                 self.last_touch = now;
                 if hit != Hit::RightIcon { self.hold_since = None; }
                 if hit != Hit::LeftIcon { self.left_tap = false; }
+                // a finger that slides off its key stops repeating it
+                if matches!(self.repeat, Some((code, _)) if hit != Hit::Key(code)) { self.repeat = None; }
             }
             Touch::Up => {
                 self.finger_down = false;
@@ -296,6 +298,19 @@ mod tests {
         assert_eq!(p.tick(&fast, ms(t0, 2600)).len(), 2);
         assert_eq!(p.next_repeat(), Some(ms(t0, 2625)), "the worker wakes for this, not its 100 ms tick");
         p.touch(Touch::Up, Hit::None, &fast, ms(t0, 2630));
+        assert_eq!(p.next_repeat(), None);
+    }
+
+    #[test]
+    fn sliding_off_the_key_stops_its_repeat() {
+        let (mut p, t0) = (Pad::new(), Instant::now());
+        p.set_allowed(true);
+        hold_icon(&mut p, t0);
+        p.touch(Touch::Up, Hit::None, &s(), ms(t0, 1100));
+        p.touch(Touch::Down { x: 1, y: 1 }, Hit::Key(80), &s(), ms(t0, 2000));
+        assert!(p.touch(Touch::Move { x: 2, y: 2 }, Hit::Key(80), &s(), ms(t0, 2100)).is_empty(), "small move on the same key");
+        p.touch(Touch::Move { x: 900, y: 900 }, Hit::Key(81), &s(), ms(t0, 2200)); // slid onto another key
+        assert!(p.tick(&s(), ms(t0, 3000)).is_empty(), "no repeat of the key it left");
         assert_eq!(p.next_repeat(), None);
     }
 }

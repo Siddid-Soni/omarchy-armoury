@@ -34,6 +34,7 @@ sudo rm -rf "$LIB" "$ROOT_STATE"
 sudo rm -f /usr/share/polkit-1/actions/org.omarchy.armoury.policy \
   /etc/polkit-1/rules.d/50-omarchy-armoury.rules \
   /etc/pacman.d/hooks/omarchy-armoury-asusd.hook \
-  /etc/udev/rules.d/70-omarchy-armoury.rules
+  /etc/udev/rules.d/70-omarchy-armoury.rules \
+  /etc/modules-load.d/omarchy-armoury.conf
 
 echo "Removed omarchy-armoury."
