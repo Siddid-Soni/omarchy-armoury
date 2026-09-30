@@ -14,6 +14,8 @@ tokio.workspace = true
 toml = "1"
 zbus.workspace = true
 nvml-wrapper = "0.13"
+evdev = { version = "0.13", features = ["tokio"] }
+i2cdev = "0.6"
 
 [dev-dependencies]
 tempfile.workspace = true

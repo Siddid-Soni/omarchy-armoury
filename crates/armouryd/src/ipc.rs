@@ -129,6 +129,7 @@ impl Daemon {
         };
         match action {
             KeyAction::None => {}
+            KeyAction::ToggleNumpad => {} // wired in plan 8 task 5
             KeyAction::CycleMode => {
                 // Keys are handled one at a time and switch_profile holds the apply lock,
                 // so presses are serialized: each switch finishes before the next starts
@@ -974,6 +975,7 @@ impl Daemon {
                 }
             }
             Request::Config => Response::ok(serde_json::to_value(&*self.config.lock().await).unwrap()),
+            Request::SetNumpad { .. } | Request::SetNumpadConfig { .. } => Response::err("NumberPad not available"), // task 5
             Request::Keys => Response::ok(serde_json::to_value(self.config.lock().await.keys.clone()).unwrap()),
             Request::SetKeyBinding { key, action, command } => {
                 if let Err(r) = self.write_guard().await { return r; }

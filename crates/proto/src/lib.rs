@@ -163,6 +163,8 @@ pub enum Toggle { Touchpad, BootSound, PanelOd, Clamshell }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SystemState {
+    #[serde(default)]
+    pub numpad: NumpadState,
     pub boot_sound: Option<bool>,
     pub panel_od: Option<bool>,
     pub touchpad: Option<bool>,
@@ -171,6 +173,17 @@ pub struct SystemState {
     pub mem_sleep: Option<SleepMode>,
     pub sleep_modes: Vec<SleepMode>,
     pub camera_present: bool,
+}
+
+/// Illuminated NumberPad on the touchpad (armouryd's, active mode only).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NumpadState {
+    /// No supported touchpad, observe mode, or the worker gave up.
+    #[default]
+    Unavailable,
+    Off,
+    On,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +206,8 @@ pub enum KeyAction {
     CycleMode,
     CycleBrightness,
     CycleEffect,
+    /// Turns the NumberPad on or off.
+    ToggleNumpad,
     /// Runs the configured shell command.
     Command,
 }
@@ -510,6 +525,14 @@ pub enum Request {
     /// Never dim the keyboard backlight when idle.
     SetKeepOn { on: bool },
     SetKeyBinding { key: HotKey, action: KeyAction, #[serde(default)] command: Option<String> },
+    /// NumberPad on/off (active mode; refused while the touchpad is off unless allowed).
+    SetNumpad { on: bool },
+    SetNumpadConfig {
+        #[serde(default)] start_brightness: Option<u8>,
+        #[serde(default)] allow_when_touchpad_off: Option<bool>,
+        #[serde(default)] idle_dim_secs: Option<u32>,
+        #[serde(default)] hold_ms: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -676,5 +699,16 @@ mod tests {
         assert!(matches!(r, Request::SaveManualProfile { ref original_name, .. } if original_name.as_deref() == Some("F")));
         let r: Request = serde_json::from_str(r#"{"cmd":"activate_manual_profile","name":"G"}"#).unwrap();
         assert_eq!(r, Request::ActivateManualProfile { name: "G".into() });
+    }
+
+    #[test]
+    fn numpad_wire_format() {
+        assert_eq!(serde_json::to_string(&NumpadState::On).unwrap(), "\"on\"");
+        assert_eq!(NumpadState::default(), NumpadState::Unavailable);
+        let r: Request = serde_json::from_str(r#"{"cmd":"set_numpad","on":true}"#).unwrap();
+        assert_eq!(r, Request::SetNumpad { on: true });
+        let r: Request = serde_json::from_str(r#"{"cmd":"set_numpad_config","idle_dim_secs":0}"#).unwrap();
+        assert_eq!(r, Request::SetNumpadConfig { start_brightness: None, allow_when_touchpad_off: None, idle_dim_secs: Some(0), hold_ms: None });
+        assert_eq!(serde_json::from_str::<KeyAction>("\"toggle_numpad\"").unwrap(), KeyAction::ToggleNumpad);
     }
 }

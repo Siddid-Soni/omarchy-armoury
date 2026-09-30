@@ -13,6 +13,7 @@ pub struct Config {
     pub lighting: LightingConfig,
     pub system: SystemConfig,
     pub keys: KeysConfig,
+    pub numpad: NumpadConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -145,6 +146,32 @@ impl ManualConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NumpadConfig {
+    /// Backlight level 1–8 used every time the NumberPad turns on.
+    pub start_brightness: u8,
+    /// Let the NumberPad work while Omarchy's touchpad toggle is off.
+    pub allow_when_touchpad_off: bool,
+    /// Backlight off after this long without a touch (0 = never).
+    pub idle_dim_secs: u32,
+    /// Top-right icon hold that toggles the NumberPad.
+    pub hold_ms: u32,
+}
+
+impl Default for NumpadConfig {
+    fn default() -> Self { Self { start_brightness: 8, allow_when_touchpad_off: false, idle_dim_secs: 60, hold_ms: 1000 } }
+}
+
+impl NumpadConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=8).contains(&self.start_brightness) { return Err("NumberPad brightness must be 1–8".into()); }
+        if !(300..=3000).contains(&self.hold_ms) { return Err("hold time must be 300–3000 ms".into()); }
+        if self.idle_dim_secs > 3600 { return Err("idle timeout must be 0–3600 s".into()); }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +267,20 @@ mod tests {
         let (old, err) = Config::load(&path);
         assert!(err.is_none(), "old [modes] must not make the config bad: {err:?}");
         assert!(old.modes.is_none(), "legacy table dropped after load");
+    }
+
+    #[test]
+    fn numpad_defaults_and_validation() {
+        let c = NumpadConfig::default();
+        assert_eq!((c.start_brightness, c.allow_when_touchpad_off, c.idle_dim_secs, c.hold_ms), (8, false, 60, 1000));
+        assert!(c.validate().is_ok());
+        for bad in [NumpadConfig { start_brightness: 0, ..c }, NumpadConfig { start_brightness: 9, ..c },
+                    NumpadConfig { hold_ms: 200, ..c }, NumpadConfig { hold_ms: 3001, ..c }, NumpadConfig { idle_dim_secs: 3601, ..c }] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+        let (cfg, err) = { let d = tempfile::tempdir().unwrap(); let p = d.path().join("c.toml");
+            std::fs::write(&p, "[numpad]\nidle_dim_secs = 0\n").unwrap(); Config::load(&p) };
+        assert!(err.is_none());
+        assert_eq!((cfg.numpad.idle_dim_secs, cfg.numpad.start_brightness), (0, 8), "missing keys take defaults");
     }
 }
