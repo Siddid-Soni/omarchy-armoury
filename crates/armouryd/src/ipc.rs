@@ -865,8 +865,13 @@ impl Daemon {
                 if in_slot { self.reapply_manual().await; }
                 Response::ok(serde_json::to_value(raw.iter().filter_map(fan::from_raw).collect::<Vec<_>>()).unwrap())
             }
-            Request::SaveManualProfile { profile, original_name } => {
+            Request::SaveManualProfile { mut profile, original_name } => {
                 if let Err(r) = self.write_guard().await { return r; }
+                if profile.curves.is_empty() {
+                    // a brand-new profile starts from its base mode's current curves (read only)
+                    let raw = with_retry(|| self.asusd.fan_curves(profile.base.to_asusd())).await.unwrap_or_default();
+                    profile.curves = manual::default_profile(&profile.name, &raw).curves;
+                }
                 if let Err(e) = manual::validate_profile(&profile, self.bounds().await) { return Response::err(e); }
                 let reapply = {
                     let mut cfg = self.config.lock().await;
@@ -2349,5 +2354,16 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
         let v = r.d.handle(Request::ManualProfiles).await;
         assert!(v.ok && v.data.unwrap()["profiles"][0]["name"] == "Gaming");
         assert_eq!(r.d.refresh().await.perf.mode, Some(ModeChoice::Balanced), "Manual shows only while active");
+    }
+
+    #[tokio::test]
+    async fn new_profile_without_curves_gets_the_base_modes_curves() {
+        let r = mrig(true, "");
+        r.asusd.curves.lock().unwrap().insert(2, vec![("CPU".into(), [0, 25, 51, 76, 102, 153, 204, 255], [30, 40, 50, 60, 70, 80, 90, 100], true)]);
+        let p: ManualProfile = serde_json::from_value(serde_json::json!({"name":"Quiet work","base":"quiet"})).unwrap();
+        assert!(r.d.handle(Request::SaveManualProfile { profile: p, original_name: None }).await.ok);
+        let saved = r.d.config.lock().await.manual.profiles[0].clone();
+        assert_eq!(saved.curves.len(), 1, "copied from asusd's Silent slot");
+        assert!(!acalls_of(&r).iter().any(|c| c.starts_with("reset_fan_curves") || c.starts_with("set_fan_curve")), "read only: {:?}", acalls_of(&r));
     }
 }

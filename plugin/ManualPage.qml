@@ -98,6 +98,14 @@ Flickable {
       color: root.fg; opacity: 0.7; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall
     }
 
+    Text {
+      visible: root.view.profiles.length === 0
+      width: parent.width
+      wrapMode: Text.WordWrap
+      text: "No manual profiles yet. New creates one from the chosen mode's current fan curves."
+      color: root.fg; opacity: 0.7; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall
+    }
+
     // ---------- profile picker ----------
     Row {
       width: parent.width
