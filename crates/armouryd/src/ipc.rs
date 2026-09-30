@@ -334,7 +334,7 @@ impl Daemon {
         }
         let Some(now) = self.snap.borrow().as_ref().and_then(|s| s.keystone) else { return };
         let before = self.keystone_seen.lock().unwrap().replace(now);
-        if before.is_none_or(|b| b == now) { return; }
+        if before.is_none_or(|b| b == now) || !self.config.lock().await.keystone.enabled { return; }
         self.on_keystone(if now { KeystoneEvent::Insert } else { KeystoneEvent::Remove }).await;
     }
 
@@ -1272,10 +1272,10 @@ impl Daemon {
                     Err(e) => Response::err(format!("save config: {e}")),
                 }
             }
-            Request::SetKeystoneFlash { on } => {
+            Request::SetKeystoneFlash { on } | Request::SetKeystoneEnabled { on } => {
                 if let Err(r) = self.write_guard().await { return r; }
                 let mut cfg = self.config.lock().await;
-                cfg.keystone.flash = on;
+                if matches!(req, Request::SetKeystoneFlash { .. }) { cfg.keystone.flash = on } else { cfg.keystone.enabled = on }
                 match cfg.save(&self.config_path) {
                     Ok(()) => Response::ok(serde_json::to_value(&cfg.keystone).unwrap()),
                     Err(e) => Response::err(format!("save config: {e}")),
@@ -3131,6 +3131,19 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
         assert!(w.len() > 30 && w[1..].iter().all(|l| l.starts_with("1 packets")), "then only the Keystone packet: {} writes", w.len());
         assert!(w.iter().any(|l| l.ends_with("keystone 255") || l.split(' ').last().unwrap().parse::<u8>().unwrap() > 240), "reaches full: {w:?}");
         assert_eq!(acalls(&r), ["set_mode_data 0"], "the effect is re-applied");
+    }
+
+    #[tokio::test]
+    async fn keystone_master_switch_off_does_nothing() {
+        let (r, log, status) = music_rig(true, "[keystone]\nenabled = false\n[keystone.insert]\nlight = \"music\"\n[keystone.remove]\nlock = true\n");
+        status.lock().unwrap().0 = armoury_proto::MusicState::Off;
+        for v in ["1", "0", "1"] { set_keystone(&r, v); keystone_step(&r).await; }
+        assert!(spawned(&r).is_empty() && !mlog(&log).iter().any(|l| l.starts_with("set") || l == "flash"), "{:?}", mlog(&log));
+        assert!(!r.svc.calls.lock().unwrap().iter().any(|c| c.contains("Keystone")), "no OSD either");
+        assert!(r.d.handle(req(serde_json::json!({"cmd":"set_keystone_enabled","on":true}))).await.ok);
+        assert!(r.d.config.lock().await.keystone.enabled);
+        set_keystone(&r, "0"); keystone_step(&r).await;
+        assert!(spawned(&r).last().is_some_and(|c| c.ends_with("omarchy-system-lock")), "back on: remove locks");
     }
 
     #[tokio::test]

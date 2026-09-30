@@ -614,6 +614,8 @@ pub enum Request {
     SetKeystoneAction { event: KeystoneEvent, action: KeystoneAction },
     /// Flash the Keystone LED when it is inserted.
     SetKeystoneFlash { on: bool },
+    /// Master switch: off = nothing happens on insert/remove (no OSD, actions or flash).
+    SetKeystoneEnabled { on: bool },
     SetMusicConfig {
         #[serde(default)] style: Option<MusicStyle>,
         #[serde(default)] scheme: Option<MusicScheme>,

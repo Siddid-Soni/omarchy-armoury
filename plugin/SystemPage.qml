@@ -171,11 +171,21 @@ Flickable {
       width: parent.width
       wrapMode: Text.WordWrap
       text: (root.snap && root.snap.keystone === true ? "Inserted." : root.snap && root.snap.keystone === false ? "Not inserted." : "")
-        + " Actions run within 2 s of inserting or removing it, while Armoury is in control."
+        + (root.ks && root.ks.enabled === false ? " Keystone actions are off: nothing happens on insert or remove."
+          : " Actions run within 2 s of inserting or removing it, while Armoury is in control.")
       color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption
     }
     ChoiceRow {
       visible: !!root.ks
+      fg: root.fg
+      label: "Keystone actions"
+      usable: root.usable
+      options: root.onOff()
+      value: root.ks ? root.ks.enabled !== false : undefined
+      onChosen: function(v) { root.client.run({ cmd: "set_keystone_enabled", on: v }, function() { root.reload() }) }
+    }
+    ChoiceRow {
+      visible: !!root.ks && root.ks.enabled !== false
       fg: root.fg
       label: "Flash the Keystone light on insert"
       usable: root.usable
@@ -184,7 +194,7 @@ Flickable {
       onChosen: function(v) { root.client.run({ cmd: "set_keystone_flash", on: v }, function() { root.reload() }) }
     }
     Repeater {
-      model: root.ks ? [{ ev: "insert", title: "When inserted" }, { ev: "remove", title: "When removed" }] : []
+      model: root.ks && root.ks.enabled !== false ? [{ ev: "insert", title: "When inserted" }, { ev: "remove", title: "When removed" }] : []
       Column {
         id: ksCol
         required property var modelData
