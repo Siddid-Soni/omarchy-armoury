@@ -10,9 +10,17 @@ Column {
   property var series: []
   property real minimum: NaN      // NaN = fit the data
   property real maximum: NaN
+  // when fitting the data, show at least this range, so small wobbles stay small
+  property real minSpan: 0
+  // keep the fitted range inside these
+  property real floor: -Infinity
+  property real ceiling: Infinity
   property real graphHeight: Style.space(44)
   property color fg: Color.foreground
   property string fontFamily: Style.font.family
+  // set from the window's open state: a hidden canvas doesn't paint, so repaint when shown
+  property bool shown: true
+  onShownChanged: if (shown) Qt.callLater(canvas.requestPaint)
 
   width: parent ? parent.width : 0
   spacing: Style.space(4)
@@ -38,8 +46,9 @@ Column {
         if (all.length === 0) return
         var mn = Math.min.apply(null, all), mx = Math.max.apply(null, all)
         var pad = Math.max((mx - mn) * 0.15, 1)
-        if (isNaN(lo)) lo = mn - pad
-        if (isNaN(hi)) hi = mx + pad
+        var grow = Math.max(0, root.minSpan - (mx - mn + 2 * pad)) / 2
+        if (isNaN(lo)) lo = Math.max(root.floor, mn - pad - grow)
+        if (isNaN(hi)) hi = Math.min(root.ceiling, mx + pad + grow)
       }
       var span = Math.max(hi - lo, 1e-6)
       for (var i = 0; i < root.series.length; i++) {
