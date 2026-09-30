@@ -93,7 +93,8 @@ pub trait Asusd: Send + Sync {
     async fn set_charge_limit(&self, percent: u8) -> anyhow::Result<()>;
     async fn one_shot_charge(&self) -> anyhow::Result<()>;
     /// asusd's own AC/battery profile switching: sets the profile for each given source and enables switching for it.
-    async fn set_source_profiles(&self, ac: Option<u32>, battery: Option<u32>) -> anyhow::Result<()>;
+    /// Turns off asusd's own AC/battery mode switching (armouryd does it; asusd doesn't know Manual).
+    async fn disable_source_switching(&self) -> anyhow::Result<()>;
     async fn armoury_set_value(&self, attr: &str, value: i32) -> anyhow::Result<()>;
 }
 
@@ -123,7 +124,7 @@ impl<T: Asusd + ?Sized> Asusd for std::sync::Arc<T> {
     async fn set_profile_epp(&self, profile: u32, epp: u32) -> anyhow::Result<()> { (**self).set_profile_epp(profile, epp).await }
     async fn set_charge_limit(&self, percent: u8) -> anyhow::Result<()> { (**self).set_charge_limit(percent).await }
     async fn one_shot_charge(&self) -> anyhow::Result<()> { (**self).one_shot_charge().await }
-    async fn set_source_profiles(&self, ac: Option<u32>, battery: Option<u32>) -> anyhow::Result<()> { (**self).set_source_profiles(ac, battery).await }
+    async fn disable_source_switching(&self) -> anyhow::Result<()> { (**self).disable_source_switching().await }
     async fn armoury_set_value(&self, attr: &str, value: i32) -> anyhow::Result<()> { (**self).armoury_set_value(attr, value).await }
 }
 

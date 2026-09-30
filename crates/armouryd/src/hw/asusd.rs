@@ -109,10 +109,11 @@ impl Asusd for AsusdClient {
         Ok(self.platform().await?.set_charge_control_end_threshold(percent).await?)
     }
     async fn one_shot_charge(&self) -> anyhow::Result<()> { Ok(self.platform().await?.one_shot_full_charge().await?) }
-    async fn set_source_profiles(&self, ac: Option<u32>, battery: Option<u32>) -> anyhow::Result<()> {
+    async fn disable_source_switching(&self) -> anyhow::Result<()> {
+        // armouryd switches modes on AC/battery itself (asusd doesn't know Manual)
         let p = self.platform().await?;
-        if let Some(v) = ac { p.set_platform_profile_on_ac(v).await?; p.set_change_platform_profile_on_ac(true).await?; }
-        if let Some(v) = battery { p.set_platform_profile_on_battery(v).await?; p.set_change_platform_profile_on_battery(true).await?; }
+        p.set_change_platform_profile_on_ac(false).await?;
+        p.set_change_platform_profile_on_battery(false).await?;
         Ok(())
     }
     async fn armoury_set_value(&self, attr: &str, value: i32) -> anyhow::Result<()> {

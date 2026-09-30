@@ -323,7 +323,7 @@ impl Daemon {
                     Ok(serde_json::json!({"mode": mode}))
                 }
                 Request::SetSourceProfile { ac, battery } => {
-                    with_retry(|| self.asusd.set_source_profiles(ac.and_then(ModeChoice::stock).map(Profile::to_asusd), battery.and_then(ModeChoice::stock).map(Profile::to_asusd))).await?;
+                    with_retry(|| self.asusd.disable_source_switching()).await?;
                     let mut cfg = self.config.lock().await;
                     if ac.is_some() { cfg.system.profile_ac = ac; }
                     if battery.is_some() { cfg.system.profile_battery = battery; }
@@ -488,6 +488,7 @@ impl Daemon {
         }
         self.follow_power_source(&snap).await;
         self.follow_system(&snap).await;
+        let snap = if self.follow_source_mode(&snap, st).await { self.refresh().await } else { snap };
         let now = tokio::time::Instant::now();
         if self.uv.lock().unwrap().is_none() && self.config.lock().await.manual.profiles.iter().any(|p| p.settings.uv_mv.is_some())
             && st.probe_retry_at.is_none_or(|t| now >= t)
@@ -680,6 +681,32 @@ impl Daemon {
             return Response::err(format!("mode changed, but its settings failed: {}", errs.join("; ")));
         }
         Response::ok(serde_json::to_value(self.refresh().await).unwrap())
+    }
+
+    /// On a real AC↔battery flip, set up the mode configured for the new source; the rest of
+    /// this tick applies it. Runs inside tick_locked (apply lock held), so it changes the
+    /// policy directly instead of calling choose_mode, which would deadlock.
+    /// The first tick after start/takeover only records the source.
+    async fn follow_source_mode(&self, snap: &Snapshot, st: &mut ApplyState) -> bool {
+        let Some(ac) = snap.lighting.on_ac else { return false };
+        let prev = self.sys_src.lock().unwrap().mode_on_ac.replace(ac);
+        if prev != Some(!ac) { return false; }
+        let want = { let c = self.config.lock().await; if ac { c.system.profile_ac } else { c.system.profile_battery } };
+        let Some(choice) = want else { return false };
+        if choice == ModeChoice::Manual { self.ensure_manual_profile().await; }
+        {
+            let mut cfg = self.config.lock().await;
+            cfg.manual.enabled = choice == ModeChoice::Manual;
+            if let Err(e) = cfg.save(&self.config_path) { eprintln!("armouryd: save config: {e}"); }
+        }
+        if let Some(p) = choice.stock() {
+            if let Err(e) = with_retry(|| self.asusd.set_profile(p.to_asusd())).await {
+                eprintln!("armouryd: power-source mode: {e:#}");
+                return false;
+            }
+            st.mode_just_set = true;
+        }
+        true
     }
 
     /// Manual when it's on, unless the firmware mode was changed away from the applied
@@ -1010,6 +1037,8 @@ struct SysSource {
     retry_at: Option<tokio::time::Instant>,
     /// Last time the applied refresh rate was re-checked.
     last_check: Option<tokio::time::Instant>,
+    /// Power source seen by the mode switch (None until the first active tick).
+    mode_on_ac: Option<bool>,
 }
 
 const REFRESH_RECHECK: Duration = Duration::from_secs(60);
@@ -1907,15 +1936,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_profiles_go_to_asusd() {
+    async fn source_profiles_saved_and_asusd_switching_disabled() {
         let r = sys_rig(true, "");
-        assert!(r.d.handle(sreq(serde_json::json!({"cmd":"set_source_profile","ac":"performance","battery":"quiet"}))).await.ok);
-        assert_eq!(*r.asusd.calls.lock().unwrap(), ["set_source_profiles Some(1) Some(2)"]);
+        assert!(r.d.handle(sreq(serde_json::json!({"cmd":"set_source_profile","ac":"manual","battery":"quiet"}))).await.ok);
+        assert_eq!(*r.asusd.calls.lock().unwrap(), ["disable_source_switching"]);
         let cfg = r.d.config.lock().await.system.clone();
-        assert_eq!((cfg.profile_ac, cfg.profile_battery), (Some(ModeChoice::Performance), Some(ModeChoice::Quiet)), "remembered for the UI");
-        assert!(r.d.handle(sreq(serde_json::json!({"cmd":"set_source_profile","battery":"balanced"}))).await.ok);
-        let cfg = r.d.config.lock().await.system.clone();
-        assert_eq!((cfg.profile_ac, cfg.profile_battery), (Some(ModeChoice::Performance), Some(ModeChoice::Balanced)));
+        assert_eq!((cfg.profile_ac, cfg.profile_battery), (Some(ModeChoice::Manual), Some(ModeChoice::Quiet)));
+    }
+
+    #[tokio::test]
+    async fn power_source_flip_switches_mode() {
+        let r = sys_rig(true, &format!("[system]\nprofile_ac = \"manual\"\nprofile_battery = \"quiet\"\n{GAMING}"));
+        *r.asusd.mirror.lock().unwrap() = Some(r.sys.clone());
+        r.sys.files.lock().unwrap().insert("sys/firmware/acpi/platform_profile".into(), "balanced".into());
+        r.d.tick().await; // first tick on AC: no switch
+        assert_eq!(r.d.refresh().await.perf.mode, Some(ModeChoice::Balanced));
+        plug(&r, false);
+        r.d.tick().await;
+        assert_eq!(r.d.refresh().await.perf.mode, Some(ModeChoice::Quiet));
+        plug(&r, true);
+        r.d.tick().await;
+        let s = r.d.refresh().await;
+        assert_eq!(s.perf.mode, Some(ModeChoice::Manual));
+        assert!(r.asusd.calls.lock().unwrap().iter().any(|c| c == "set_fan_curve 1 CPU"), "manual applied in the same tick");
     }
 
     #[tokio::test]

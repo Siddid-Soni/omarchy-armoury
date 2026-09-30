@@ -283,9 +283,7 @@ impl Asusd for FakeAsusd {
     async fn set_profile_epp(&self, profile: u32, epp: u32) -> anyhow::Result<()> { self.record(format!("set_profile_epp {profile} {epp}")) }
     async fn set_charge_limit(&self, percent: u8) -> anyhow::Result<()> { self.record(format!("set_charge_limit {percent}")) }
     async fn one_shot_charge(&self) -> anyhow::Result<()> { self.record("one_shot_charge".into()) }
-    async fn set_source_profiles(&self, ac: Option<u32>, battery: Option<u32>) -> anyhow::Result<()> {
-        self.record(format!("set_source_profiles {ac:?} {battery:?}"))
-    }
+    async fn disable_source_switching(&self) -> anyhow::Result<()> { self.record("disable_source_switching".into()) }
     async fn armoury_set_value(&self, attr: &str, value: i32) -> anyhow::Result<()> { self.record(format!("armoury_set_value {attr} {value}")) }
 }
 
@@ -355,8 +353,8 @@ mod tests {
         let a = FakeAsusd::default();
         a.set_charge_limit(80).await.unwrap();
         a.one_shot_charge().await.unwrap();
-        a.set_source_profiles(Some(1), None).await.unwrap();
+        a.disable_source_switching().await.unwrap();
         a.armoury_set_value("panel_overdrive", 0).await.unwrap();
-        assert_eq!(*a.calls.lock().unwrap(), ["set_charge_limit 80", "one_shot_charge", "set_source_profiles Some(1) None", "armoury_set_value panel_overdrive 0"]);
+        assert_eq!(*a.calls.lock().unwrap(), ["set_charge_limit 80", "one_shot_charge", "disable_source_switching", "armoury_set_value panel_overdrive 0"]);
     }
 }
