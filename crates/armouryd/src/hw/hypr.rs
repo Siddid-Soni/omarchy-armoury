@@ -13,6 +13,8 @@ pub trait Hypr: Send + Sync {
     async fn numlock(&self) -> anyhow::Result<bool>;
     /// Keyboard repeats per second (`input:repeat_rate`).
     async fn repeat_rate(&self) -> anyhow::Result<u32>;
+    /// Keyboard delay before repeating, ms (`input:repeat_delay`).
+    async fn repeat_delay(&self) -> anyhow::Result<u32>;
 }
 
 #[async_trait::async_trait]
@@ -22,6 +24,7 @@ impl<T: Hypr + ?Sized> Hypr for std::sync::Arc<T> {
     async fn gamma(&self, pct: u8) -> anyhow::Result<()> { (**self).gamma(pct).await }
     async fn numlock(&self) -> anyhow::Result<bool> { (**self).numlock().await }
     async fn repeat_rate(&self) -> anyhow::Result<u32> { (**self).repeat_rate().await }
+    async fn repeat_delay(&self) -> anyhow::Result<u32> { (**self).repeat_delay().await }
 }
 
 pub fn parse_repeat_rate(json: &str) -> anyhow::Result<u32> {
@@ -109,6 +112,7 @@ impl Hypr for RealHypr {
     async fn monitors(&self) -> anyhow::Result<Vec<DisplayInfo>> { parse_monitors(&hyprctl(&["monitors", "-j"]).await?) }
     async fn numlock(&self) -> anyhow::Result<bool> { parse_numlock(&hyprctl(&["devices", "-j"]).await?) }
     async fn repeat_rate(&self) -> anyhow::Result<u32> { parse_repeat_rate(&hyprctl(&["getoption", "input:repeat_rate", "-j"]).await?) }
+    async fn repeat_delay(&self) -> anyhow::Result<u32> { parse_repeat_rate(&hyprctl(&["getoption", "input:repeat_delay", "-j"]).await?) }
 
 
     async fn eval(&self, lua: &str) -> anyhow::Result<()> {
@@ -131,6 +135,7 @@ mod tests {
     #[test]
     fn repeat_rate_from_getoption_json() {
         assert_eq!(parse_repeat_rate(r#"{"option":"input:repeat_rate","int":40,"set":true}"#).unwrap(), 40);
+        assert_eq!(parse_repeat_rate(r#"{"option":"input:repeat_delay","int":300,"set":true}"#).unwrap(), 300, "same shape for the delay");
         assert!(parse_repeat_rate(r#"{"option":"x"}"#).is_err());
     }
 

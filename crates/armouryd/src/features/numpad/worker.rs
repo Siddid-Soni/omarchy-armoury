@@ -23,14 +23,15 @@ pub trait NumpadIo: Send {
     fn key(&mut self, code: u16, down: bool) -> std::io::Result<()>;
 }
 
-/// `kb_rate`: the keyboard's repeats per second, used when the NumberPad's own rate is 0.
-fn settings(c: &NumpadConfig, kb_rate: u32) -> Settings {
-    let rate = if c.repeat_rate_hz > 0 { c.repeat_rate_hz } else { kb_rate }.max(1);
+/// `kb`: the keyboard's (repeat delay ms, repeats per second), used where the NumberPad's own are 0.
+fn settings(c: &NumpadConfig, kb: (u32, u32)) -> Settings {
+    let rate = if c.repeat_rate_hz > 0 { c.repeat_rate_hz } else { kb.1 }.max(1);
+    let delay = if c.repeat_delay_ms > 0 { c.repeat_delay_ms } else { kb.0 };
     Settings {
         hold: Duration::from_millis(c.hold_ms as u64),
         idle: (c.idle_dim_secs > 0).then(|| Duration::from_secs(c.idle_dim_secs as u64)),
         start_level: c.start_brightness,
-        repeat_delay: (c.repeat_delay_ms > 0).then(|| Duration::from_millis(c.repeat_delay_ms as u64)),
+        repeat_delay: c.key_repeat.then(|| Duration::from_millis(delay as u64)),
         repeat_every: Duration::from_millis((1000 / rate).max(1) as u64),
     }
 }
@@ -71,8 +72,9 @@ pub async fn run_worker(
         };
         backoff = 0;
         *state.lock().unwrap() = NumpadState::Off;
-        // the keyboard's repeat rate (NumberPad repeat follows it unless set); 25/s if Hyprland can't say
-        let mut kb_rate = hypr.repeat_rate().await.unwrap_or(25);
+        // the keyboard's repeat delay and rate (NumberPad repeat follows them unless set);
+        // Hyprland's defaults (600 ms, 25/s) if it can't say
+        let mut kb = keyboard_repeat(&*hypr, (600, 25)).await;
         let mut pad = Pad::new();
         let mut mt = MtDecoder::default();
         let area = io.area();
@@ -87,19 +89,19 @@ pub async fn run_worker(
                         Some(t) => {
                             let (x, y) = match t { Touch::Down { x, y } | Touch::Move { x, y } => (x, y), Touch::Up => (0, 0) };
                             let hit = if matches!(t, Touch::Up) { Hit::None } else { layout.hit(&area, x, y) };
-                            pad.touch(t, hit, &settings(&cfg, kb_rate), tokio::time::Instant::now().into_std())
+                            pad.touch(t, hit, &settings(&cfg, kb), tokio::time::Instant::now().into_std())
                         }
                         None => Vec::new(),
                     },
                 },
-                _ = tick.tick() => pad.tick(&settings(&cfg, kb_rate), tokio::time::Instant::now().into_std()),
+                _ = tick.tick() => pad.tick(&settings(&cfg, kb), tokio::time::Instant::now().into_std()),
                 // a resting finger's key repeats on its own schedule, finer than the tick
                 _ = async {
                     match pad.next_repeat() {
                         Some(t) => tokio::time::sleep_until(tokio::time::Instant::from_std(t)).await,
                         None => std::future::pending().await,
                     }
-                } => pad.tick(&settings(&cfg, kb_rate), tokio::time::Instant::now().into_std()),
+                } => pad.tick(&settings(&cfg, kb), tokio::time::Instant::now().into_std()),
                 cmd = cmds.recv() => match cmd {
                     None => break Ok(()),
                     Some(Cmd::Env { active: a, touchpad_enabled: t }) => {
@@ -109,10 +111,10 @@ pub async fn run_worker(
                     }
                     Some(Cmd::Config(c)) => {
                         cfg = c;
-                        kb_rate = hypr.repeat_rate().await.unwrap_or(kb_rate);
+                        kb = keyboard_repeat(&*hypr, kb).await;
                         pad.set_allowed(tp_on || cfg.allow_when_touchpad_off)
                     }
-                    Some(Cmd::Set(on)) => pad.set_on(on, &settings(&cfg, kb_rate), tokio::time::Instant::now().into_std()),
+                    Some(Cmd::Set(on)) => pad.set_on(on, &settings(&cfg, kb), tokio::time::Instant::now().into_std()),
                 },
             };
             if let Err(e) = apply(&mut *io, &*hypr, actions).await { break Err(e); }
@@ -134,6 +136,10 @@ pub async fn run_worker(
             tokio::time::sleep(crate::features::keys::backoff(0)).await;
         }
     }
+}
+
+async fn keyboard_repeat(hypr: &dyn Hypr, fallback: (u32, u32)) -> (u32, u32) {
+    (hypr.repeat_delay().await.unwrap_or(fallback.0), hypr.repeat_rate().await.unwrap_or(fallback.1))
 }
 
 /// Backlight failures are logged, not fatal (the NumberPad works unlit); grab / key failures end the session.
@@ -342,5 +348,16 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(700)).await; settle().await;
         let n = log(&r).iter().filter(|l| *l == "key 76 true").count();
         assert!(n >= 1 + 4, "600 ms delay, then every 25 ms (not every 100 ms tick): {n} presses in {:?}", log(&r));
+    }
+
+    #[test]
+    fn repeat_settings_follow_the_keyboard_unless_set() {
+        let kb = (300, 40); // this machine's input:repeat_delay / repeat_rate
+        let d = settings(&NumpadConfig::default(), kb);
+        assert_eq!((d.repeat_delay, d.repeat_every), (Some(Duration::from_millis(300)), Duration::from_millis(25)));
+        let own = settings(&NumpadConfig { repeat_delay_ms: 800, repeat_rate_hz: 10, ..NumpadConfig::default() }, kb);
+        assert_eq!((own.repeat_delay, own.repeat_every), (Some(Duration::from_millis(800)), Duration::from_millis(100)));
+        let off = settings(&NumpadConfig { key_repeat: false, ..NumpadConfig::default() }, kb);
+        assert_eq!(off.repeat_delay, None);
     }
 }

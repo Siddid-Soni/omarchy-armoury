@@ -1012,7 +1012,7 @@ impl Daemon {
                 }
                 Response::ok(serde_json::json!({"on": on}))
             }
-            Request::SetNumpadConfig { start_brightness, allow_when_touchpad_off, idle_dim_secs, hold_ms, repeat_delay_ms, repeat_rate_hz } => {
+            Request::SetNumpadConfig { start_brightness, allow_when_touchpad_off, idle_dim_secs, hold_ms, key_repeat, repeat_delay_ms, repeat_rate_hz } => {
                 if let Err(r) = self.write_guard().await { return r; }
                 let mut cfg = self.config.lock().await;
                 let mut n = cfg.numpad;
@@ -1020,6 +1020,7 @@ impl Daemon {
                 if let Some(v) = allow_when_touchpad_off { n.allow_when_touchpad_off = v; }
                 if let Some(v) = idle_dim_secs { n.idle_dim_secs = v; }
                 if let Some(v) = hold_ms { n.hold_ms = v; }
+                if let Some(v) = key_repeat { n.key_repeat = v; }
                 if let Some(v) = repeat_delay_ms { n.repeat_delay_ms = v; }
                 if let Some(v) = repeat_rate_hz { n.repeat_rate_hz = v; }
                 if let Err(e) = n.validate() { return Response::err(e); }

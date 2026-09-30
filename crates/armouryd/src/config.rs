@@ -157,14 +157,16 @@ pub struct NumpadConfig {
     pub idle_dim_secs: u32,
     /// Top-right icon hold that toggles the NumberPad.
     pub hold_ms: u32,
-    /// A finger resting on a key repeats it after this long (0 = never).
+    /// A finger resting on a key repeats it.
+    pub key_repeat: bool,
+    /// Delay before the first repeat (0 = the keyboard's, from Hyprland).
     pub repeat_delay_ms: u32,
     /// Repeats per second after the delay (0 = the keyboard's own rate, from Hyprland).
     pub repeat_rate_hz: u32,
 }
 
 impl Default for NumpadConfig {
-    fn default() -> Self { Self { start_brightness: 8, allow_when_touchpad_off: false, idle_dim_secs: 60, hold_ms: 1000, repeat_delay_ms: 600, repeat_rate_hz: 0 } }
+    fn default() -> Self { Self { start_brightness: 8, allow_when_touchpad_off: false, idle_dim_secs: 60, hold_ms: 1000, key_repeat: true, repeat_delay_ms: 0, repeat_rate_hz: 0 } }
 }
 
 impl NumpadConfig {
@@ -172,7 +174,7 @@ impl NumpadConfig {
         if !(1..=8).contains(&self.start_brightness) { return Err("NumberPad brightness must be 1–8".into()); }
         if !(300..=3000).contains(&self.hold_ms) { return Err("hold time must be 300–3000 ms".into()); }
         if self.idle_dim_secs > 3600 { return Err("idle timeout must be 0–3600 s".into()); }
-        if self.repeat_delay_ms != 0 && !(200..=2000).contains(&self.repeat_delay_ms) { return Err("key repeat delay must be 0 (off) or 200–2000 ms".into()); }
+        if self.repeat_delay_ms != 0 && !(100..=2000).contains(&self.repeat_delay_ms) { return Err("key repeat delay must be 0 (keyboard's) or 100–2000 ms".into()); }
         if self.repeat_rate_hz > 100 { return Err("key repeat rate must be 0 (keyboard's) to 100 per second".into()); }
         Ok(())
     }
@@ -278,9 +280,10 @@ mod tests {
     #[test]
     fn numpad_defaults_and_validation() {
         let c = NumpadConfig::default();
-        assert_eq!((c.start_brightness, c.allow_when_touchpad_off, c.idle_dim_secs, c.hold_ms, c.repeat_delay_ms), (8, false, 60, 1000, 600));
-        assert!(NumpadConfig { repeat_delay_ms: 0, ..c }.validate().is_ok(), "0 = no repeat");
-        assert!(NumpadConfig { repeat_delay_ms: 100, ..c }.validate().is_err());
+        assert_eq!((c.start_brightness, c.allow_when_touchpad_off, c.idle_dim_secs, c.hold_ms), (8, false, 60, 1000));
+        assert_eq!((c.key_repeat, c.repeat_delay_ms, c.repeat_rate_hz), (true, 0, 0), "repeat on, delay and rate = the keyboard's");
+        assert!(NumpadConfig { repeat_delay_ms: 0, ..c }.validate().is_ok());
+        assert!(NumpadConfig { repeat_delay_ms: 50, ..c }.validate().is_err(), "below 100 ms");
         assert_eq!(c.repeat_rate_hz, 0, "0 = the keyboard's own repeat rate");
         assert!(NumpadConfig { repeat_rate_hz: 30, ..c }.validate().is_ok());
         assert!(NumpadConfig { repeat_rate_hz: 101, ..c }.validate().is_err());

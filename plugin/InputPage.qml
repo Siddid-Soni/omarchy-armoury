@@ -42,7 +42,7 @@ Flickable {
     { label: "Run command", value: "command" }
   ]
 
-  readonly property var np: cfg.numpad || ({ start_brightness: 8, allow_when_touchpad_off: false, idle_dim_secs: 60, hold_ms: 1000, repeat_delay_ms: 600, repeat_rate_hz: 0 })
+  readonly property var np: cfg.numpad || ({ start_brightness: 8, allow_when_touchpad_off: false, idle_dim_secs: 60, hold_ms: 1000, key_repeat: true, repeat_delay_ms: 0, repeat_rate_hz: 0 })
   function setNp(key, v) { var r = { cmd: "set_numpad_config" }; r[key] = v; client.run(r, function() { root.reload() }) }
 
   function bindKey(key, action, command) {
@@ -148,15 +148,25 @@ Flickable {
       usable: root.usable
       onCommitted: function(v) { root.setNp("idle_dim_secs", v) }
     }
+    ChoiceRow {
+      fg: root.fg
+      label: "Key repeat (finger resting on a key)"
+      usable: root.usable
+      options: [{ label: "On", value: true }, { label: "Off", value: false }]
+      value: root.np.key_repeat !== false
+      onChosen: function(v) { root.setNp("key_repeat", v) }
+    }
     ValueSlider {
-      fg: root.fg; label: "Key repeat delay (0 = no repeat)"; unit: "ms"
+      visible: root.np.key_repeat !== false
+      fg: root.fg; label: "Key repeat delay (0 = same as the keyboard)"; unit: "ms"
       minimum: 0; maximum: 2000; step: 50
       value: root.np.repeat_delay_ms
       usable: root.usable
-      // 1–199 isn't a valid delay: snap it to "off"
-      onCommitted: function(v) { root.setNp("repeat_delay_ms", v > 0 && v < 200 ? 0 : v) }
+      // 1–99 isn't a valid delay: snap it to "same as the keyboard"
+      onCommitted: function(v) { root.setNp("repeat_delay_ms", v > 0 && v < 100 ? 0 : v) }
     }
     ValueSlider {
+      visible: root.np.key_repeat !== false
       fg: root.fg; label: "Key repeat rate (0 = same as the keyboard)"; unit: "/s"
       minimum: 0; maximum: 100; step: 1
       value: root.np.repeat_rate_hz
