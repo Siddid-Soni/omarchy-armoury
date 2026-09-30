@@ -1,21 +1,51 @@
 # omarchy-armoury
 
-ASUS ROG control for Omarchy: a Rust daemon (`armouryd`), CLI (`armoury`),
-root helper (`armoury-root`) and, in later milestones, an Omarchy bar popup
-and window. Replaces G-Helper. Design: `docs/superpowers/specs/`.
+ASUS ROG control for Omarchy. A bar widget and a full settings window
+(the `asus.armoury` Omarchy plugin), backed by a Rust daemon (`armouryd`),
+a CLI (`armoury`) and a root helper (`armoury-root`).
+Design: `docs/superpowers/specs/`.
+
+## Plugin features
+
+### Bar widget
+
+- Shows the current performance mode and, optionally, CPU temperature.
+- Click for a popup with:
+  - **Mode**: Silent, Balanced, Turbo.
+  - **GPU mode**: Integrated, Hybrid, Ultimate (confirmation required; applies after reboot).
+  - **Quick toggles**: keyboard brightness, touchpad, lid-closed-awake on AC,
+    panel overdrive, boot sound, music.
+  - Battery and fan summary, and a shortcut to open the full window.
+- Widget settings: dim the keyboard after N idle seconds, show or hide temperature.
+
+### Window
+
+- **Fans**: per-fan (CPU, GPU, mid) custom curves per mode. Drag points to edit,
+  Shift-drag moves the whole curve, reset to firmware auto at any time.
+- **CPU / GPU**: per-mode power tuning.
+  - CPU: PL1 / PL2 power limits, CPU boost, energy preference (EPP), core + cache undervolt (when the BIOS allows it).
+  - NVIDIA: Dynamic Boost, temperature target, core and memory clock offsets.
+  - Live GPU status: clocks, temperature, power, load, VRAM, and what is keeping the dGPU awake.
+- **Lighting**: keyboard brightness (remembered separately on AC and battery),
+  effects with colours, speed and direction, and per-zone control including logo and lightbar.
+- **Battery**: charge, health, cycles, voltage, draw and time left; charge limit
+  with a one-shot "charge to 100%".
+- **Input**: bind the ROG key, Fn+F5 and Fn+F4 (Aura) to open Armoury, cycle mode,
+  cycle keyboard brightness, cycle lighting effect, or run any command; touchpad toggle.
+- **System**: panel refresh rate on AC and on battery, overdrive and gamma,
+  performance mode on AC and on battery, sleep mode, lid-closed behaviour, boot sound.
+
+### Daemon extras
+
+- OSD for Fn+F2 / Fn+F3 keyboard brightness and the mode key.
+- Stock modes send only the firmware policy change; Manual mode applies your own
+  limits and fan curves, serialized to keep the embedded controller happy.
 
 ## Install
 
     ./install.sh
 
-armouryd starts in **observe** mode: it reads hardware state and changes
-nothing, so G-Helper keeps working.
-
     armoury status          # what the daemon sees
-    armoury takeover        # stop G-Helper, start asusd, armouryd controls hardware
-    armoury handback        # stop asusd, restart G-Helper
-
-While active, G-Helper will not autostart at login.
 
 ## asusd lighting fix
 
