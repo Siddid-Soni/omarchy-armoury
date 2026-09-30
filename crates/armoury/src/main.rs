@@ -31,6 +31,11 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<ProfileAction>,
     },
+    /// Show or switch the NumberPad (armouryd in control only)
+    Numpad {
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+    },
     /// List manual-mode profiles (* in use, - active but a stock mode is on)
     Manual {
         #[command(subcommand)]
@@ -492,6 +497,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let s: Snapshot = serde_json::from_value(call(&req)?)?;
             println!("{}", s.perf.mode.map(|m| m.label()).unwrap_or("-"));
         }
+        Cmd::Numpad { state: None } => {
+            let s: Snapshot = serde_json::from_value(call(&Request::Status)?)?;
+            println!("{}", serde_json::to_value(s.system.numpad)?.as_str().unwrap_or("-"));
+        }
+        Cmd::Numpad { state: Some(st) } => { call(&Request::SetNumpad { on: st == "on" })?; }
         Cmd::Manual { action } => {
             let req = match action {
                 None => Request::ManualProfiles,

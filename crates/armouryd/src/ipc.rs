@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::control::{Control, ModeHandle, handback, takeover};
-use crate::features::{fan, manual};
+use crate::features::{fan, manual, numpad};
 use crate::features::limits::{self, Bounds, Limit};
 use crate::features::perf::{HwCtx, apply_mode, apply_nv, nv_is_stock};
 use crate::features::lighting::{effect_from_raw, effect_to_raw, power_from_raw, set_zone, validate_effect};
@@ -10,7 +10,7 @@ use crate::hw::{Asusd, Aura, Gfx, Nvidia, Services, Sysfs, with_retry};
 use crate::state::collect;
 use anyhow::{Context, bail};
 use crate::features::gpu::plan_switch;
-use armoury_proto::{HotKey, KeyAction, Toggle, ControlMode, Event, GpuMode, GpuStep, GpuSwitchResult, ManualProfile, ManualView, ModeChoice, ModeSettings, Profile, Request, Response, Snapshot, UndervoltState};
+use armoury_proto::{HotKey, KeyAction, Toggle, ControlMode, Event, GpuMode, GpuStep, GpuSwitchResult, ManualProfile, ManualView, ModeChoice, ModeSettings, NumpadState, Profile, Request, Response, Snapshot, UndervoltState};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,6 +49,10 @@ pub struct Daemon {
     sys_src: std::sync::Mutex<SysSource>,
     state_dir: PathBuf,
     last_reapply: std::sync::Mutex<tokio::time::Instant>,
+    /// NumberPad worker commands, its published state, and the (active, touchpad on) last sent to it.
+    numpad_tx: Option<tokio::sync::mpsc::Sender<numpad::worker::Cmd>>,
+    numpad_state: Arc<std::sync::Mutex<NumpadState>>,
+    numpad_env: std::sync::Mutex<Option<(bool, bool)>>,
 }
 
 impl Daemon {
@@ -71,6 +75,9 @@ impl Daemon {
             lid_awake: std::sync::Mutex::new(None),
             sys_src: std::sync::Mutex::new(SysSource::default()),
             state_dir, last_reapply: std::sync::Mutex::new(tokio::time::Instant::now()),
+            numpad_tx: None,
+            numpad_state: Arc::new(std::sync::Mutex::new(NumpadState::Unavailable)),
+            numpad_env: std::sync::Mutex::new(None),
         })
     }
 
@@ -91,6 +98,17 @@ impl Daemon {
         let mut d = Arc::try_unwrap(self).ok().expect("with_clamshell before the daemon is shared");
         d.clamshell = Mutex::new(c);
         Arc::new(d)
+    }
+
+    pub fn with_numpad(self: Arc<Self>, tx: tokio::sync::mpsc::Sender<numpad::worker::Cmd>, state: Arc<std::sync::Mutex<NumpadState>>) -> Arc<Self> {
+        let mut d = Arc::try_unwrap(self).ok().expect("with_numpad before the daemon is shared");
+        d.numpad_tx = Some(tx);
+        d.numpad_state = state;
+        Arc::new(d)
+    }
+
+    fn numpad_send(&self, c: numpad::worker::Cmd) -> bool {
+        self.numpad_tx.as_ref().is_some_and(|tx| tx.try_send(c).is_ok())
     }
 
     pub fn with_home(self: Arc<Self>, home: PathBuf) -> Arc<Self> {
@@ -129,7 +147,11 @@ impl Daemon {
         };
         match action {
             KeyAction::None => {}
-            KeyAction::ToggleNumpad => {} // wired in plan 8 task 5
+            KeyAction::ToggleNumpad => {
+                let on = *self.numpad_state.lock().unwrap() == NumpadState::On;
+                let r = self.handle(Request::SetNumpad { on: !on }).await;
+                if !r.ok { self.osd("keyboard", &format!("NumberPad: {}", r.error.unwrap_or_default())).await; }
+            }
             KeyAction::CycleMode => {
                 // Keys are handled one at a time and switch_profile holds the apply lock,
                 // so presses are serialized: each switch finishes before the next starts
@@ -482,6 +504,10 @@ impl Daemon {
     }
 
     async fn tick_locked(&self, st: &mut ApplyState, force: bool) -> Vec<String> {
+        let env = (self.mode.get() == ControlMode::Active, self.touchpad_enabled());
+        if *self.numpad_env.lock().unwrap() != Some(env) && self.numpad_send(numpad::worker::Cmd::Env { active: env.0, touchpad_enabled: env.1 }) {
+            *self.numpad_env.lock().unwrap() = Some(env);
+        }
         let snap = self.refresh().await;
         if self.mode.get() != ControlMode::Active {
             *st = ApplyState::default(); // re-apply after the next takeover
@@ -845,6 +871,7 @@ impl Daemon {
         s.apply_error = self.apply_error.lock().unwrap().clone();
         s.gpu.armoury_pending = self.gpu_record();
         s.system.touchpad = Some(self.touchpad_enabled());
+        s.system.numpad = *self.numpad_state.lock().unwrap();
         {
             let cfg = self.config.lock().await;
             s.perf.mode = if mode == ControlMode::Active && cfg.manual.enabled { Some(ModeChoice::Manual) } else { s.perf.profile.map(ModeChoice::from) };
@@ -975,7 +1002,31 @@ impl Daemon {
                 }
             }
             Request::Config => Response::ok(serde_json::to_value(&*self.config.lock().await).unwrap()),
-            Request::SetNumpad { .. } | Request::SetNumpadConfig { .. } => Response::err("NumberPad not available"), // task 5
+            Request::SetNumpad { on } => {
+                if let Err(r) = self.write_guard().await { return r; }
+                if on && !self.touchpad_enabled() && !self.config.lock().await.numpad.allow_when_touchpad_off {
+                    return Response::err("the touchpad is off (allow the NumberPad while it's off in Input settings)");
+                }
+                if *self.numpad_state.lock().unwrap() == NumpadState::Unavailable || !self.numpad_send(numpad::worker::Cmd::Set(on)) {
+                    return Response::err("NumberPad not available");
+                }
+                Response::ok(serde_json::json!({"on": on}))
+            }
+            Request::SetNumpadConfig { start_brightness, allow_when_touchpad_off, idle_dim_secs, hold_ms } => {
+                if let Err(r) = self.write_guard().await { return r; }
+                let mut cfg = self.config.lock().await;
+                let mut n = cfg.numpad;
+                if let Some(v) = start_brightness { n.start_brightness = v; }
+                if let Some(v) = allow_when_touchpad_off { n.allow_when_touchpad_off = v; }
+                if let Some(v) = idle_dim_secs { n.idle_dim_secs = v; }
+                if let Some(v) = hold_ms { n.hold_ms = v; }
+                if let Err(e) = n.validate() { return Response::err(e); }
+                cfg.numpad = n;
+                if let Err(e) = cfg.save(&self.config_path) { return Response::err(format!("save config: {e}")); }
+                drop(cfg);
+                self.numpad_send(numpad::worker::Cmd::Config(n));
+                Response::ok(serde_json::to_value(n).unwrap())
+            }
             Request::Keys => Response::ok(serde_json::to_value(self.config.lock().await.keys.clone()).unwrap()),
             Request::SetKeyBinding { key, action, command } => {
                 if let Err(r) = self.write_guard().await { return r; }
@@ -2509,5 +2560,50 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
         r.d.on_hotkey(armoury_proto::HotKey::Fan).await;
         assert!(svc_calls(&r).iter().any(|c| c.ends_with("-m Turbo mode")), "Balanced → Turbo: {:?}", svc_calls(&r));
         assert_eq!(r.d.refresh().await.perf.mode, Some(ModeChoice::Performance), "our choice overrides the EC's");
+    }
+
+    fn numpad_rig(active: bool, toml: &str) -> (SysRig, tokio::sync::mpsc::Receiver<crate::features::numpad::worker::Cmd>, Arc<std::sync::Mutex<armoury_proto::NumpadState>>) {
+        let SysRig { d, sys, asusd, svc, hypr, dir } = sys_rig(active, toml);
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let state = Arc::new(std::sync::Mutex::new(armoury_proto::NumpadState::Off));
+        let d = d.with_numpad(tx, state.clone()); // builders take self: Arc<Self> (like with_hypr)
+        (SysRig { d, sys, asusd, svc, hypr, dir }, rx, state)
+    }
+
+    #[tokio::test]
+    async fn numpad_requests_and_snapshot() {
+        use crate::features::numpad::worker::Cmd;
+        let (r, mut rx, state) = numpad_rig(true, "");
+        assert!(r.d.handle(sreq(serde_json::json!({"cmd":"set_numpad","on":true}))).await.ok);
+        let mut got_set = false;
+        while let Ok(c) = rx.try_recv() { if matches!(c, Cmd::Set(true)) { got_set = true; } }
+        assert!(got_set);
+        *state.lock().unwrap() = armoury_proto::NumpadState::On;
+        assert_eq!(r.d.refresh().await.system.numpad, armoury_proto::NumpadState::On);
+        assert!(r.d.handle(sreq(serde_json::json!({"cmd":"set_numpad_config","idle_dim_secs":0}))).await.ok);
+        assert_eq!(r.d.config.lock().await.numpad.idle_dim_secs, 0);
+        assert!(!r.d.handle(sreq(serde_json::json!({"cmd":"set_numpad_config","hold_ms":50}))).await.ok, "validated");
+    }
+
+    #[tokio::test]
+    async fn numpad_refused_in_observe_and_when_touchpad_off() {
+        let (o, _rx, _s) = numpad_rig(false, "");
+        assert!(o.d.handle(sreq(serde_json::json!({"cmd":"set_numpad","on":true}))).await.error.unwrap().contains("observe"));
+        let (r, _rx, _s) = numpad_rig(true, "");
+        let off = r.dir.path().join("home/.local/state/omarchy/toggles/hypr");
+        std::fs::create_dir_all(&off).unwrap();
+        std::fs::write(off.join("touchpad-disabled-name"), "x").unwrap();
+        assert!(r.d.handle(sreq(serde_json::json!({"cmd":"set_numpad","on":true}))).await.error.unwrap().contains("touchpad"));
+    }
+
+    #[tokio::test]
+    async fn tick_tells_the_worker_about_mode_and_touchpad() {
+        use crate::features::numpad::worker::Cmd;
+        let (r, mut rx, _s) = numpad_rig(true, "");
+        r.d.tick().await;
+        let envs: Vec<(bool, bool)> = std::iter::from_fn(|| rx.try_recv().ok()).filter_map(|c| match c { Cmd::Env { active, touchpad_enabled } => Some((active, touchpad_enabled)), _ => None }).collect();
+        assert_eq!(envs, [(true, true)]);
+        r.d.tick().await;
+        assert!(rx.try_recv().is_err(), "unchanged: not re-sent");
     }
 }

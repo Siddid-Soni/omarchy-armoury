@@ -45,7 +45,8 @@ setup
 run; rc=$?
 check "udev rule removed" 'grep -q "sudo rm -f .*/etc/udev/rules.d/70-omarchy-armoury.rules" "$T/log"'
 
-# 5. the shipped rule only grants the N-KEY keyboard, via uaccess
-check "udev rule scoped to the N-KEY device" 'grep -q "ATTRS{name}==\"ASUSTek Computer Inc. N-KEY Device\"" "$repo/packaging/udev/70-omarchy-armoury.rules" && grep -q "TAG+=\"uaccess\"" "$repo/packaging/udev/70-omarchy-armoury.rules" && ! grep -q "MODE=\"0666\"" "$repo/packaging/udev/70-omarchy-armoury.rules"'
+# 5. the shipped rules grant only via uaccess (N-KEY, touchpad, i2c, uinput), never world-writable
+R="$repo/packaging/udev/70-omarchy-armoury.rules"
+check "udev rules grant only via uaccess (N-KEY, touchpad, i2c, uinput)" 'grep -q "ATTRS{name}==\"ASUSTek Computer Inc. N-KEY Device\"" "$R" && grep -q "ASUE\* Touchpad" "$R" && grep -q "SUBSYSTEM==\"i2c-dev\", TAG+=\"uaccess\"" "$R" && grep -q "KERNEL==\"uinput\"" "$R" && ! grep -q "MODE=" "$R"'
 
 exit $fail

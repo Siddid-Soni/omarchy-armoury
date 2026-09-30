@@ -3,3 +3,12 @@
 # (ROG key = KEY_PROG1, Fn+F5 = KEY_PROG4). uaccess grants an ACL to the active seat
 # user only; nothing is made world-readable.
 SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="ASUSTek Computer Inc. N-KEY Device", TAG+="uaccess"
+
+# NumberPad (armouryd, active mode only): read the touchpad (and grab it while the
+# NumberPad is on), write its backlight over i2c, type keys through a virtual keyboard.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="ASUE* Touchpad", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="ASUF* Touchpad", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="ASUP* Touchpad", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="ELAN* Touchpad", TAG+="uaccess"
+SUBSYSTEM=="i2c-dev", TAG+="uaccess"
+KERNEL=="uinput", OPTIONS+="static_node=uinput", TAG+="uaccess"
