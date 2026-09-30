@@ -127,8 +127,10 @@ toolchain (`cargo`, to build the daemon).
 
 The first command adds the bar widget and window. The second builds and installs the
 daemon: the plugin does nothing without it, and the popup says so until it runs.
-`install.sh` asks for sudo once (see *What it installs*). It ends by putting armouryd
-in control, which starts asusd and stops G-Helper if it's installed. The build goes to
+`install.sh` lists what it installs and asks before it starts, then asks for sudo once
+(see *What it installs*). It asks again before adding the SUPER+W line to your
+`bindings.lua`, and before stopping G-Helper if it's installed. At the end, armouryd
+takes control and starts asusd. The build goes to
 `~/.cache/omarchy-armoury`, not the plugin folder.
 
 ## Usage
@@ -162,8 +164,10 @@ Unix socket (`$XDG_RUNTIME_DIR/armoury.sock`). Everything else comes from `insta
   - `~/.local/bin/armouryd`, `~/.local/bin/armoury`
   - the `armouryd` user service
   - `~/.config/omarchy-armoury/config.toml`
-  - `~/.config/hypr/omarchy-armoury.lua`, plus one line in `bindings.lua` (SUPER+W closes the window)
-  - a drop-in that keeps G-Helper from autostarting while armouryd is in control
+  - `~/.config/hypr/omarchy-armoury.lua`, plus one line in `bindings.lua` (SUPER+W closes
+    the window), added only if you say yes
+  - a drop-in that keeps G-Helper from autostarting while armouryd is in control (asked
+    first, if G-Helper is installed)
 - **Root helper**: `/usr/local/lib/omarchy-armoury/armoury-root`, run through `pkexec`.
   - A polkit rule lets *your user* run it **without a password**.
   - It only has a fixed set of commands, and it re-checks every argument:
