@@ -15,6 +15,15 @@ implementation after the in-chat design.
 - `pw-record --raw --format f32 --rate 48000 --channels 1 -P '{ stream.capture.sink = true }' -`
   captures the default output (follows default-sink changes).
 - USB HID only: no EC/ACPI calls, no polling.
+- G533 LED map differences from g-helper (measured with the user):
+  - The space bar is LEDs 130–133, left to right; g-helper maps only 131.
+  - The Keystone LED is 175; g-helper's "KSTN" LED 0 lights nothing. Music leaves it off,
+    because the user reserves it for Keystone actions.
+  - The light bar under the display mirrors F5 (28) and Delete (37). It lights in direct
+    mode only when the power packet's **lid** zone is on. asusd's support entry lacked
+    `Lid`, so the support fix now adds it and the Lighting page gains a Lid row. With
+    Spectrum, the bar lights when the F5/Delete bars reach the top row, which is what the
+    user wanted (pulsing it with loudness was rejected).
 
 ## Behaviour
 
@@ -22,7 +31,7 @@ implementation after the in-chat design.
   rise bottom-up) and **Pulse** (everything follows loudness).
 - Colour schemes: **Gradient** (colour 1 → colour 2; by bar height in
   Spectrum, by loudness in Pulse), **Rainbow** (hue by column), **Single**
-  (colour 1). Lightbar, logo and lid follow overall loudness.
+  (colour 1). Front lightbar, logo and lid LEDs follow overall loudness.
 - Automatic gain plus a sensitivity 1–10 (default 5); instant attack, ~0.5 s fall.
 - Silence (≈1 s below −70 dBFS): keys off, one frame sent, then nothing until sound returns.
 - 30 fps cap; unchanged frames are not sent.
