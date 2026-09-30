@@ -124,7 +124,7 @@ Flickable {
       visible: root.sys.numpad === "unavailable" || root.sys.numpad === undefined
       width: parent.width
       wrapMode: Text.WordWrap
-      text: root.usable ? "No NumberPad touchpad found." : "The NumberPad works while armouryd is in control (Take over)."
+      text: "No NumberPad touchpad found."
       color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption
     }
     ChoiceRow {

@@ -34,4 +34,8 @@ sudo "$LIB/armoury-root" asusd-support-fix
 systemctl --user daemon-reload
 systemctl --user enable --now armouryd.service
 
-echo "Installed. armouryd is observing; run 'armoury takeover' to let it control the hardware."
+# armouryd takes control: starts asusd (and stops G-Helper, if it is installed)
+for _ in $(seq 1 20); do ~/.local/bin/armoury status >/dev/null 2>&1 && break; sleep 0.5; done
+~/.local/bin/armoury takeover
+
+echo "Installed. Armoury is in control; open it from the bar or with the ROG key."
