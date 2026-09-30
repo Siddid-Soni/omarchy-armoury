@@ -66,6 +66,22 @@ pub fn packets(frame: &Frame) -> Vec<[u8; PACKET_LEN]> {
     out
 }
 
+/// How long the Keystone LED flashes when the Keystone goes in.
+pub const KEYSTONE_FLASH: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Keystone LED brightness `elapsed` into a flash: fades in and out (the LED is red only).
+pub fn keystone_flash_level(elapsed: std::time::Duration) -> u8 {
+    let t = elapsed.as_secs_f32() / KEYSTONE_FLASH.as_secs_f32();
+    if !(0.0..1.0).contains(&t) { return 0; }
+    (255.0 * (std::f32::consts::PI * t).sin()).round() as u8
+}
+
+/// The lightbar/logo/lid packet alone (LEDs 167 on): the Keystone LED is in it, so a flash
+/// over a still frame only resends this packet.
+pub fn ambient_packet(frame: &Frame) -> [u8; PACKET_LEN] {
+    *packets(frame).last().unwrap()
+}
+
 /// A key row: (LED index, width in key units), left to right.
 type Row = &'static [(u8, f32)];
 
@@ -148,6 +164,20 @@ mod tests {
         assert_eq!(p[11][..9], [0x5D, 0xBC, 0, 1, 4, 0, 0, 0, 0]);
         assert_eq!(p[11][9..12], [7, 8, 9]);
         assert_eq!(p[11][9 + 30..12 + 30], [10, 11, 12], "LED 177 = 11th slot of the lightbar packet");
+    }
+
+    #[test]
+    fn keystone_flash_fades_in_and_out() {
+        use std::time::Duration;
+        assert_eq!(keystone_flash_level(Duration::ZERO), 0);
+        assert_eq!(keystone_flash_level(KEYSTONE_FLASH / 2), 255);
+        assert!(keystone_flash_level(KEYSTONE_FLASH / 4) > 150 && keystone_flash_level(KEYSTONE_FLASH / 4) < 200);
+        assert_eq!(keystone_flash_level(KEYSTONE_FLASH), 0);
+        let mut f = Frame::default();
+        f.0[KEYSTONE_LED as usize] = [9, 0, 0];
+        let p = ambient_packet(&f);
+        assert_eq!(p[4], 4, "the lightbar/logo packet");
+        assert_eq!(p[9 + 3 * 8], 9, "Keystone = slot 8");
     }
 
     #[test]

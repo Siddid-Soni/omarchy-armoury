@@ -15,6 +15,20 @@ pub struct Config {
     pub keys: KeysConfig,
     pub numpad: NumpadConfig,
     pub music: MusicConfig,
+    pub keystone: KeystoneConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeystoneConfig {
+    pub insert: armoury_proto::KeystoneAction,
+    pub remove: armoury_proto::KeystoneAction,
+    /// Flash the Keystone LED when it goes in.
+    pub flash: bool,
+}
+
+impl Default for KeystoneConfig {
+    fn default() -> Self { Self { insert: Default::default(), remove: Default::default(), flash: true } }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -302,6 +316,18 @@ mod tests {
         let (old, err) = Config::load(&path);
         assert!(err.is_none(), "old [modes] must not make the config bad: {err:?}");
         assert!(old.modes.is_none(), "legacy table dropped after load");
+    }
+
+    #[test]
+    fn keystone_config_round_trip() {
+        let (cfg, err) = { let d = tempfile::tempdir().unwrap(); let p = d.path().join("c.toml");
+            std::fs::write(&p, "[keystone.insert]\nmode = \"performance\"\nlight = \"music\"\n[keystone.remove]\nlight = \"previous\"\nlock = true\n").unwrap(); Config::load(&p) };
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(cfg.keystone.insert.mode, Some(armoury_proto::ModeChoice::Performance));
+        assert_eq!(cfg.keystone.insert.light, armoury_proto::KeystoneLight::Music);
+        assert!(cfg.keystone.remove.lock && cfg.keystone.flash, "flash defaults on");
+        let text = toml::to_string(&cfg).unwrap();
+        assert_eq!(toml::from_str::<Config>(&text).unwrap().keystone, cfg.keystone);
     }
 
     #[test]

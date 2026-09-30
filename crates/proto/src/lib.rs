@@ -226,6 +226,36 @@ pub enum NumpadState {
     On,
 }
 
+/// Lighting change when the Keystone goes in or out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeystoneLight {
+    #[default]
+    Unchanged,
+    Music,
+    /// Back to what was on before the last insert changed it (remove only).
+    Previous,
+    /// This effect, with the current colours and speed.
+    #[serde(untagged)]
+    Effect(AuraMode),
+}
+
+/// What armouryd does when the Keystone is inserted or removed (active mode).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeystoneAction {
+    pub mode: Option<ModeChoice>,
+    pub light: KeystoneLight,
+    /// Shell command, run detached.
+    pub command: Option<String>,
+    /// Lock the screen (remove only).
+    pub lock: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeystoneEvent { Insert, Remove }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HotKey {
@@ -580,6 +610,10 @@ pub enum Request {
     },
     /// Music lighting on/off (active mode; remembered).
     SetMusic { on: bool },
+    /// Replaces the actions for one Keystone event.
+    SetKeystoneAction { event: KeystoneEvent, action: KeystoneAction },
+    /// Flash the Keystone LED when it is inserted.
+    SetKeystoneFlash { on: bool },
     SetMusicConfig {
         #[serde(default)] style: Option<MusicStyle>,
         #[serde(default)] scheme: Option<MusicScheme>,
@@ -764,6 +798,18 @@ mod tests {
         let r: Request = serde_json::from_str(r#"{"cmd":"set_numpad_config","idle_dim_secs":0}"#).unwrap();
         assert_eq!(r, Request::SetNumpadConfig { start_brightness: None, allow_when_touchpad_off: None, idle_dim_secs: Some(0), hold_ms: None, key_repeat: None, repeat_delay_ms: None, repeat_rate_hz: None });
         assert_eq!(serde_json::from_str::<KeyAction>("\"toggle_numpad\"").unwrap(), KeyAction::ToggleNumpad);
+    }
+
+    #[test]
+    fn keystone_wire_format() {
+        let a: KeystoneAction = serde_json::from_str(r#"{"mode":"performance","light":"rainbow_wave","command":"notify-send hi"}"#).unwrap();
+        assert_eq!((a.mode, a.light, a.lock), (Some(ModeChoice::Performance), KeystoneLight::Effect(AuraMode::RainbowWave), false));
+        for (s, l) in [("\"music\"", KeystoneLight::Music), ("\"previous\"", KeystoneLight::Previous), ("\"unchanged\"", KeystoneLight::Unchanged), ("\"static\"", KeystoneLight::Effect(AuraMode::Static))] {
+            assert_eq!(serde_json::from_str::<KeystoneLight>(s).unwrap(), l);
+            assert_eq!(serde_json::to_string(&l).unwrap(), s);
+        }
+        let r: Request = serde_json::from_str(r#"{"cmd":"set_keystone_action","event":"remove","action":{"lock":true,"light":"previous"}}"#).unwrap();
+        assert_eq!(r, Request::SetKeystoneAction { event: KeystoneEvent::Remove, action: KeystoneAction { lock: true, light: KeystoneLight::Previous, ..Default::default() } });
     }
 
     #[test]
