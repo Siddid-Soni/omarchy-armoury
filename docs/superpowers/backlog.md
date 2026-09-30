@@ -25,13 +25,11 @@ Proposed approach (not yet approved):
 - First step: a key-capture session with the user to list the exact codes
   each key sends.
 
-## Keystone LED in music lighting — for Plan 10, 2026-09-30
+## Keystone LED — for Plan 10, 2026-09-30
 
-The light bar under the display is the Keystone LED. It stays dark while music lighting
-is on: direct-mode frames don't drive it. We send loudness to LED 0 (g-helper's "KSTN"),
-and lighting-packet slots 8–17 (LEDs 175+) had no effect either. It does light with
-normal asusd effects. Find out how to drive it (another report or zone), or leave it on
-its effect while music runs.
+The Keystone LED is direct-mode LED 175 (slot 8 of the lightbar/logo packet), confirmed on
+the G533ZW. g-helper's "KSTN" LED 0 lights nothing. Music lighting drives 175 with the
+ambient lights. Plan 10 can use it, e.g. to flash on insert/remove.
 
 ## Other deferred items
 

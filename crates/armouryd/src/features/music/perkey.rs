@@ -70,7 +70,9 @@ pub fn packets(frame: &Frame) -> Vec<[u8; PACKET_LEN]> {
 type Row = &'static [(u8, f32)];
 
 /// ROG Strix Scar 15 (G533): the g-helper per-key map without the 17" numpad LEDs.
-/// Four LEDs g-helper leaves unnamed (120, 140, 141, 143) are placed by the arrow keys.
+/// The light bar under the display (Lid power zone) mirrors F5 (28) and Delete (37): it lights
+/// when their spectrum bars reach the top row. Four LEDs g-helper leaves unnamed (120, 140, 141, 143) are placed by the arrow keys. The
+/// space bar has four LEDs, 130–133 left to right (measured on a G533ZW; g-helper maps only 131).
 const G533_ROWS: [Row; 7] = [
     // Vol-, Vol+, mic mute, fan, Armoury Crate: above F1–F5 (placed on the F-row's grid below)
     &[(2, 1.0), (3, 1.0), (4, 1.0), (5, 1.0), (6, 1.0)],
@@ -90,11 +92,14 @@ const G533_ROWS: [Row; 7] = [
     &[(105, 1.25), (106, 1.0), (107, 1.0), (108, 1.0), (109, 1.0), (110, 1.0), (111, 1.0), (112, 1.0),
       (113, 1.0), (114, 1.0), (115, 1.0), (116, 1.0), (117, 0.6), (118, 0.6), (119, 0.6), (120, 0.5), (139, 1.0), (121, 1.0)],
     // Ctrl Fn Win Alt Space Alt Fn Ctrl, Left Down Right, (140 141 143), PrtSc
-    &[(126, 1.25), (127, 1.0), (128, 1.0), (129, 1.25), (131, 6.0), (135, 1.0), (136, 1.0), (137, 1.0),
+    &[(126, 1.25), (127, 1.0), (128, 1.0), (129, 1.25), (130, 1.5), (131, 1.5), (132, 1.5), (133, 1.5), (135, 1.0), (136, 1.0), (137, 1.0),
       (159, 1.0), (160, 1.0), (161, 1.0), (140, 0.3), (141, 0.3), (143, 0.3), (142, 1.0)],
 ];
-/// Lightbar (left→right), Keystone, logo, lid left/right.
-const G533_AMBIENT: &[u8] = &[174, 173, 172, 171, 170, 169, 0, 167, 176, 177];
+/// Lightbar (left→right), logo, lid left/right. Not the Keystone LED (175; g-helper's "KSTN"
+/// LED 0 lights nothing): it stays off, reserved for Keystone actions.
+const G533_AMBIENT: &[u8] = &[174, 173, 172, 171, 170, 169, 167, 176, 177];
+/// The Keystone slot's LED (measured on a G533ZW).
+pub const KEYSTONE_LED: u8 = 175;
 
 fn build(rows: &[Row], ambient: &[u8]) -> Layout {
     let mut leds = Vec::new();
@@ -162,8 +167,12 @@ mod tests {
         }
         let x = |i: u8| match l.leds.iter().find(|l| l.idx == i).unwrap().place { Place::Key { x, .. } => x, _ => panic!() };
         assert!(x(21) < 0.05 && x(41) > 0.95, "Esc far left, Home far right");
-        assert!((x(131) - 0.4).abs() < 0.1, "space bar near the middle");
+        assert!(x(130) < x(131) && x(131) < x(132) && x(132) < x(133), "space bar LEDs left to right");
+        assert!((x(131) - 0.4).abs() < 0.1 && (x(132) - 0.45).abs() < 0.1, "space bar near the middle");
         assert!(x(2) > x(21) && x(6) < 0.4, "media keys over F1–F5");
+        let place = |i: u8| l.leds.iter().find(|l| l.idx == i).unwrap().place;
+        assert!(l.leds.iter().all(|l| l.idx != KEYSTONE_LED), "Keystone LED left off (Keystone actions only)");
+        assert!(matches!(place(28), Place::Key { row: 1, .. }), "F5 (and the display bar that mirrors it) is a spectrum key");
         assert!(layout_for("ROG Zephyrus G14").is_none());
     }
 }

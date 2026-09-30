@@ -12,3 +12,7 @@ SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="ASUP* Touchpad", TAG+="uacce
 SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="ELAN* Touchpad", TAG+="uaccess"
 SUBSYSTEM=="i2c-dev", TAG+="uaccess"
 KERNEL=="uinput", OPTIONS+="static_node=uinput", TAG+="uaccess"
+
+# Music lighting (armouryd, active mode only): per-key frames to the laptop keyboard's
+# Aura controller over hidraw. Laptop keyboard product IDs from g-helper-linux.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="1a30|1854|1869|1866|19b6|1822|1837|184a|183d|8502|1807|17e0|1abe|1b4c|1b6e|1b2c|8854|1ce7|1bf2", TAG+="uaccess"

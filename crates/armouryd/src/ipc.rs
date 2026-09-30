@@ -57,6 +57,10 @@ pub struct Daemon {
     music_tx: Option<tokio::sync::mpsc::Sender<music::worker::Cmd>>,
     music_status: music::worker::Status,
     music_env: std::sync::Mutex<Option<bool>>,
+    /// Set from the NumberPad/music release until the handback has finished: the poll tick
+    /// must not tell a released worker that armouryd is still active (it would restart just
+    /// before asusd stops).
+    handing_back: std::sync::atomic::AtomicBool,
 }
 
 impl Daemon {
@@ -85,6 +89,7 @@ impl Daemon {
             music_tx: None,
             music_status: Arc::new(std::sync::Mutex::new((armoury_proto::MusicState::Unavailable, None))),
             music_env: std::sync::Mutex::new(None),
+            handing_back: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -577,7 +582,8 @@ impl Daemon {
     }
 
     async fn tick_locked(&self, st: &mut ApplyState, force: bool) -> Vec<String> {
-        let env = (self.mode.get() == ControlMode::Active, self.touchpad_enabled());
+        let active = self.mode.get() == ControlMode::Active && !self.handing_back.load(std::sync::atomic::Ordering::SeqCst);
+        let env = (active, self.touchpad_enabled());
         if *self.numpad_env.lock().unwrap() != Some(env) && self.numpad_send(numpad::worker::Cmd::Env { active: env.0, touchpad_enabled: env.1 }) {
             *self.numpad_env.lock().unwrap() = Some(env);
         }
@@ -977,7 +983,9 @@ impl Daemon {
             }
             Request::Subscribe => Response::ok(serde_json::Value::Null),
             Request::Takeover | Request::Handback => {
-                if req == Request::Handback && self.mode.get() == ControlMode::Active {
+                let releasing = req == Request::Handback && self.mode.get() == ControlMode::Active;
+                if releasing {
+                    self.handing_back.store(true, std::sync::atomic::Ordering::SeqCst);
                     self.release_numpad().await;
                     self.release_music().await;
                     self.reset_to_stock().await;
@@ -986,6 +994,8 @@ impl Daemon {
                     let mut ctl = self.control.lock().await;
                     if req == Request::Takeover { takeover(&mut ctl, &*self.svc).await } else { handback(&mut ctl, &*self.svc).await }
                 };
+                // a failed handback leaves armouryd active: the next tick restarts the workers
+                if releasing { self.handing_back.store(false, std::sync::atomic::Ordering::SeqCst); }
                 let snap = self.refresh().await;
                 match result {
                     Ok(()) => Response::ok(serde_json::to_value(snap).unwrap()),
@@ -2844,5 +2854,16 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
         r.d.on_hotkey(HotKey::Rog).await;
         assert_eq!(mlog(&log), ["set true", "set false"]);
         assert!(r.svc.calls.lock().unwrap().iter().any(|c| c.contains("Music lighting off")));
+    }
+
+    #[tokio::test]
+    async fn a_tick_during_handback_does_not_restart_released_workers() {
+        let (r, log, _s) = music_rig(true, "");
+        r.d.tick().await; // env true
+        r.d.handing_back.store(true, std::sync::atomic::Ordering::SeqCst); // released, mode not yet observe
+        *r.d.music_env.lock().unwrap() = Some(false);
+        r.d.tick().await;
+        tokio::task::yield_now().await;
+        assert_eq!(mlog(&log), ["env true"], "no Env {{ active: true }} between release and observe");
     }
 }

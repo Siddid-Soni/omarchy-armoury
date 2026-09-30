@@ -36,6 +36,11 @@ enum Cmd {
         #[arg(value_parser = ["on", "off"])]
         state: Option<String>,
     },
+    /// Music-reactive lighting: show, on/off/toggle, or change its settings (armouryd in control only)
+    Music {
+        #[command(subcommand)]
+        action: Option<MusicAction>,
+    },
     /// List manual-mode profiles (* in use, - active but a stock mode is on)
     Manual {
         #[command(subcommand)]
@@ -214,7 +219,7 @@ enum LightAction {
 
 #[derive(Subcommand)]
 enum KeysAction {
-    /// Bind a key: none|open-window|cycle-mode|cycle-brightness|cycle-effect|command
+    /// Bind a key: none|open-window|cycle-mode|cycle-brightness|cycle-effect|toggle-numpad|toggle-music|command
     Set {
         #[arg(value_parser = ["rog", "fan", "aura"])]
         key: String,
@@ -232,7 +237,30 @@ fn parse_mode_choice(s: &str) -> Result<ModeChoice, String> {
 
 fn parse_key_action(s: &str) -> Result<KeyAction, String> {
     serde_json::from_value(serde_json::json!(s.replace('-', "_")))
-        .map_err(|_| format!("unknown action {s:?} (none|open-window|cycle-mode|cycle-brightness|cycle-effect|command)"))
+        .map_err(|_| format!("unknown action {s:?} (none|open-window|cycle-mode|cycle-brightness|cycle-effect|toggle-numpad|toggle-music|command)"))
+}
+
+#[derive(Subcommand)]
+enum MusicAction {
+    On,
+    Off,
+    Toggle,
+    /// Change settings; unspecified ones keep their value
+    Set {
+        #[arg(long, value_parser = ["spectrum", "pulse"])]
+        style: Option<String>,
+        #[arg(long, value_parser = ["gradient", "rainbow", "single"])]
+        scheme: Option<String>,
+        /// Colour 1 (bottom of the bars / quiet), RRGGBB
+        #[arg(long, value_parser = parse_colour)]
+        color1: Option<[u8; 3]>,
+        /// Colour 2 (top of the bars / loud), RRGGBB
+        #[arg(long, value_parser = parse_colour)]
+        color2: Option<[u8; 3]>,
+        /// 1–10: how much of the music lights up
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=10))]
+        sensitivity: Option<u8>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -502,6 +530,32 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", serde_json::to_value(s.system.numpad)?.as_str().unwrap_or("-"));
         }
         Cmd::Numpad { state: Some(st) } => { call(&Request::SetNumpad { on: st == "on" })?; }
+        Cmd::Music { action: None } => {
+            let s: Snapshot = serde_json::from_value(call(&Request::Status)?)?;
+            let cfg = call(&Request::Config)?;
+            let m = &cfg["music"];
+            let hex = |v: &serde_json::Value| v.as_array().map(|a| a.iter().map(|b| format!("{:02x}", b.as_u64().unwrap_or(0))).collect::<String>()).unwrap_or_default();
+            println!("State       {}", serde_json::to_value(s.lighting.music)?.as_str().unwrap_or("-"));
+            if let Some(e) = s.lighting.music_error { println!("Error       {e}"); }
+            println!("Style       {}", m["style"].as_str().unwrap_or("-"));
+            println!("Scheme      {}", m["scheme"].as_str().unwrap_or("-"));
+            println!("Colours     {} {}", hex(&m["colour1"]), hex(&m["colour2"]));
+            println!("Sensitivity {}", m["sensitivity"]);
+        }
+        Cmd::Music { action: Some(MusicAction::On) } => { call(&Request::SetMusic { on: true })?; }
+        Cmd::Music { action: Some(MusicAction::Off) } => { call(&Request::SetMusic { on: false })?; }
+        Cmd::Music { action: Some(MusicAction::Toggle) } => {
+            let s: Snapshot = serde_json::from_value(call(&Request::Status)?)?;
+            call(&Request::SetMusic { on: s.lighting.music != armoury_proto::MusicState::On })?;
+        }
+        Cmd::Music { action: Some(MusicAction::Set { style, scheme, color1, color2, sensitivity }) } => {
+            let enm = |v: Option<String>| v.map(serde_json::Value::String);
+            call(&Request::SetMusicConfig {
+                style: enm(style).map(serde_json::from_value).transpose()?,
+                scheme: enm(scheme).map(serde_json::from_value).transpose()?,
+                colour1: color1, colour2: color2, sensitivity,
+            })?;
+        }
         Cmd::Manual { action } => {
             let req = match action {
                 None => Request::ManualProfiles,
@@ -618,5 +672,6 @@ mod tests {
         assert_eq!(parse_key_action("cycle-mode"), Ok(armoury_proto::KeyAction::CycleMode));
         assert_eq!(parse_key_action("open-window"), Ok(armoury_proto::KeyAction::OpenWindow));
         assert!(parse_key_action("reboot").is_err());
+        assert_eq!(parse_key_action("toggle-music"), Ok(armoury_proto::KeyAction::ToggleMusic));
     }
 }

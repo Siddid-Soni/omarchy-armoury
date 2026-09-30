@@ -99,8 +99,12 @@ pub async fn run_worker(io: Io, layout: Option<Layout>, mut cmds: mpsc::Receiver
         *status.lock().unwrap() = (MusicState::On, None);
         let lit = match lit_override { Some(l) => l, None => io.effects.lit().await.unwrap_or_default() };
         let mut ack: Option<oneshot::Sender<()>> = None;
+        eprintln!("armouryd: music: started");
         let end = session(&io, layout, &mut cmds, &mut cfg, lit, &mut idle, &mut want, &mut active, &mut lit_override, &mut ack).await;
-        if let Err(e) = io.effects.restore().await { eprintln!("armouryd: music: restoring the lighting effect: {e:#}"); }
+        match io.effects.restore().await {
+            Ok(()) => eprintln!("armouryd: music: stopped, effect restored"),
+            Err(e) => eprintln!("armouryd: music: stopped; restoring the lighting effect: {e:#}"),
+        }
         if let Some(ack) = ack { let _ = ack.send(()); }
         if let End::Failed(e) = end {
             eprintln!("armouryd: music: {e}");
