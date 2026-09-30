@@ -39,6 +39,23 @@ Item {
 
   function modeLabel(p) { return p === "quiet" ? "Silent" : p === "balanced" ? "Balanced" : p === "performance" ? "Turbo" : p === "manual" ? "Manual" : "—" }
   function gpuLabel(m) { return m === "AsusMuxDgpu" ? "Ultimate" : (m || "—") }
+  function effectLabel(m) { return String(m).split("_").map(function(w) { return w.charAt(0).toUpperCase() + w.slice(1) }).join(" ") }
+  function ksSummary(a) {
+    if (!a) return "nothing"
+    var parts = []
+    if (a.mode) parts.push(modeLabel(a.mode))
+    if (a.light && a.light !== "unchanged") parts.push(a.light === "previous" ? "previous lighting" : a.light === "music" ? "Music" : effectLabel(a.light))
+    if (a.command) parts.push("command")
+    if (a.lock) parts.push("lock")
+    return parts.length ? parts.join(", ") : "nothing"
+  }
+
+  // config.toml (music colours for the lighting preview, Keystone summary)
+  property var cfg: ({})
+  function reloadCfg() { armoury.call({ cmd: "config" }, function(r) { if (r.ok) root.cfg = r.data }) }
+  onOpenedChanged: if (opened) reloadCfg()
+  onPageChanged: if (page === "") reloadCfg()
+  readonly property color accent: Color.accent
 
   ArmouryClient { id: armoury }
 
@@ -169,41 +186,136 @@ Item {
                 pageId: "manual"; icon: "󰈐"; title: "Manual"
                 lines: root.snap && root.snap.perf ? [
                   root.snap.perf.mode === "manual" ? "In use: " + (root.snap.perf.manual_profile || "—") : "Profile: " + (root.snap.perf.manual_profile || "none yet"),
-                  "CPU " + (root.snap.perf.cpu_fan_rpm || 0) + " rpm · GPU " + (root.snap.perf.gpu_fan_rpm || 0) + " rpm",
                   "Fan curves, power limits, GPU"
                 ] : []
+                Column {
+                  width: parent.width
+                  spacing: Style.space(10)
+                  Sparkline {
+                    label: "CPU temperature"; fg: root.fg; fontFamily: root.fontFamily
+                    value: root.snap && root.snap.perf && root.snap.perf.cpu_temp_c ? Math.round(root.snap.perf.cpu_temp_c) + " °C" : "—"
+                    series: [{ values: armoury.hist.cpuTemp, color: root.accent }]
+                    minimum: 30; maximum: 100
+                  }
+                  Sparkline {
+                    label: "Fans (CPU · GPU)"; fg: root.fg; fontFamily: root.fontFamily
+                    value: root.snap && root.snap.perf ? (root.snap.perf.cpu_fan_rpm || 0) + " · " + (root.snap.perf.gpu_fan_rpm || 0) + " rpm" : "—"
+                    series: [{ values: armoury.hist.cpuFan, color: root.accent }, { values: armoury.hist.gpuFan, color: root.dim }]
+                    minimum: 0
+                  }
+                  Sparkline {
+                    label: "Power draw"; fg: root.fg; fontFamily: root.fontFamily
+                    value: root.snap && root.snap.perf && root.snap.perf.power_draw_w ? root.snap.perf.power_draw_w.toFixed(1) + " W" : "—"
+                    series: [{ values: armoury.hist.power, color: root.accent }]
+                    minimum: 0
+                  }
+                }
               }
               Tile {
                 pageId: "lighting"; icon: "󰌌"; title: "Lighting"
-                lines: root.snap && root.snap.lighting ? [
-                  "Keyboard " + ["off", "low", "medium", "high"][root.snap.lighting.brightness || 0],
-                  "Effects, colours, zones",
-                  root.snap.lighting.on_ac === false ? "On battery" : "On AC"
+                readonly property var l: root.snap ? (root.snap.lighting || {}) : {}
+                lines: root.snap ? [
+                  (l.music === "on" ? "Music" : l.effect ? root.effectLabel(l.effect.mode) : "Effect —")
+                    + " · keyboard " + ["off", "low", "medium", "high"][l.brightness || 0],
+                  l.on_ac === false ? "On battery" : "On AC"
                 ] : []
+                KeyboardPreview {
+                  width: parent.width
+                  height: Math.min(parent.height, width * 0.42)
+                  anchors.bottom: parent.bottom
+                  fg: root.fg
+                  effect: parent.parent.l.effect || null
+                  brightness: parent.parent.l.brightness || 0
+                  musicOn: parent.parent.l.music === "on"
+                  bands: armoury.bands
+                  music: root.cfg.music || null
+                }
               }
               Tile {
                 pageId: "battery"; icon: "󰁹"; title: "Battery"
-                lines: root.snap && root.snap.battery_info ? [
-                  (root.snap.battery_info.capacity || 0) + "% · limit " + (root.snap.battery_info.charge_limit || "—") + "%",
-                  root.snap.battery_info.health_pct ? "Health " + Math.round(root.snap.battery_info.health_pct) + "%" : "",
-                  root.snap.battery_info.status || ""
+                readonly property var b: root.snap ? (root.snap.battery_info || {}) : {}
+                lines: root.snap ? [
+                  (b.status || "") + (b.draw_w && b.draw_w > 0.5 ? " · " + b.draw_w.toFixed(1) + " W" : "")
+                    + (b.time_left_min ? " · " + Math.floor(b.time_left_min / 60) + " h " + (b.time_left_min % 60) + " min left" : ""),
+                  b.health_pct ? "Health " + Math.round(b.health_pct) + "%" : ""
                 ] : []
+                Column {
+                  width: parent.width
+                  spacing: Style.space(12)
+                  Item {
+                    width: parent.width
+                    height: Style.space(40)
+                    readonly property var b: parent.parent.parent.b
+                    Rectangle {
+                      id: battBar
+                      anchors.fill: parent
+                      radius: Style.space(6)
+                      color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.06)
+                      border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.15)
+                      Rectangle {
+                        width: parent.width * Math.min(1, (parent.parent.b.capacity || 0) / 100)
+                        height: parent.height
+                        radius: parent.radius
+                        color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.55)
+                      }
+                      // the charge limit
+                      Rectangle {
+                        visible: !!parent.parent.b.charge_limit && parent.parent.b.charge_limit < 100
+                        x: parent.width * (parent.parent.b.charge_limit || 100) / 100 - width / 2
+                        width: 2; height: parent.height
+                        color: root.fg
+                      }
+                      Text {
+                        anchors.centerIn: parent
+                        text: (parent.parent.b.capacity || 0) + "%" + (parent.parent.b.charge_limit ? "  ·  limit " + parent.parent.b.charge_limit + "%" : "")
+                        color: root.fg; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true
+                      }
+                    }
+                  }
+                  Sparkline {
+                    label: "Charge, last 30 min"; fg: root.fg; fontFamily: root.fontFamily
+                    value: ""
+                    series: [{ values: armoury.batteryHist, color: root.accent }]
+                    minimum: 0; maximum: 100
+                  }
+                }
               }
               Tile {
                 pageId: "input"; icon: "󰘳"; title: "Input"
-                lines: root.snap ? [
-                  "ROG key · Fn+F4 · Fn+F5",
-                  "Touchpad " + (root.snap.system && root.snap.system.touchpad === false ? "off" : "on"),
-                  "Keyboard idle dim"
-                ] : []
+                lines: ["Keys, touchpad, NumberPad"]
+                InputArt {
+                  anchors.fill: parent
+                  fg: root.fg; accent: root.accent; fontFamily: root.fontFamily
+                  keys: root.cfg.keys || null
+                  touchpadOn: !(root.snap && root.snap.system && root.snap.system.touchpad === false)
+                  numpad: root.snap && root.snap.system ? (root.snap.system.numpad || "unavailable") : "unavailable"
+                }
               }
               Tile {
                 pageId: "system"; icon: "󰒓"; title: "System"
-                lines: root.snap && root.snap.system ? [
-                  "Sleep " + (root.snap.system.mem_sleep || "—"),
-                  "Overdrive " + (root.snap.system.panel_od ? "on" : "off"),
-                  "Refresh, lid, auto-switch"
+                lines: ["Display, sleep, power source"]
+                SystemArt {
+                  anchors.fill: parent
+                  fg: root.fg; accent: root.accent; fontFamily: root.fontFamily
+                  sys: root.cfg.system || null
+                  snap: root.snap
+                }
+              }
+              Tile {
+                pageId: "keystone"; icon: "󰌆"; title: "Keystone"
+                readonly property var k: root.cfg.keystone || null
+                lines: root.snap ? [
+                  root.snap.keystone === true ? "Inserted" : root.snap.keystone === false ? "Not inserted" : "—",
+                  !k ? "" : k.enabled === false ? "Actions off" : "Actions on" + (k.flash ? " · light flash" : ""),
+                  k && k.enabled !== false ? "Insert: " + root.ksSummary(k.insert) : "",
+                  k && k.enabled !== false ? "Remove: " + root.ksSummary(k.remove) : ""
                 ] : []
+                KeystoneArt {
+                  anchors.fill: parent
+                  fg: root.fg; fontFamily: root.fontFamily
+                  inserted: !!root.snap && root.snap.keystone === true
+                  enabled_: !parent.parent.k || parent.parent.k.enabled !== false
+                }
               }
             }
 
@@ -215,7 +327,8 @@ Item {
                 : root.page === "lighting" ? lightingPage
                 : root.page === "battery" ? batteryPage
                 : root.page === "input" ? inputPage
-                : root.page === "system" ? systemPage : null
+                : root.page === "system" ? systemPage
+                : root.page === "keystone" ? keystonePage : null
             }
           }
         }
@@ -224,7 +337,7 @@ Item {
   }
 
   function pageTitle(p) {
-    return ({ manual: "Manual", lighting: "Lighting", battery: "Battery", input: "Input", system: "System" })[p] || ""
+    return ({ manual: "Manual", lighting: "Lighting", battery: "Battery", input: "Input", system: "System", keystone: "Keystone" })[p] || ""
   }
 
   Component { id: manualPage; ManualPage { client: armoury; fg: root.fg; fontFamily: root.fontFamily } }
@@ -232,12 +345,15 @@ Item {
   Component { id: batteryPage; BatteryPage { client: armoury; fg: root.fg; fontFamily: root.fontFamily } }
   Component { id: inputPage; InputPage { client: armoury; fg: root.fg; fontFamily: root.fontFamily } }
   Component { id: systemPage; SystemPage { client: armoury; fg: root.fg; fontFamily: root.fontFamily } }
+  Component { id: keystonePage; KeystonePage { client: armoury; fg: root.fg; fontFamily: root.fontFamily } }
 
   component Tile: Rectangle {
     property string pageId: ""
     property string icon: ""
     property string title: ""
     property var lines: []
+    // extra content (graphs, preview) in the space under the text
+    default property alias content: area.data
     width: parent.tileW
     height: parent.tileH
     radius: Style.space(8)
@@ -245,7 +361,10 @@ Item {
     border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.12)
 
     Column {
-      anchors.fill: parent
+      id: textCol
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.top: parent.top
       anchors.margins: Style.space(18)
       spacing: Style.space(8)
       Row {
@@ -266,6 +385,18 @@ Item {
           width: parent.width
         }
       }
+    }
+    Item {
+      id: area
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.top: textCol.bottom
+      anchors.bottom: parent.bottom
+      anchors.leftMargin: Style.space(18)
+      anchors.rightMargin: Style.space(18)
+      anchors.topMargin: Style.space(14)
+      anchors.bottomMargin: Style.space(34)
+      clip: true
     }
     Text {
       anchors.right: parent.right

@@ -1,68 +1,129 @@
 # omarchy-armoury
 
-ASUS ROG control for Omarchy. A bar widget and a full settings window
-(the `asus.armoury` Omarchy plugin), backed by a Rust daemon (`armouryd`),
-a CLI (`armoury`) and a root helper (`armoury-root`).
-Design: `docs/superpowers/specs/`.
+ASUS ROG control for [Omarchy](https://omarchy.org): a replacement for G-Helper,
+built into the Omarchy bar. It has a bar widget and a settings window (the
+`asus.armoury` Omarchy plugin), backed by three Rust programs: a daemon
+(`armouryd`), a CLI (`armoury`) and a small root helper (`armoury-root`).
+Design notes: `docs/superpowers/specs/`. Open follow-ups: `docs/superpowers/backlog.md`.
 
-## Plugin features
+## Features
 
-### Bar widget
+### Bar widget and popup
 
-- Shows the current performance mode and, optionally, CPU temperature.
-- Click for a popup with:
-  - **Mode**: Silent, Balanced, Turbo.
-  - **GPU mode**: Integrated, Hybrid, Ultimate (confirmation required; applies after reboot).
-  - **Quick toggles**: keyboard brightness, touchpad, lid-closed-awake on AC,
-    panel overdrive, boot sound, music.
-  - Battery and fan summary, and a shortcut to open the full window.
-- Widget settings: dim the keyboard after N idle seconds, show or hide temperature.
+- The bar shows the current performance mode and, optionally, CPU temperature.
+- The popup has:
+  - **Mode**: Silent, Balanced, Turbo, Manual.
+  - **GPU mode**: Integrated, Hybrid, Ultimate. It asks for confirmation and takes effect after a reboot.
+  - **Quick toggles**: keyboard brightness, touchpad, NumberPad, lid-closed-awake on AC,
+    panel overdrive, boot sound, music lighting.
+  - A battery, fan and dGPU summary, plus a shortcut to the window.
 
 ### Window
 
-- **Fans**: per-fan (CPU, GPU, mid) custom curves per mode. Drag points to edit,
-  Shift-drag moves the whole curve, reset to firmware auto at any time.
-- **CPU / GPU**: per-mode power tuning.
-  - CPU: PL1 / PL2 power limits, CPU boost, energy preference (EPP), core + cache undervolt (when the BIOS allows it).
-  - NVIDIA: Dynamic Boost, temperature target, core and memory clock offsets.
-  - Live GPU status: clocks, temperature, power, load, VRAM, and what is keeping the dGPU awake.
-- **Lighting**: keyboard brightness (remembered separately on AC and battery),
-  effects with colours, speed and direction, and per-zone control including logo, lightbar
-  and the light bar under the display (Lid).
-- **Music effect** (per-key keyboards): pick *Music* in the effect list and the keyboard
-  reacts to whatever is playing. Spectrum (bass to treble, left to right, bars rising
-  with each band) or Pulse (everything follows loudness), in a gradient, rainbow or
-  single colour, with a sensitivity setting. Fn+F4 cycles through it; it remembers
-  on/off. `armoury light effect music`, `armoury music on|off|toggle|set …`.
-- **Battery**: charge, health, cycles, voltage, draw and time left; charge limit
-  with a one-shot "charge to 100%".
-- **Input**: bind the ROG key, Fn+F5 and Fn+F4 (Aura) to open Armoury, cycle mode,
-  cycle keyboard brightness, cycle lighting effect, toggle the NumberPad or music
-  lighting, or run any command; touchpad toggle.
-- **System**: panel refresh rate on AC and on battery, overdrive and gamma,
-  performance mode on AC and on battery, sleep mode, lid-closed behaviour, boot sound.
-- **Keystone**: actions when the Keystone goes in or out: performance mode,
-  lighting (an effect, Music, or back to what was on before), a command, and lock
-  the screen on remove. The Keystone light flashes on insert. One switch turns it all
-  off. `armoury keystone [on|off]`.
+- **Dashboard**: one tile per area.
+  - Live graphs of CPU temperature, fan speeds and power draw.
+  - A battery bar with a marker at the charge limit, and a charge trend.
+  - A keyboard preview of the current lighting, live during Music.
+  - Key bindings, the touchpad and NumberPad state, the display and power-source rules,
+    and the Keystone.
+- **Manual (performance)**: saved profiles, each built on a firmware mode.
+  - Fan curves for each fan: drag points to edit, Shift-drag moves the whole curve.
+  - PL1/PL2 power limits, CPU boost and energy preference.
+  - Intel undervolt, when the BIOS allows it.
+  - NVIDIA Dynamic Boost, temperature target, and core/memory clock offsets.
+  - Live GPU status, including what is keeping the dGPU awake.
+- **Lighting**:
+  - Keyboard brightness, remembered separately on AC and on battery.
+  - Firmware effects with colours, speed and direction.
+  - Per-zone power (keyboard, lightbar, logo, lid) for boot, awake, sleep and shutdown.
+- **Music effect**: the keyboard reacts to whatever is playing.
+  - Spectrum (bass to treble, left to right) or Pulse (everything follows loudness).
+  - Gradient, rainbow or single colour, with a sensitivity setting.
+  - Pick *Music* in the effect list, or reach it with Fn+F4.
+- **Battery**: charge, health, cycles, voltage, draw and time left. Charge limit, plus
+  a one-shot "charge to 100%".
+- **Input**:
+  - Bind the ROG key, Fn+F4 and Fn+F5 to open Armoury, cycle mode, keyboard
+    brightness or effect, toggle the NumberPad or music, or run a command.
+  - Touchpad toggle.
+  - NumberPad: touchpad number keys with a backlight, toggled by holding the corner.
+- **System**:
+  - Refresh rate and performance mode, set separately for AC and for battery.
+  - Panel overdrive, gamma, sleep mode (s2idle/deep), lid closed on AC, boot sound.
+- **Keystone**: actions for insert and for remove.
+  - Performance mode.
+  - Lighting: an effect, Music, or back to what was on before the insert.
+  - A command.
+  - Lock the screen, on remove only.
+  - The Keystone light flashes on insert. One switch turns it all off.
 
-### Daemon extras
+### Daemon
 
-- OSD for Fn+F2 / Fn+F3 keyboard brightness and the mode key.
-- Stock modes send only the firmware policy change; Manual mode applies your own
-  limits and fan curves, serialized to keep the embedded controller happy.
+- The OSD shows keyboard-brightness changes (Fn+F2/F3) and the mode key.
+- Mode switches are serialized, one at a time, and stock modes send only the firmware
+  policy change. Rapid firmware calls hung the embedded controller on the G533ZW.
+- **Coexistence with G-Helper**: armouryd starts in *observe* mode and only reads.
+  - `armoury takeover` stops G-Helper and starts asusd so armouryd can control the laptop.
+  - `armoury handback` stops asusd and gives control back to G-Helper.
+  - Settings can be changed only while armouryd is in control.
+
+### CLI
+
+`armoury status`, `profile`, `manual`, `undervolt`, `gpu`, `light`, `kbd`, `music`,
+`numpad`, `keys`, `battery`, `display`, `toggle`, `sleep`, `auto`, `keystone`,
+`takeover`, `handback`, `watch`. `armoury <command> --help` has the details.
+
+## Hardware support
+
+Built and tested on a **ROG Strix SCAR 15 G533ZW** (i9-12900H, RTX 3070 Ti, per-key
+RGB, NumberPad, Keystone). Features check what the hardware offers and only show what
+exists, but only the G533ZW has been tested.
+
+| Area | Works on | Notes |
+|---|---|---|
+| Modes, fan curves, charge limit, overdrive, boot sound, keyboard brightness and effects | ASUS laptops supported by **asusd** | Only what asusd reports is shown |
+| Power limits, NVIDIA Dynamic Boost and temperature target | Laptops with the `asus-nb-wmi` attributes | Hidden when absent |
+| GPU switching | **supergfxd**, plus Omarchy's hybrid-GPU toggle | Integrated ↔ Ultimate goes through Hybrid (two reboots) |
+| Undervolt | Intel CPUs with an unlocked voltage MSR | BIOS-locked on the G533ZW, so it's shown as unavailable |
+| NVIDIA clocks and GPU status | NVIDIA dGPUs (NVML) | |
+| ROG key, Fn+F4, Fn+F5 | Models whose hotkeys come through `asus-nb-wmi` | Key codes captured on the G533ZW |
+| Keystone actions | Models with `/sys/devices/platform/asus-nb-wmi/keystone` | |
+| **Music effect, Keystone light** | **G533 per-key layout only** | Other keyboards need an LED map in `features/music/perkey.rs` |
+| **NumberPad** | **G533 touchpad layout only** (ASUE1403 04F3:319A) | Layouts are data tables in `features/numpad/layout.rs` |
+| **asusd zone fix** | **G533Z only** | asusd's model database under-reports its lighting zones |
+| Desktop integration | **Omarchy** (Hyprland, omarchy-shell) | Uses Omarchy's OSD, lock, touchpad and lid tools |
+
+Adding a model usually means adding data (an LED map, a NumberPad layout, an asusd
+zone fix), not code.
+
+## Known issues
+
+- **Light bar under the display during Music.** In per-key mode it copies the F5 and
+  Delete colours. Armoury Crate on Windows controls it separately, so there's another
+  packet; a USB capture from Windows is needed (steps in the backlog).
+- **Keystone reacts within 2 s**, not instantly. The firmware sends no event, so its
+  presence is read every 2 s. Keystones can't be told apart yet: the NFC reader
+  (NXP3001) has no Linux driver bound.
+- **Setting an effect or cycling Fn+F4 turns Music off.** Leaving Music restores the
+  previous effect.
+- **The lighting preview is an approximation** of the firmware effects, especially the
+  reactive ones (Highlight, Laser, Ripple), which are shown answering simulated key presses.
+- **GPU switching**: the actual switch (which reboots) hasn't been tested end to end on
+  this machine yet.
+- **The asusd zone fix edits a package file** (`/usr/share/asusd/aura_support.ron`). A
+  pacman hook re-applies it after every asusctl upgrade, and it regenerates asusd's
+  lighting config, which resets the effect once.
+- **Settings are read-only in observe mode.** Run `armoury takeover` first.
 
 ## Install
 
     ./install.sh
 
     armoury status          # what the daemon sees
+    armoury takeover        # let armouryd control the hardware (stops G-Helper)
 
-## asusd lighting fix
-
-asusd's model database lists the G533Z as keyboard-only, so the logo,
-lightbar and the light bar under the display (Lid) never light. `armoury-root asusd-support-fix` adds the missing zones;
-a pacman hook re-applies it after asusctl upgrades.
+Needs asusd (asusctl), supergfxd, PipeWire (`pw-record`, for Music) and Omarchy.
+One sudo prompt installs the root helper, polkit rule, udev rules and pacman hook.
 
 ## Uninstall
 

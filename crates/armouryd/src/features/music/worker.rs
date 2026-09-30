@@ -50,7 +50,12 @@ pub trait Effects: Send + Sync {
 /// Opens the keyboard's hidraw node for direct frames.
 pub type OpenKeyboard = Box<dyn Fn() -> std::io::Result<Box<dyn Keyboard>> + Send + Sync>;
 
+/// Band levels for the UI (latest wins); empty while music isn't running.
+pub type Bands = tokio::sync::watch::Sender<Vec<f32>>;
+
 pub struct Io {
+    /// Where band levels go for the UI (~10 per second).
+    pub bands: Option<Bands>,
     pub capture: Box<dyn Fn() -> std::io::Result<Box<dyn Capture>> + Send + Sync>,
     pub keyboard: OpenKeyboard,
     pub effects: Arc<dyn Effects>,
@@ -60,6 +65,8 @@ pub struct Io {
 const MIN_FRAME_GAP: Duration = Duration::from_millis(30);
 /// Direct mode is re-entered this often: the firmware drops it on resume and when asusd writes.
 const REINIT_EVERY: Duration = Duration::from_secs(5);
+/// How often band levels go to the UI.
+const BANDS_EVERY: Duration = Duration::from_millis(100);
 /// More failures than this within a minute: music turns itself off.
 const MAX_FAILURES_PER_MIN: usize = 3;
 
@@ -107,6 +114,7 @@ pub async fn run_worker(io: Io, layout: Option<Layout>, mut cmds: mpsc::Receiver
         let mut ack: Option<oneshot::Sender<()>> = None;
         eprintln!("armouryd: music: started");
         let end = session(&io, layout, &mut cmds, &mut cfg, lit, &mut idle, &mut want, &mut active, &mut lit_override, &mut ack).await;
+        if let Some(b) = &io.bands { b.send_if_modified(|v| { let was = !v.is_empty(); v.clear(); was }); }
         match io.effects.restore().await {
             Ok(()) => eprintln!("armouryd: music: stopped, effect restored"),
             Err(e) => eprintln!("armouryd: music: stopped; restoring the lighting effect: {e:#}"),
@@ -141,12 +149,17 @@ async fn session(
     let mut last_sent = Instant::now() - MIN_FRAME_GAP;
     let mut init_at: Option<Instant> = None;
     let mut flash_from: Option<Instant> = None;
+    let mut bands_at: Option<Instant> = None;
     loop {
         tokio::select! {
             chunk = cap.next() => {
                 let chunk = match chunk { Ok(c) => c, Err(e) => return End::Failed(format!("audio capture: {e}")) };
                 let a = analyzer.feed(&chunk, cfg.sensitivity);
                 let now = Instant::now();
+                if let Some(b) = &io.bands && bands_at.is_none_or(|t| now.duration_since(t) >= BANDS_EVERY) {
+                    b.send_replace(a.bands.to_vec());
+                    bands_at = Some(now);
+                }
                 if *idle || now.duration_since(last_sent) < MIN_FRAME_GAP { continue; }
                 let mut out = Vec::new();
                 if init_at.is_none_or(|t| now.duration_since(t) >= REINIT_EVERY) {
@@ -298,15 +311,18 @@ mod tests {
     struct Rig {
         audio: Arc<Mutex<Option<mpsc::UnboundedSender<std::io::Result<Vec<f32>>>>>>,
         cmds: mpsc::Sender<Cmd>, log: Arc<Mutex<Vec<String>>>, status: Status, kb_fail: Arc<Mutex<bool>>,
+        bands: tokio::sync::watch::Receiver<Vec<f32>>,
     }
 
     fn start(on: bool) -> Rig {
+        let bands = tokio::sync::watch::Sender::new(Vec::new());
         let log = Arc::new(Mutex::new(Vec::new()));
         let audio = Arc::new(Mutex::new(None));
         let kb_fail = Arc::new(Mutex::new(false));
         let (a, l, f) = (audio.clone(), log.clone(), kb_fail.clone());
         let l2 = log.clone();
         let io = Io {
+            bands: Some(bands.clone()),
             capture: Box::new(move || {
                 let (tx, rx) = mpsc::unbounded_channel();
                 *a.lock().unwrap() = Some(tx);
@@ -318,7 +334,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let status: Status = Arc::new(Mutex::new((MusicState::Unavailable, None)));
         tokio::spawn(run_worker(io, layout_for("G533ZW"), rx, status.clone(), MusicConfig { on, ..MusicConfig::default() }));
-        Rig { audio, cmds: tx, log, status, kb_fail }
+        Rig { audio, cmds: tx, log, status, kb_fail, bands: bands.subscribe() }
     }
     async fn settle() { for _ in 0..30 { tokio::task::yield_now().await; } }
     fn tone(k: usize) -> Vec<f32> { (0..CHUNK).map(|i| 0.5 * ((k * CHUNK + i) as f32 * 0.13).sin()).collect() }
@@ -449,10 +465,22 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn band_levels_go_to_the_ui_while_running() {
+        let mut r = start(true);
+        r.cmds.send(Cmd::Env { active: true }).await.unwrap(); settle().await;
+        play(&r, (0..3).map(tone)).await;
+        assert_eq!(r.bands.borrow_and_update().len(), 18);
+        let (ack, done) = oneshot::channel();
+        r.cmds.send(Cmd::Set { on: false, ack: Some(ack) }).await.unwrap();
+        done.await.unwrap();
+        assert!(r.bands.borrow_and_update().is_empty(), "cleared when music stops");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn no_layout_means_unavailable() {
         let (tx, rx) = mpsc::channel(8);
         let status: Status = Arc::new(Mutex::new((MusicState::Off, None)));
-        let io = Io { capture: Box::new(|| Err(std::io::Error::other("x"))), keyboard: Box::new(|| Err(std::io::Error::other("x"))),
+        let io = Io { bands: None, capture: Box::new(|| Err(std::io::Error::other("x"))), keyboard: Box::new(|| Err(std::io::Error::other("x"))),
                       effects: Arc::new(FakeFx(Arc::new(Mutex::new(Vec::new())))) };
         tokio::spawn(run_worker(io, None, rx, status.clone(), MusicConfig { on: true, ..MusicConfig::default() }));
         tx.send(Cmd::Env { active: true }).await.unwrap(); settle().await;
