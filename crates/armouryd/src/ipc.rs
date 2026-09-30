@@ -133,7 +133,10 @@ impl Daemon {
                 // Keys are handled one at a time and switch_profile holds the apply lock,
                 // so presses are serialized: each switch finishes before the next starts
                 // (overlapping switches hung the EC on the G533ZW).
-                let next = next_choice(self.refresh().await.perf.mode);
+                // Step from the mode armouryd put in force, not from the firmware: the EC
+                // advances the thermal policy itself ~3 ms after Fn+F5, so the firmware
+                // already shows the next mode by the time this runs (double step otherwise).
+                let next = next_choice(self.mode_in_force().await);
                 let icon = mode_look(next);
                 let label = match next {
                     ModeChoice::Manual => {
@@ -800,6 +803,16 @@ impl Daemon {
         }
     }
 
+    /// The mode armouryd last put in force; the firmware's own view only before the first apply.
+    async fn mode_in_force(&self) -> Option<ModeChoice> {
+        let applied = self.apply.lock().await.applied.clone();
+        match applied {
+            Some(Target::Stock(p)) => Some(ModeChoice::from(p)),
+            Some(Target::Manual { .. }) => Some(ModeChoice::Manual),
+            None => self.refresh().await.perf.mode,
+        }
+    }
+
     /// Re-applies Manual from scratch (profile edited, activated or deleted).
     async fn reapply_manual(&self) -> Vec<String> {
         let mut st = self.apply.lock().await;
@@ -876,7 +889,7 @@ impl Daemon {
             }
             Request::NextProfile => {
                 if let Err(r) = self.write_guard().await { return r; }
-                let cur = self.refresh().await.perf.mode;
+                let cur = self.mode_in_force().await;
                 self.choose_mode(next_choice(cur)).await
             }
             Request::LimitBounds => {
@@ -2477,5 +2490,22 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
         let none = sys_rig(true, "");
         none.d.tick().await;
         assert!(!none.asusd.calls.lock().unwrap().iter().any(|c| c == "disable_source_switching"));
+    }
+
+    #[tokio::test]
+    async fn fan_key_steps_from_our_mode_not_the_ecs() {
+        // measured on the G533ZW: the EC itself advances the thermal policy ~3 ms after
+        // Fn+F5 (balanced → performance → quiet → balanced), before armouryd sees the key
+        let r = profile_rig("quiet");
+        *r.asusd.mirror.lock().unwrap() = Some(r.sys.clone());
+        r.d.tick().await; // Silent in force
+        r.sys.files.lock().unwrap().insert("sys/firmware/acpi/platform_profile".into(), "balanced".into()); // the EC's own step
+        r.d.on_hotkey(armoury_proto::HotKey::Fan).await;
+        assert!(svc_calls(&r).iter().any(|c| c.ends_with("-m Balanced mode")), "Silent → Balanced: {:?}", svc_calls(&r));
+        assert_eq!(r.d.refresh().await.perf.mode, Some(ModeChoice::Balanced));
+        r.sys.files.lock().unwrap().insert("sys/firmware/acpi/platform_profile".into(), "performance".into()); // EC again
+        r.d.on_hotkey(armoury_proto::HotKey::Fan).await;
+        assert!(svc_calls(&r).iter().any(|c| c.ends_with("-m Turbo mode")), "Balanced → Turbo: {:?}", svc_calls(&r));
+        assert_eq!(r.d.refresh().await.perf.mode, Some(ModeChoice::Performance), "our choice overrides the EC's");
     }
 }

@@ -145,6 +145,28 @@ Flickable {
       }
     }
 
+    // ---------- save / activate (kept at the top so it's always in view) ----------
+    Row {
+      spacing: Style.space(10)
+      Button {
+        text: root.dirty ? (root.isActive ? "Save and apply" : "Save") : "Saved"
+        bordered: true; foreground: root.fg
+        enabled: root.usable && root.dirty && root.selected !== ""
+        onClicked: root.saveAs(root.selected, root.selected)
+      }
+      Button {
+        visible: !root.isActive && root.selected !== ""
+        text: root.dirty ? "Save and activate" : "Activate"
+        bordered: true; foreground: root.fg; enabled: root.usable
+        onClicked: {
+          var name = root.selected
+          var go = function() { root.client.run({ cmd: "activate_manual_profile", name: name }, function(r) { if (r.ok) root.load(name) }) }
+          if (root.dirty) root.saveAs(name, name, go); else go()
+        }
+      }
+      Button { text: "Discard"; foreground: root.fg; visible: root.dirty; onClicked: root.select(root.selected) }
+    }
+
     ChoiceRow {
       fg: root.fg
       label: "Runs on"
@@ -276,28 +298,6 @@ Flickable {
       value: root.val("gpu_mem_offset", 0)
       usable: root.usable
       onCommitted: function(v) { root.set("gpu_mem_offset", v) }
-    }
-
-    // ---------- save / activate ----------
-    Row {
-      spacing: Style.space(10)
-      Button {
-        text: root.dirty ? (root.isActive ? "Save and apply" : "Save") : "Saved"
-        bordered: true; foreground: root.fg
-        enabled: root.usable && root.dirty && root.selected !== ""
-        onClicked: root.saveAs(root.selected, root.selected)
-      }
-      Button {
-        visible: !root.isActive && root.selected !== ""
-        text: root.dirty ? "Save and activate" : "Activate"
-        bordered: true; foreground: root.fg; enabled: root.usable
-        onClicked: {
-          var name = root.selected
-          var go = function() { root.client.run({ cmd: "activate_manual_profile", name: name }, function(r) { if (r.ok) root.load(name) }) }
-          if (root.dirty) root.saveAs(name, name, go); else go()
-        }
-      }
-      Button { text: "Discard"; foreground: root.fg; visible: root.dirty; onClicked: root.select(root.selected) }
     }
 
     // ---------- GPU status ----------
