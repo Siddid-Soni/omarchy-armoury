@@ -5,6 +5,7 @@ use armoury_proto::{BatteryInfo, SleepMode, SystemState, BatteryState, ControlMo
 /// NVML every 2 s kept the dGPU from ever runtime-suspending (measured on the G533ZW).
 pub async fn collect(sys: &dyn Sysfs, gfx: &dyn Gfx, svc: &dyn Services, nv: &dyn Nvidia, control: ControlMode, gpu_detail: bool) -> Snapshot {
     Snapshot {
+        version: env!("CARGO_PKG_VERSION").to_string(),
         model: sys.read(sysfs::PRODUCT_NAME),
         control,
         keystone: sys.read(sysfs::KEYSTONE).map(|v| v == "1"),
@@ -172,6 +173,13 @@ mod tests {
             ("sys/class/power_supply/BAT0/power_now", "18250000"),
             ("sys/devices/system/cpu/intel_pstate/no_turbo", "0"),
         ])
+    }
+
+    #[test]
+    fn daemon_and_plugin_versions_match() {
+        // the plugin compares these to offer "Update daemon" after `omarchy plugin update`
+        let manifest: serde_json::Value = serde_json::from_str(include_str!("../../../manifest.json")).unwrap();
+        assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"), "bump manifest.json and Cargo.toml together");
     }
 
     #[tokio::test]

@@ -1,0 +1,33 @@
+# Builds armouryd, armoury and armoury-root for a version tag (v0.3.0 …) and attaches
+# them to the GitHub release, where install.sh downloads them.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tag matches the plugin version
+        run: test "v$(jq -r .version manifest.json)" = "$GITHUB_REF_NAME"
+      - name: Test
+        run: cargo test --workspace --release
+      - name: Build
+        run: cargo build --workspace --release
+      - name: Package
+        run: |
+          name="armoury-${GITHUB_REF_NAME#v}-$(uname -m)-linux.tar.gz"
+          tar -czf "$name" -C target/release armouryd armoury armoury-root
+          sha256sum "$name" > "$name.sha256"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            armoury-*-linux.tar.gz
+            armoury-*-linux.tar.gz.sha256
