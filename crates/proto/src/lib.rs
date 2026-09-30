@@ -533,6 +533,7 @@ pub enum Request {
         #[serde(default)] idle_dim_secs: Option<u32>,
         #[serde(default)] hold_ms: Option<u32>,
         #[serde(default)] repeat_delay_ms: Option<u32>,
+        #[serde(default)] repeat_rate_hz: Option<u32>,
     },
 }
 
@@ -709,7 +710,7 @@ mod tests {
         let r: Request = serde_json::from_str(r#"{"cmd":"set_numpad","on":true}"#).unwrap();
         assert_eq!(r, Request::SetNumpad { on: true });
         let r: Request = serde_json::from_str(r#"{"cmd":"set_numpad_config","idle_dim_secs":0}"#).unwrap();
-        assert_eq!(r, Request::SetNumpadConfig { start_brightness: None, allow_when_touchpad_off: None, idle_dim_secs: Some(0), hold_ms: None, repeat_delay_ms: None });
+        assert_eq!(r, Request::SetNumpadConfig { start_brightness: None, allow_when_touchpad_off: None, idle_dim_secs: Some(0), hold_ms: None, repeat_delay_ms: None, repeat_rate_hz: None });
         assert_eq!(serde_json::from_str::<KeyAction>("\"toggle_numpad\"").unwrap(), KeyAction::ToggleNumpad);
     }
 }

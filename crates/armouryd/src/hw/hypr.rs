@@ -11,6 +11,8 @@ pub trait Hypr: Send + Sync {
     async fn gamma(&self, pct: u8) -> anyhow::Result<()>;
     /// NumLock state (seat-wide; true if any keyboard reports it on).
     async fn numlock(&self) -> anyhow::Result<bool>;
+    /// Keyboard repeats per second (`input:repeat_rate`).
+    async fn repeat_rate(&self) -> anyhow::Result<u32>;
 }
 
 #[async_trait::async_trait]
@@ -19,6 +21,12 @@ impl<T: Hypr + ?Sized> Hypr for std::sync::Arc<T> {
     async fn eval(&self, lua: &str) -> anyhow::Result<()> { (**self).eval(lua).await }
     async fn gamma(&self, pct: u8) -> anyhow::Result<()> { (**self).gamma(pct).await }
     async fn numlock(&self) -> anyhow::Result<bool> { (**self).numlock().await }
+    async fn repeat_rate(&self) -> anyhow::Result<u32> { (**self).repeat_rate().await }
+}
+
+pub fn parse_repeat_rate(json: &str) -> anyhow::Result<u32> {
+    let v: serde_json::Value = serde_json::from_str(json)?;
+    v["int"].as_u64().map(|r| r as u32).ok_or_else(|| anyhow::anyhow!("no input:repeat_rate in {json}"))
 }
 
 pub fn parse_numlock(json: &str) -> anyhow::Result<bool> {
@@ -100,6 +108,7 @@ async fn hyprctl(args: &[&str]) -> anyhow::Result<String> {
 impl Hypr for RealHypr {
     async fn monitors(&self) -> anyhow::Result<Vec<DisplayInfo>> { parse_monitors(&hyprctl(&["monitors", "-j"]).await?) }
     async fn numlock(&self) -> anyhow::Result<bool> { parse_numlock(&hyprctl(&["devices", "-j"]).await?) }
+    async fn repeat_rate(&self) -> anyhow::Result<u32> { parse_repeat_rate(&hyprctl(&["getoption", "input:repeat_rate", "-j"]).await?) }
 
 
     async fn eval(&self, lua: &str) -> anyhow::Result<()> {
@@ -118,6 +127,12 @@ impl Hypr for RealHypr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeat_rate_from_getoption_json() {
+        assert_eq!(parse_repeat_rate(r#"{"option":"input:repeat_rate","int":40,"set":true}"#).unwrap(), 40);
+        assert!(parse_repeat_rate(r#"{"option":"x"}"#).is_err());
+    }
 
     #[test]
     fn numlock_from_devices_json() {

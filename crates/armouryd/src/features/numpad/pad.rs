@@ -7,10 +7,14 @@ use std::time::{Duration, Instant};
 pub enum Action { Grab(bool), Light(u8), Key { code: u16, down: bool }, EnsureNumlock }
 
 #[derive(Debug, Clone, Copy)]
-pub struct Settings { pub hold: Duration, pub idle: Option<Duration>, pub start_level: u8, pub repeat_delay: Option<Duration> }
-
-/// After the first repeat, a resting finger repeats its key this often.
-const REPEAT_EVERY: Duration = Duration::from_millis(100);
+pub struct Settings {
+    pub hold: Duration,
+    pub idle: Option<Duration>,
+    pub start_level: u8,
+    pub repeat_delay: Option<Duration>,
+    /// After the first repeat, a resting finger repeats its key this often.
+    pub repeat_every: Duration,
+}
 
 pub struct Pad {
     on: bool,
@@ -37,6 +41,12 @@ impl Pad {
     }
 
     pub fn is_on(&self) -> bool { self.on }
+
+    /// When the resting finger's key repeats next (the worker wakes for it; repeats are
+    /// finer than its 100 ms tick).
+    pub fn next_repeat(&self) -> Option<Instant> {
+        if self.on && self.finger_down { self.repeat.map(|(_, t)| t) } else { None }
+    }
 
     /// Touchpad enabled (or allowed while off) and armouryd active; turning false while on turns it off.
     pub fn set_allowed(&mut self, allowed: bool) -> Vec<Action> {
@@ -127,7 +137,7 @@ impl Pad {
         }
         if let Some((code, next)) = self.repeat {
             if self.on && self.finger_down && now >= next {
-                self.repeat = Some((code, next + REPEAT_EVERY));
+                self.repeat = Some((code, next + s.repeat_every));
                 return vec![Action::Key { code, down: true }, Action::Key { code, down: false }];
             }
         }
@@ -146,7 +156,7 @@ mod tests {
     use crate::features::numpad::layout::{Hit, LIGHT_OFF, LIGHT_ON, level_byte};
     use crate::features::numpad::mt::Touch;
     use std::time::{Duration, Instant};
-    fn s() -> Settings { Settings { hold: Duration::from_millis(1000), idle: Some(Duration::from_secs(60)), start_level: 8, repeat_delay: Some(Duration::from_millis(600)) } }
+    fn s() -> Settings { Settings { hold: Duration::from_millis(1000), idle: Some(Duration::from_secs(60)), start_level: 8, repeat_delay: Some(Duration::from_millis(600)), repeat_every: Duration::from_millis(100) } }
     fn ms(t0: Instant, n: u64) -> Instant { t0 + Duration::from_millis(n) }
     fn hold_icon(p: &mut Pad, t0: Instant) -> Vec<Action> {
         let mut a = p.touch(Touch::Down { x: 4000, y: 50 }, Hit::RightIcon, &s(), t0);
@@ -272,5 +282,20 @@ mod tests {
         let no_repeat = Settings { repeat_delay: None, ..s() };
         p.touch(Touch::Down { x: 1, y: 1 }, Hit::Key(80), &no_repeat, ms(t0, 4000));
         assert!(p.tick(&no_repeat, ms(t0, 9000)).is_empty(), "repeat off");
+    }
+
+    #[test]
+    fn repeat_rate_is_a_setting() {
+        let (mut p, t0) = (Pad::new(), Instant::now());
+        p.set_allowed(true);
+        hold_icon(&mut p, t0);
+        p.touch(Touch::Up, Hit::None, &s(), ms(t0, 1100));
+        let fast = Settings { repeat_every: Duration::from_millis(25), ..s() }; // 40/s
+        p.touch(Touch::Down { x: 1, y: 1 }, Hit::Key(80), &fast, ms(t0, 2000));
+        assert_eq!(p.next_repeat(), Some(ms(t0, 2600)));
+        assert_eq!(p.tick(&fast, ms(t0, 2600)).len(), 2);
+        assert_eq!(p.next_repeat(), Some(ms(t0, 2625)), "the worker wakes for this, not its 100 ms tick");
+        p.touch(Touch::Up, Hit::None, &fast, ms(t0, 2630));
+        assert_eq!(p.next_repeat(), None);
     }
 }

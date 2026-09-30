@@ -5,8 +5,10 @@ pub const LIGHT_ON: u8 = 0x01;
 pub const LIGHT_OFF: u8 = 0x00;
 pub const KEY_NUMLOCK: u16 = 69;
 
-/// Brightness level 1–8 → packet value.
-pub fn level_byte(level: u8) -> u8 { 0x40 + level.clamp(1, 8) }
+/// Brightness level 1–8 → packet value. The pad uses the low 4 bits (16 steps,
+/// asus-numberpad-driver issue #109), so the 8 levels are spread over 0x42..=0x4F
+/// and level 8 is full brightness (0x41..0x48 only reached half).
+pub fn level_byte(level: u8) -> u8 { 0x40 + ((level.clamp(1, 8) as u16 * 15 + 4) / 8) as u8 }
 
 pub fn backlight_packet(v: u8) -> [u8; 13] {
     [0x05, 0x00, 0x3d, 0x03, 0x06, 0x00, 0x07, 0x00, 0x0d, 0x14, 0x03, v, 0xad]
@@ -99,8 +101,10 @@ mod tests {
     #[test]
     fn packet_and_address() {
         assert_eq!(backlight_packet(LIGHT_ON), [0x05, 0x00, 0x3d, 0x03, 0x06, 0x00, 0x07, 0x00, 0x0d, 0x14, 0x03, 0x01, 0xad]);
-        assert_eq!(backlight_packet(level_byte(8))[11], 0x48);
-        assert_eq!(level_byte(1), 0x41);
+        // the pad uses the low 4 bits (16 steps; asus-numberpad-driver issue #109): level 8 is 0x4F, full brightness
+        assert_eq!(backlight_packet(level_byte(8))[11], 0x4F);
+        let bytes: Vec<u8> = (1..=8).map(level_byte).collect();
+        assert!(bytes.windows(2).all(|w| w[0] < w[1]) && bytes[0] > 0x40, "8 distinct rising levels, none off: {bytes:x?}");
         assert_eq!(i2c_address("ASUE1403:00 04F3:319A Touchpad"), 0x15);
         assert_eq!(i2c_address("ASUF1416:00 2808:0108 Touchpad"), 0x38);
     }

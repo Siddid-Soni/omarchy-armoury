@@ -205,6 +205,7 @@ impl super::hypr::Hypr for FakeHypr {
         Ok(())
     }
     async fn numlock(&self) -> anyhow::Result<bool> { Ok(*self.numlock.lock().unwrap()) }
+    async fn repeat_rate(&self) -> anyhow::Result<u32> { Ok(40) } // this machine's input:repeat_rate
     async fn gamma(&self, pct: u8) -> anyhow::Result<()> {
         if !self.sunset_running { anyhow::bail!("hyprsunset is not running (turn on Omarchy's night light, or start hyprsunset)"); }
         self.gamma.lock().unwrap().push(pct);
