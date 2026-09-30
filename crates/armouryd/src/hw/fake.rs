@@ -169,6 +169,8 @@ pub struct FakeHypr {
     pub sunset_running: bool,
     pub fail: Mutex<bool>,
     pub attempts: Mutex<u32>,
+    /// NumLock as Hyprland would report it.
+    pub numlock: Mutex<bool>,
 }
 
 impl Default for FakeHypr {
@@ -184,6 +186,7 @@ impl Default for FakeHypr {
             sunset_running: true,
             fail: Mutex::new(false),
             attempts: Mutex::new(0),
+            numlock: Mutex::new(true),
         }
     }
 }
@@ -201,6 +204,7 @@ impl super::hypr::Hypr for FakeHypr {
         }
         Ok(())
     }
+    async fn numlock(&self) -> anyhow::Result<bool> { Ok(*self.numlock.lock().unwrap()) }
     async fn gamma(&self, pct: u8) -> anyhow::Result<()> {
         if !self.sunset_running { anyhow::bail!("hyprsunset is not running (turn on Omarchy's night light, or start hyprsunset)"); }
         self.gamma.lock().unwrap().push(pct);

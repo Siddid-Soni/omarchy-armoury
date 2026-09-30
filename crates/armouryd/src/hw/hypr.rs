@@ -9,6 +9,8 @@ pub trait Hypr: Send + Sync {
     async fn eval(&self, lua: &str) -> anyhow::Result<()>;
     /// hyprsunset gamma, percent.
     async fn gamma(&self, pct: u8) -> anyhow::Result<()>;
+    /// NumLock state (seat-wide; true if any keyboard reports it on).
+    async fn numlock(&self) -> anyhow::Result<bool>;
 }
 
 #[async_trait::async_trait]
@@ -16,6 +18,12 @@ impl<T: Hypr + ?Sized> Hypr for std::sync::Arc<T> {
     async fn monitors(&self) -> anyhow::Result<Vec<DisplayInfo>> { (**self).monitors().await }
     async fn eval(&self, lua: &str) -> anyhow::Result<()> { (**self).eval(lua).await }
     async fn gamma(&self, pct: u8) -> anyhow::Result<()> { (**self).gamma(pct).await }
+    async fn numlock(&self) -> anyhow::Result<bool> { (**self).numlock().await }
+}
+
+pub fn parse_numlock(json: &str) -> anyhow::Result<bool> {
+    let v: serde_json::Value = serde_json::from_str(json)?;
+    Ok(v["keyboards"].as_array().into_iter().flatten().any(|k| k["numLock"].as_bool() == Some(true)))
 }
 
 pub fn parse_monitors(json: &str) -> anyhow::Result<Vec<DisplayInfo>> {
@@ -91,6 +99,7 @@ async fn hyprctl(args: &[&str]) -> anyhow::Result<String> {
 #[async_trait::async_trait]
 impl Hypr for RealHypr {
     async fn monitors(&self) -> anyhow::Result<Vec<DisplayInfo>> { parse_monitors(&hyprctl(&["monitors", "-j"]).await?) }
+    async fn numlock(&self) -> anyhow::Result<bool> { parse_numlock(&hyprctl(&["devices", "-j"]).await?) }
 
 
     async fn eval(&self, lua: &str) -> anyhow::Result<()> {
@@ -109,6 +118,12 @@ impl Hypr for RealHypr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numlock_from_devices_json() {
+        assert!(parse_numlock(r#"{"keyboards":[{"name":"a","numLock":false},{"name":"b","numLock":true}]}"#).unwrap());
+        assert!(!parse_numlock(r#"{"keyboards":[{"name":"a","numLock":false}]}"#).unwrap());
+    }
 
     // captured from this machine: hyprctl monitors -j
     const MONITORS: &str = r#"[{"name": "eDP-1", "width": 2560, "height": 1440, "refreshRate": 240.00301, "scale": 1.6, "x": 0, "y": 0, "transform": 0, "availableModes": ["2560x1440@240.00Hz", "2560x1440@60.00Hz"]}]"#;
