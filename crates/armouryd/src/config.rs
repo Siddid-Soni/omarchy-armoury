@@ -157,10 +157,12 @@ pub struct NumpadConfig {
     pub idle_dim_secs: u32,
     /// Top-right icon hold that toggles the NumberPad.
     pub hold_ms: u32,
+    /// A finger resting on a key repeats it after this long (0 = never).
+    pub repeat_delay_ms: u32,
 }
 
 impl Default for NumpadConfig {
-    fn default() -> Self { Self { start_brightness: 8, allow_when_touchpad_off: false, idle_dim_secs: 60, hold_ms: 1000 } }
+    fn default() -> Self { Self { start_brightness: 8, allow_when_touchpad_off: false, idle_dim_secs: 60, hold_ms: 1000, repeat_delay_ms: 600 } }
 }
 
 impl NumpadConfig {
@@ -168,6 +170,7 @@ impl NumpadConfig {
         if !(1..=8).contains(&self.start_brightness) { return Err("NumberPad brightness must be 1–8".into()); }
         if !(300..=3000).contains(&self.hold_ms) { return Err("hold time must be 300–3000 ms".into()); }
         if self.idle_dim_secs > 3600 { return Err("idle timeout must be 0–3600 s".into()); }
+        if self.repeat_delay_ms != 0 && !(200..=2000).contains(&self.repeat_delay_ms) { return Err("key repeat delay must be 0 (off) or 200–2000 ms".into()); }
         Ok(())
     }
 }
@@ -272,7 +275,9 @@ mod tests {
     #[test]
     fn numpad_defaults_and_validation() {
         let c = NumpadConfig::default();
-        assert_eq!((c.start_brightness, c.allow_when_touchpad_off, c.idle_dim_secs, c.hold_ms), (8, false, 60, 1000));
+        assert_eq!((c.start_brightness, c.allow_when_touchpad_off, c.idle_dim_secs, c.hold_ms, c.repeat_delay_ms), (8, false, 60, 1000, 600));
+        assert!(NumpadConfig { repeat_delay_ms: 0, ..c }.validate().is_ok(), "0 = no repeat");
+        assert!(NumpadConfig { repeat_delay_ms: 100, ..c }.validate().is_err());
         assert!(c.validate().is_ok());
         for bad in [NumpadConfig { start_brightness: 0, ..c }, NumpadConfig { start_brightness: 9, ..c },
                     NumpadConfig { hold_ms: 200, ..c }, NumpadConfig { hold_ms: 3001, ..c }, NumpadConfig { idle_dim_secs: 3601, ..c }] {

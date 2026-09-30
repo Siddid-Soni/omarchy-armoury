@@ -42,7 +42,7 @@ Flickable {
     { label: "Run command", value: "command" }
   ]
 
-  readonly property var np: cfg.numpad || ({ start_brightness: 8, allow_when_touchpad_off: false, idle_dim_secs: 60, hold_ms: 1000 })
+  readonly property var np: cfg.numpad || ({ start_brightness: 8, allow_when_touchpad_off: false, idle_dim_secs: 60, hold_ms: 1000, repeat_delay_ms: 600 })
   function setNp(key, v) { var r = { cmd: "set_numpad_config" }; r[key] = v; client.run(r, function() { root.reload() }) }
 
   function bindKey(key, action, command) {
@@ -147,6 +147,14 @@ Flickable {
       value: root.np.idle_dim_secs
       usable: root.usable
       onCommitted: function(v) { root.setNp("idle_dim_secs", v) }
+    }
+    ValueSlider {
+      fg: root.fg; label: "Key repeat delay (0 = no repeat)"; unit: "ms"
+      minimum: 0; maximum: 2000; step: 50
+      value: root.np.repeat_delay_ms
+      usable: root.usable
+      // 1–199 isn't a valid delay: snap it to "off"
+      onCommitted: function(v) { root.setNp("repeat_delay_ms", v > 0 && v < 200 ? 0 : v) }
     }
     ValueSlider {
       fg: root.fg; label: "Hold time to toggle"; unit: "ms"

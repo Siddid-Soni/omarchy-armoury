@@ -28,6 +28,7 @@ fn settings(c: &NumpadConfig) -> Settings {
         hold: Duration::from_millis(c.hold_ms as u64),
         idle: (c.idle_dim_secs > 0).then(|| Duration::from_secs(c.idle_dim_secs as u64)),
         start_level: c.start_brightness,
+        repeat_delay: (c.repeat_delay_ms > 0).then(|| Duration::from_millis(c.repeat_delay_ms as u64)),
     }
 }
 
@@ -271,7 +272,7 @@ mod tests {
         assert_eq!(*r.state.lock().unwrap(), NumpadState::On);
         touch(&r, 1000, 800); lift(&r); settle().await; // "5"
         let l = log(&r);
-        assert_eq!(&l[..3], ["grab true", &format!("light {:#04x}", level_byte(8)), "key 69 true"], "{l:?}");
+        assert_eq!(&l[..4], ["grab true", "light 0x01", &format!("light {:#04x}", level_byte(8)), "key 69 true"], "{l:?}");
         assert!(l.contains(&"key 76 true".to_string()) && l.contains(&"key 76 false".to_string()), "{l:?}");
         touch(&r, 4000, 50); settle().await;
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;

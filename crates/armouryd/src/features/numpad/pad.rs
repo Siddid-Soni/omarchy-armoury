@@ -1,5 +1,5 @@
 //! NumberPad behaviour as a pure state machine: touches and clock ticks in, device actions out.
-use super::layout::{level_byte, Hit, LIGHT_OFF};
+use super::layout::{level_byte, Hit, LIGHT_OFF, LIGHT_ON};
 use super::mt::Touch;
 use std::time::{Duration, Instant};
 
@@ -7,15 +7,19 @@ use std::time::{Duration, Instant};
 pub enum Action { Grab(bool), Light(u8), Key { code: u16, down: bool }, EnsureNumlock }
 
 #[derive(Debug, Clone, Copy)]
-pub struct Settings { pub hold: Duration, pub idle: Option<Duration>, pub start_level: u8 }
+pub struct Settings { pub hold: Duration, pub idle: Option<Duration>, pub start_level: u8, pub repeat_delay: Option<Duration> }
+
+/// After the first repeat, a resting finger repeats its key this often.
+const REPEAT_EVERY: Duration = Duration::from_millis(100);
 
 pub struct Pad {
     on: bool,
     allowed: bool,
     level: u8,
     lit: bool,
-    /// Key held by the current touch.
-    pressed: Option<u16>,
+    /// Key under the resting finger, and when it next repeats (keys are typed as
+    /// press+release, never held, so the desktop's own fast repeat never starts).
+    repeat: Option<(u16, Instant)>,
     /// The current touch started in the right icon at this time (and hasn't left it).
     hold_since: Option<Instant>,
     hold_fired: bool,
@@ -28,7 +32,7 @@ pub struct Pad {
 
 impl Pad {
     pub fn new() -> Self {
-        Self { on: false, allowed: false, level: 8, lit: false, pressed: None, hold_since: None, hold_fired: false,
+        Self { on: false, allowed: false, level: 8, lit: false, repeat: None, hold_since: None, hold_fired: false,
                left_tap: false, waking: false, finger_down: false, last_touch: Instant::now() }
     }
 
@@ -53,12 +57,13 @@ impl Pad {
         self.lit = true;
         self.level = s.start_level.clamp(1, 8);
         self.last_touch = now;
-        vec![Action::Grab(true), Action::Light(level_byte(self.level)), Action::EnsureNumlock]
+        // "on" first: the level byte alone leaves the pad at its previous brightness
+        vec![Action::Grab(true), Action::Light(LIGHT_ON), Action::Light(level_byte(self.level)), Action::EnsureNumlock]
     }
 
     fn turn_off(&mut self) -> Vec<Action> {
         let mut a = Vec::new();
-        if let Some(code) = self.pressed.take() { a.push(Action::Key { code, down: false }); }
+        self.repeat = None;
         self.on = false;
         self.lit = false;
         a.push(Action::Light(LIGHT_OFF));
@@ -77,12 +82,17 @@ impl Pad {
                 if self.on && !self.lit {
                     self.lit = true;
                     self.waking = true;
+                    a.push(Action::Light(LIGHT_ON));
                     a.push(Action::Light(level_byte(self.level)));
                     return a;
                 }
                 if !self.on { return a; }
                 match hit {
-                    Hit::Key(code) => { self.pressed = Some(code); a.push(Action::Key { code, down: true }); }
+                    Hit::Key(code) => {
+                        a.push(Action::Key { code, down: true });
+                        a.push(Action::Key { code, down: false });
+                        self.repeat = s.repeat_delay.map(|d| (code, now + d));
+                    }
                     Hit::LeftIcon => self.left_tap = true,
                     _ => {}
                 }
@@ -97,14 +107,13 @@ impl Pad {
                 self.last_touch = now;
                 self.hold_since = None;
                 self.waking = false;
-                if let Some(code) = self.pressed.take() { a.push(Action::Key { code, down: false }); }
+                self.repeat = None;
                 if std::mem::take(&mut self.left_tap) && self.on {
                     self.level = self.level % 8 + 1;
                     a.push(Action::Light(level_byte(self.level)));
                 }
             }
         }
-        let _ = s;
         a
     }
 
@@ -114,6 +123,12 @@ impl Pad {
                 self.hold_fired = true;
                 self.hold_since = None;
                 return if self.on { self.turn_off() } else if self.allowed { self.turn_on(s, now) } else { Vec::new() };
+            }
+        }
+        if let Some((code, next)) = self.repeat {
+            if self.on && self.finger_down && now >= next {
+                self.repeat = Some((code, next + REPEAT_EVERY));
+                return vec![Action::Key { code, down: true }, Action::Key { code, down: false }];
             }
         }
         if let Some(idle) = s.idle {
@@ -128,10 +143,10 @@ impl Pad {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::numpad::layout::{Hit, LIGHT_OFF, level_byte};
+    use crate::features::numpad::layout::{Hit, LIGHT_OFF, LIGHT_ON, level_byte};
     use crate::features::numpad::mt::Touch;
     use std::time::{Duration, Instant};
-    fn s() -> Settings { Settings { hold: Duration::from_millis(1000), idle: Some(Duration::from_secs(60)), start_level: 8 } }
+    fn s() -> Settings { Settings { hold: Duration::from_millis(1000), idle: Some(Duration::from_secs(60)), start_level: 8, repeat_delay: Some(Duration::from_millis(600)) } }
     fn ms(t0: Instant, n: u64) -> Instant { t0 + Duration::from_millis(n) }
     fn hold_icon(p: &mut Pad, t0: Instant) -> Vec<Action> {
         let mut a = p.touch(Touch::Down { x: 4000, y: 50 }, Hit::RightIcon, &s(), t0);
@@ -144,7 +159,8 @@ mod tests {
         let (mut p, t0) = (Pad::new(), Instant::now());
         p.set_allowed(true);
         let a = hold_icon(&mut p, t0);
-        assert_eq!(a, [Action::Grab(true), Action::Light(level_byte(8)), Action::EnsureNumlock]);
+        // "on" first, then the level: the level byte alone keeps the pad's previous brightness
+        assert_eq!(a, [Action::Grab(true), Action::Light(LIGHT_ON), Action::Light(level_byte(8)), Action::EnsureNumlock]);
         assert!(p.is_on());
     }
 
@@ -175,9 +191,10 @@ mod tests {
         p.touch(Touch::Up, Hit::None, &s(), t0);
         hold_icon(&mut p, t0);
         p.touch(Touch::Up, Hit::None, &s(), ms(t0, 1100));
-        assert_eq!(p.touch(Touch::Down { x: 1, y: 1 }, Hit::Key(72), &s(), ms(t0, 1200)), [Action::Key { code: 72, down: true }]);
+        // typed once at touch (never held down, so the desktop's own fast repeat can't start)
+        assert_eq!(p.touch(Touch::Down { x: 1, y: 1 }, Hit::Key(72), &s(), ms(t0, 1200)), [Action::Key { code: 72, down: true }, Action::Key { code: 72, down: false }]);
         assert!(p.touch(Touch::Move { x: 900, y: 900 }, Hit::Key(80), &s(), ms(t0, 1250)).is_empty(), "moving doesn't retype");
-        assert_eq!(p.touch(Touch::Up, Hit::None, &s(), ms(t0, 1300)), [Action::Key { code: 72, down: false }]);
+        assert!(p.touch(Touch::Up, Hit::None, &s(), ms(t0, 1300)).is_empty());
     }
 
     #[test]
@@ -198,9 +215,10 @@ mod tests {
         p.touch(Touch::Up, Hit::None, &s(), ms(t0, 1100));
         assert_eq!(p.tick(&s(), ms(t0, 1100 + 60_000)), [Action::Light(LIGHT_OFF)]);
         assert!(p.is_on(), "still on (grabbed), just dark");
-        assert_eq!(p.touch(Touch::Down { x: 1, y: 1 }, Hit::Key(72), &s(), ms(t0, 70_000)), [Action::Light(level_byte(8))]);
-        assert!(p.touch(Touch::Up, Hit::None, &s(), ms(t0, 70_100)).is_empty(), "no key up for a key never pressed");
-        assert_eq!(p.touch(Touch::Down { x: 1, y: 1 }, Hit::Key(72), &s(), ms(t0, 70_200)), [Action::Key { code: 72, down: true }]);
+        assert_eq!(p.touch(Touch::Down { x: 1, y: 1 }, Hit::Key(72), &s(), ms(t0, 70_000)), [Action::Light(LIGHT_ON), Action::Light(level_byte(8))]);
+        assert!(p.tick(&s(), ms(t0, 71_000)).is_empty(), "the waking touch doesn't repeat either");
+        assert!(p.touch(Touch::Up, Hit::None, &s(), ms(t0, 71_100)).is_empty());
+        assert_eq!(p.touch(Touch::Down { x: 1, y: 1 }, Hit::Key(72), &s(), ms(t0, 71_200)), [Action::Key { code: 72, down: true }, Action::Key { code: 72, down: false }]);
     }
 
     #[test]
@@ -221,8 +239,9 @@ mod tests {
         p.set_allowed(true);
         hold_icon(&mut p, ms(t0, 2000));
         p.touch(Touch::Up, Hit::None, &s(), ms(t0, 3100));
-        p.touch(Touch::Down { x: 1, y: 1 }, Hit::Key(72), &s(), ms(t0, 3200)); // key held
-        assert_eq!(p.set_allowed(false), [Action::Key { code: 72, down: false }, Action::Light(LIGHT_OFF), Action::Grab(false)]);
+        p.touch(Touch::Down { x: 1, y: 1 }, Hit::Key(72), &s(), ms(t0, 3200)); // finger resting on a key
+        assert_eq!(p.set_allowed(false), [Action::Light(LIGHT_OFF), Action::Grab(false)]);
+        assert!(p.tick(&s(), ms(t0, 5000)).is_empty(), "no repeat after turning off");
         assert!(!p.is_on());
     }
 
@@ -234,5 +253,24 @@ mod tests {
         p.touch(Touch::Up, Hit::None, &s(), ms(t0, 1100));
         let a = hold_icon(&mut p, ms(t0, 2000));
         assert_eq!(a, [Action::Light(LIGHT_OFF), Action::Grab(false)]);
+    }
+
+    #[test]
+    fn held_key_repeats_after_the_delay() {
+        let (mut p, t0) = (Pad::new(), Instant::now());
+        p.set_allowed(true);
+        hold_icon(&mut p, t0);
+        p.touch(Touch::Up, Hit::None, &s(), ms(t0, 1100));
+        p.touch(Touch::Down { x: 1, y: 1 }, Hit::Key(80), &s(), ms(t0, 2000));
+        assert!(p.tick(&s(), ms(t0, 2500)).is_empty(), "not before 600 ms");
+        let press = [Action::Key { code: 80, down: true }, Action::Key { code: 80, down: false }];
+        assert_eq!(p.tick(&s(), ms(t0, 2600)), press);
+        assert!(p.tick(&s(), ms(t0, 2650)).is_empty());
+        assert_eq!(p.tick(&s(), ms(t0, 2700)), press, "then every 100 ms");
+        p.touch(Touch::Up, Hit::None, &s(), ms(t0, 2750));
+        assert!(p.tick(&s(), ms(t0, 3000)).is_empty(), "stops on lift");
+        let no_repeat = Settings { repeat_delay: None, ..s() };
+        p.touch(Touch::Down { x: 1, y: 1 }, Hit::Key(80), &no_repeat, ms(t0, 4000));
+        assert!(p.tick(&no_repeat, ms(t0, 9000)).is_empty(), "repeat off");
     }
 }
