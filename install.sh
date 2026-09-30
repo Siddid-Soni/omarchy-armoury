@@ -6,10 +6,14 @@ cd "$(dirname "$0")"
 LIB=/usr/local/lib/omarchy-armoury
 UNIT_DIR=~/.config/systemd/user
 
+# Build outside the source tree: when installed with `omarchy plugin add`, this folder is
+# the live plugin, and a Rust target directory (several GB) doesn't belong in it.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-armoury/target}"
 cargo build --release --workspace
+BIN="$CARGO_TARGET_DIR/release"
 
-install -Dm755 target/release/armouryd ~/.local/bin/armouryd
-install -Dm755 target/release/armoury ~/.local/bin/armoury
+install -Dm755 "$BIN"/armouryd ~/.local/bin/armouryd
+install -Dm755 "$BIN"/armoury ~/.local/bin/armoury
 install -Dm644 packaging/systemd/armouryd.service "$UNIT_DIR/armouryd.service"
 install -Dm644 packaging/systemd/ghelper-dropin.conf "$UNIT_DIR/app-ghelper@autostart.service.d/omarchy-armoury.conf"
 
@@ -18,7 +22,7 @@ install -Dm644 packaging/hypr/omarchy-armoury.lua ~/.config/hypr/omarchy-armoury
 HYPR_LINE='if package.searchpath("hypr.omarchy-armoury", package.path) then require("hypr.omarchy-armoury") end -- omarchy-armoury'
 grep -qxF "$HYPR_LINE" ~/.config/hypr/bindings.lua 2>/dev/null || printf '\n%s\n' "$HYPR_LINE" >> ~/.config/hypr/bindings.lua
 
-sudo install -Dm755 target/release/armoury-root "$LIB/armoury-root"
+sudo install -Dm755 "$BIN"/armoury-root "$LIB/armoury-root"
 sudo install -Dm644 packaging/polkit/org.omarchy.armoury.policy /usr/share/polkit-1/actions/org.omarchy.armoury.policy
 sed "s/@USER@/$USER/" packaging/polkit/50-omarchy-armoury.rules.in |
   sudo install -Dm644 /dev/stdin /etc/polkit-1/rules.d/50-omarchy-armoury.rules

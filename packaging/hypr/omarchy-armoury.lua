@@ -11,7 +11,7 @@ end
 hl.unbind("SUPER + W")
 o.bind("SUPER + W", "Close window", function()
   if armoury_open() then
-    hl.exec_cmd("omarchy-shell shell hide asus.armoury")
+    hl.exec_cmd("omarchy-shell shell hide io.github.siddid-soni.armoury")
   else
     hl.dispatch(hl.dsp.window.close())
   end

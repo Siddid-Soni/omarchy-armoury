@@ -37,4 +37,7 @@ sudo rm -f /usr/share/polkit-1/actions/org.omarchy.armoury.policy \
   /etc/udev/rules.d/70-omarchy-armoury.rules \
   /etc/modules-load.d/omarchy-armoury.conf
 
-echo "Removed omarchy-armoury."
+rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-armoury"
+
+echo "Removed omarchy-armoury's daemon and system files."
+echo "To remove the plugin itself: omarchy plugin remove io.github.siddid-soni.armoury"

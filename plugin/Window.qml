@@ -33,7 +33,7 @@ Item {
   // armouryd asks this so the ROG key can toggle the window
   function isOpen() { return root.opened ? "open" : "closed" }
   function dismiss() {
-    if (root.shell && typeof root.shell.hide === "function") root.shell.hide((root.manifest && root.manifest.id) || "asus.armoury")
+    if (root.shell && typeof root.shell.hide === "function") root.shell.hide((root.manifest && root.manifest.id) || "io.github.siddid-soni.armoury")
     else close()
   }
 
@@ -177,25 +177,37 @@ Item {
                   "Fan curves, power limits, GPU"
                 ] : []
                 Column {
+                  id: perfGraphs
                   width: parent.width
                   spacing: Style.space(10)
+                  // the graphs share the space under the text (power only when the firmware reports it)
+                  readonly property bool hasPower: armoury.hist.power.some(function(v) { return v > 0 })
+                  readonly property int count: hasPower ? 3 : 2
+                  readonly property real graphH: Math.max(Style.space(14), (parent.height - spacing * (count - 1)) / count - Style.space(20))
                   Sparkline {
+                    shown: root.opened
+                    graphHeight: perfGraphs.graphH
                     label: "CPU temperature"; fg: root.fg; fontFamily: root.fontFamily
                     value: root.snap && root.snap.perf && root.snap.perf.cpu_temp_c ? Math.round(root.snap.perf.cpu_temp_c) + " °C" : "—"
                     series: [{ values: armoury.hist.cpuTemp, color: root.accent }]
-                    minimum: 30; maximum: 100
+                    minSpan: 15; floor: 0
                   }
                   Sparkline {
+                    shown: root.opened
+                    graphHeight: perfGraphs.graphH
                     label: "Fans (CPU · GPU)"; fg: root.fg; fontFamily: root.fontFamily
                     value: root.snap && root.snap.perf ? (root.snap.perf.cpu_fan_rpm || 0) + " · " + (root.snap.perf.gpu_fan_rpm || 0) + " rpm" : "—"
                     series: [{ values: armoury.hist.cpuFan, color: root.accent }, { values: armoury.hist.gpuFan, color: root.dim }]
-                    minimum: 0
+                    minSpan: 1500; floor: 0
                   }
                   Sparkline {
+                    shown: root.opened
+                    visible: perfGraphs.hasPower
+                    graphHeight: perfGraphs.graphH
                     label: "Power draw"; fg: root.fg; fontFamily: root.fontFamily
                     value: root.snap && root.snap.perf && root.snap.perf.power_draw_w ? root.snap.perf.power_draw_w.toFixed(1) + " W" : "—"
                     series: [{ values: armoury.hist.power, color: root.accent }]
-                    minimum: 0
+                    minSpan: 10; floor: 0
                   }
                 }
               }
@@ -261,10 +273,11 @@ Item {
                     }
                   }
                   Sparkline {
+                    shown: root.opened
                     label: "Charge, last 30 min"; fg: root.fg; fontFamily: root.fontFamily
                     value: ""
                     series: [{ values: armoury.batteryHist, color: root.accent }]
-                    minimum: 0; maximum: 100
+                    minSpan: 10; floor: 0; ceiling: 100
                   }
                 }
               }

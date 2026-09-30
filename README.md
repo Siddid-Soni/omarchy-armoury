@@ -2,7 +2,7 @@
 
 ASUS ROG control for [Omarchy](https://omarchy.org): a replacement for G-Helper,
 built into the Omarchy bar. It has a bar widget and a settings window (the
-`asus.armoury` Omarchy plugin), backed by three Rust programs: a daemon
+`io.github.siddid-soni.armoury` Omarchy plugin), backed by three Rust programs: a daemon
 (`armouryd`), a CLI (`armoury`) and a small root helper (`armoury-root`).
 Design notes: `docs/superpowers/specs/`. Open follow-ups: `docs/superpowers/backlog.md`.
 
@@ -115,13 +115,69 @@ zone fix), not code.
 
 ## Install
 
-    ./install.sh
+Needs Omarchy, **asusd** (asusctl), **supergfxd** (supergfxctl), PipeWire and a Rust
+toolchain (`cargo`, to build the daemon).
 
-    armoury status          # what the daemon sees
+    omarchy plugin add https://github.com/Siddid-Soni/omarchy-armoury.git --enable
+    ~/.config/omarchy/plugins/io.github.siddid-soni.armoury/install.sh
 
-Needs asusd (asusctl), supergfxd, PipeWire (`pw-record`, for Music) and Omarchy.
-One sudo prompt installs the root helper, polkit rule, udev rules and pacman hook.
+The first command adds the bar widget and window. The second builds and installs the
+daemon: the plugin does nothing without it, and the popup says so until it runs.
+`install.sh` asks for sudo once (see *What it installs*). It ends by putting armouryd
+in control, which starts asusd and stops G-Helper if it's installed. The build goes to
+`~/.cache/omarchy-armoury`, not the plugin folder.
 
-## Uninstall
+## Usage
 
-    ./uninstall.sh
+- Click the bar icon for the popup (mode, GPU, quick toggles). Press *Open Armoury* or
+  the ROG key for the full window.
+- `armoury status` shows what the daemon sees; `armoury --help` lists the commands.
+- Move the widget: `omarchy bar move io.github.siddid-soni.armoury --section right`.
+
+## Update
+
+    omarchy plugin update io.github.siddid-soni.armoury
+    ~/.config/omarchy/plugins/io.github.siddid-soni.armoury/install.sh
+
+Rerun `install.sh` after every update, so the daemon matches the plugin.
+
+## Remove
+
+    ~/.config/omarchy/plugins/io.github.siddid-soni.armoury/uninstall.sh
+    omarchy plugin remove io.github.siddid-soni.armoury
+
+`uninstall.sh` gives control back (asusd stopped and its mask restored, G-Helper
+restarted if you have it), restores asusd's model file, and removes everything below.
+
+## What it installs (privilege boundaries)
+
+The plugin itself is QML running in the Omarchy shell; it only talks to armouryd over a
+Unix socket (`$XDG_RUNTIME_DIR/armoury.sock`). Everything else comes from `install.sh`:
+
+- **User files**:
+  - `~/.local/bin/armouryd`, `~/.local/bin/armoury`
+  - the `armouryd` user service
+  - `~/.config/omarchy-armoury/config.toml`
+  - `~/.config/hypr/omarchy-armoury.lua`, plus one line in `bindings.lua` (SUPER+W closes the window)
+  - a drop-in that keeps G-Helper from autostarting while armouryd is in control
+- **Root helper**: `/usr/local/lib/omarchy-armoury/armoury-root`, run through `pkexec`.
+  - A polkit rule lets *your user* run it **without a password**.
+  - It only has a fixed set of commands, and it re-checks every argument:
+    - start or stop asusd (`takeover` / `handback`)
+    - patch or restore asusd's model file
+    - power limits and CPU boost
+    - NVIDIA clocks
+    - the kernel sleep mode
+    - Intel undervolt
+- **udev rules** (`/etc/udev/rules.d/70-omarchy-armoury.rules`): give the logged-in
+  seat user access (`uaccess`, nothing world-writable) to:
+  - the ASUS keyboard's key events and lighting device (hidraw)
+  - the touchpad and its i2c bus (NumberPad)
+  - `/dev/uinput`
+- **Kernel module**: `i2c-dev` loaded at boot (`/etc/modules-load.d/`), for the NumberPad light.
+- **pacman hook**: re-applies the asusd model-file fix after asusctl upgrades.
+- **asusd**: unmasked and started (its own udev rule starts it at boot).
+- **Audio**: the Music effect records the default output's audio with `pw-record` while
+  it runs. The audio is analysed in memory only, never stored or sent.
+
+Nothing is downloaded at run time. armouryd makes no network connections.
