@@ -62,16 +62,14 @@ Design notes: `docs/superpowers/specs/`. Open follow-ups: `docs/superpowers/back
 - The OSD shows keyboard-brightness changes (Fn+F2/F3) and the mode key.
 - Mode switches are serialized, one at a time, and stock modes send only the firmware
   policy change. Rapid firmware calls hung the embedded controller on the G533ZW.
-- **Coexistence with G-Helper**: armouryd starts in *observe* mode and only reads.
-  - `armoury takeover` stops G-Helper and starts asusd so armouryd can control the laptop.
-  - `armoury handback` stops asusd and gives control back to G-Helper.
-  - Settings can be changed only while armouryd is in control.
+- Installing puts armouryd in control and starts asusd. If G-Helper is installed, it's
+  stopped and its autostart is blocked. Uninstalling gives control back.
 
 ### CLI
 
 `armoury status`, `profile`, `manual`, `undervolt`, `gpu`, `light`, `kbd`, `music`,
 `numpad`, `keys`, `battery`, `display`, `toggle`, `sleep`, `auto`, `keystone`,
-`takeover`, `handback`, `watch`. `armoury <command> --help` has the details.
+`watch`. `armoury <command> --help` has the details.
 
 ## Hardware support
 
@@ -83,7 +81,7 @@ exists, but only the G533ZW has been tested.
 |---|---|---|
 | Modes, fan curves, charge limit, overdrive, boot sound, keyboard brightness and effects | ASUS laptops supported by **asusd** | Only what asusd reports is shown |
 | Power limits, NVIDIA Dynamic Boost and temperature target | Laptops with the `asus-nb-wmi` attributes | Hidden when absent |
-| GPU switching | **supergfxd**, plus Omarchy's hybrid-GPU toggle | Integrated ↔ Ultimate goes through Hybrid (two reboots) |
+| GPU switching | **supergfxd**, plus Omarchy's hybrid-GPU toggle | Each switch needs a reboot; Integrated ↔ Ultimate goes through Hybrid (two reboots) |
 | Undervolt | Intel CPUs with an unlocked voltage MSR | BIOS-locked on the G533ZW, so it's shown as unavailable |
 | NVIDIA clocks and GPU status | NVIDIA dGPUs (NVML) | |
 | ROG key, Fn+F4, Fn+F5 | Models whose hotkeys come through `asus-nb-wmi` | Key codes captured on the G533ZW |
@@ -108,19 +106,18 @@ zone fix), not code.
   previous effect.
 - **The lighting preview is an approximation** of the firmware effects, especially the
   reactive ones (Highlight, Laser, Ripple), which are shown answering simulated key presses.
-- **GPU switching**: the actual switch (which reboots) hasn't been tested end to end on
-  this machine yet.
+- **GPU switching needs reboots.** Integrated ↔ Hybrid and Hybrid ↔ Ultimate take one
+  reboot each. Integrated ↔ Ultimate has no direct path: it's two steps through Hybrid,
+  so two reboots.
 - **The asusd zone fix edits a package file** (`/usr/share/asusd/aura_support.ron`). A
   pacman hook re-applies it after every asusctl upgrade, and it regenerates asusd's
   lighting config, which resets the effect once.
-- **Settings are read-only in observe mode.** Run `armoury takeover` first.
 
 ## Install
 
     ./install.sh
 
     armoury status          # what the daemon sees
-    armoury takeover        # let armouryd control the hardware (stops G-Helper)
 
 Needs asusd (asusctl), supergfxd, PipeWire (`pw-record`, for Music) and Omarchy.
 One sudo prompt installs the root helper, polkit rule, udev rules and pacman hook.

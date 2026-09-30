@@ -124,7 +124,7 @@ Item {
                   : root.modeLabel(root.snap.perf.mode || root.snap.perf.profile) + " · GPU " + root.gpuLabel(root.snap.gpu.mode)
                     + (root.snap.gpu.pending ? " → " + root.gpuLabel(root.snap.gpu.pending) + " after reboot" : "")
                     + (root.snap.keystone ? " · Keystone" : "")
-                    + (armoury.active ? "" : " · watching (G-Helper in control)")).toUpperCase()
+                    + (armoury.active ? "" : " · read-only")).toUpperCase()
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -133,19 +133,7 @@ Item {
               }
             }
 
-            Item { width: Math.max(0, header.width - header.children[0].width - header.children[1].width - controlBtn.width - closeBtn.width - header.spacing * 4); height: 1 }
-
-            Button {
-              id: controlBtn
-              visible: armoury.online
-              anchors.verticalCenter: parent.verticalCenter
-              text: armoury.active ? "Hand back to G-Helper" : "Take over"
-              fontSize: Style.font.bodySmall
-              foreground: root.fg
-              fontFamily: root.fontFamily
-              bordered: true
-              onClicked: armoury.run({ cmd: armoury.active ? "handback" : "takeover" })
-            }
+            Item { width: Math.max(0, header.width - header.children[0].width - header.children[1].width - closeBtn.width - header.spacing * 3); height: 1 }
             Button {
               id: closeBtn
               anchors.verticalCenter: parent.verticalCenter

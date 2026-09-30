@@ -177,9 +177,9 @@ Panel {
           }
         }
 
-        // ---------- Observe / offline banner ----------
+        // ---------- Offline banner ----------
         Rectangle {
-          visible: !root.active
+          visible: !root.online
           width: parent.width
           implicitHeight: bannerRow.implicitHeight + Style.space(16)
           radius: Style.space(6)
@@ -194,25 +194,13 @@ Panel {
             spacing: Style.space(10)
 
             Text {
-              width: parent.width - takeoverBtn.width - parent.spacing
+              width: parent.width
               anchors.verticalCenter: parent.verticalCenter
               wrapMode: Text.WordWrap
-              text: !root.online ? "armouryd is not running. Start it with: systemctl --user start armouryd"
-                : "Watching only: G-Helper is in control of the hardware."
+              text: "armouryd is not running. Start it with: systemctl --user start armouryd"
               color: root.fg
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
-            }
-            Button {
-              id: takeoverBtn
-              visible: root.online
-              anchors.verticalCenter: parent.verticalCenter
-              text: "Take over"
-              foreground: root.fg
-              fontFamily: root.fontFamily
-              fontSize: Style.font.bodySmall
-              bordered: true
-              onClicked: client.run({ cmd: "takeover" })
             }
           }
         }
@@ -390,15 +378,7 @@ Panel {
         Row {
           width: parent.width
           spacing: Style.space(8)
-          Button {
-            visible: root.active
-            text: "Hand back to G-Helper"
-            fontSize: Style.font.caption
-            foreground: root.dim
-            fontFamily: root.fontFamily
-            onClicked: client.run({ cmd: "handback" })
-          }
-          Item { width: parent.width - (root.active ? parent.children[0].width : 0) - openBtn.width - parent.spacing * 2; height: 1 }
+          Item { width: parent.width - openBtn.width - parent.spacing; height: 1 }
           Button {
             id: openBtn
             text: "Open Armoury ›"
