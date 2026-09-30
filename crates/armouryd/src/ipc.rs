@@ -527,17 +527,26 @@ impl Daemon {
         }
         if !force && st.failed.as_ref() == Some(&target) && st.retry_at.is_some_and(|t| now < t) { return Vec::new(); }
         let ctx = HwCtx { cpu_boost_now: snap.perf.cpu_boost, ..self.hw_ctx(dgpu_active, st) };
-        // one-time cleanup only when leaving Manual (its base slot) or on the first
-        // apply after start/takeover (G-Helper may have left the current slot's curves on)
-        let cleanup = match &st.applied {
-            Some(Target::Manual { base, .. }) => Some(*base),
-            None => Some(fw),
-            Some(Target::Stock(_)) => None,
-        };
-        let errs = match &manual {
-            Some(p) => manual::apply_manual(p, ctx, &*self.asusd, &*self.svc).await,
-            None => manual::apply_stock(fw, cleanup, ctx, &*self.asusd, &*self.svc).await,
-        };
+        // Custom curves go off on every slot armouryd turned on except the one Manual keeps
+        // using, and once per active run on the current slot (G-Helper may have left them on).
+        let keep = manual.as_ref().map(|p| p.base);
+        let mut clear: Vec<Profile> = st.curve_slots.iter().copied().filter(|s| Some(*s) != keep).collect();
+        if !st.startup_cleaned && Some(fw) != keep && !clear.contains(&fw) { clear.push(fw); }
+        let mut errs = Vec::new();
+        for slot in &clear {
+            match with_retry(|| self.asusd.set_fan_curves_enabled(slot.to_asusd(), false)).await {
+                Ok(()) => st.curve_slots.retain(|s| s != slot),
+                Err(e) => errs.push(format!("fan curves off: {e:#}")),
+            }
+        }
+        if errs.is_empty() { st.startup_cleaned = true; }
+        errs.extend(match &manual {
+            Some(p) => {
+                if !st.curve_slots.contains(&p.base) { st.curve_slots.push(p.base); }
+                manual::apply_manual(p, ctx, &*self.asusd, &*self.svc).await
+            }
+            None => manual::apply_stock(fw, clear.contains(&fw), ctx, &*self.asusd, &*self.svc).await,
+        });
         self.note_apply(&target, &errs);
         if errs.is_empty() {
             *st = ApplyState {
@@ -546,11 +555,23 @@ impl Daemon {
                 uv_at_stock: if ctx.uv_unlocked { settings.uv_mv.unwrap_or(0) == 0 } else { st.uv_at_stock },
                 nv_at_stock: if dgpu_active { nv_is_stock(&settings) } else { st.nv_at_stock },
                 probe_retry_at: st.probe_retry_at,
+                curve_slots: std::mem::take(&mut st.curve_slots),
+                startup_cleaned: st.startup_cleaned,
                 ..Default::default()
             };
             *self.last_reapply.lock().unwrap() = now;
         } else {
-            *st = ApplyState { failed: Some(target), retry_at: Some(now + RETRY_BACKOFF), dgpu_was_active: dgpu_active, probe_retry_at: st.probe_retry_at, ..Default::default() };
+            let fail_count = if st.failed.as_ref() == Some(&target) { st.fail_count + 1 } else { 1 };
+            *st = ApplyState {
+                failed: Some(target),
+                retry_at: Some(now + retry_backoff(fail_count)),
+                fail_count,
+                dgpu_was_active: dgpu_active,
+                probe_retry_at: st.probe_retry_at,
+                curve_slots: std::mem::take(&mut st.curve_slots),
+                startup_cleaned: st.startup_cleaned,
+                ..Default::default()
+            };
         }
         errs
     }
@@ -688,6 +709,15 @@ impl Daemon {
     /// policy directly instead of calling choose_mode, which would deadlock.
     /// The first tick after start/takeover only records the source.
     async fn follow_source_mode(&self, snap: &Snapshot, st: &mut ApplyState) -> bool {
+        // Older builds turned asusd's own switching on; while armouryd owns switching, make
+        // sure it's off once per active run, or both would switch on every plug event.
+        let owns = { let c = self.config.lock().await; c.system.profile_ac.is_some() || c.system.profile_battery.is_some() };
+        if owns && !self.sys_src.lock().unwrap().asusd_switching_off {
+            match with_retry(|| self.asusd.disable_source_switching()).await {
+                Ok(()) => self.sys_src.lock().unwrap().asusd_switching_off = true,
+                Err(e) => eprintln!("armouryd: turn off asusd's AC/battery switching: {e:#}"),
+            }
+        }
         let Some(ac) = snap.lighting.on_ac else { return false };
         let prev = self.sys_src.lock().unwrap().mode_on_ac.replace(ac);
         if prev != Some(!ac) { return false; }
@@ -858,11 +888,18 @@ impl Daemon {
             Request::ManualProfiles => Response::ok(serde_json::to_value(self.manual_view().await).unwrap()),
             Request::DefaultCurves { base } => {
                 if let Err(r) = self.write_guard().await { return r; }
+                // a firmware write like any mode change: never overlaps one
+                let mut st = self.apply.lock().await;
                 if let Err(e) = with_retry(|| self.asusd.reset_fan_curves(base.to_asusd())).await { return Response::err(format!("{e:#}")); }
                 let raw = match with_retry(|| self.asusd.fan_curves(base.to_asusd())).await { Ok(r) => r, Err(e) => return Response::err(format!("{e:#}")) };
                 // the reset also cleared Manual's curves if they live in that slot
                 let in_slot = { let c = self.config.lock().await; c.manual.enabled && c.manual.active_profile().is_some_and(|p| p.base == base) };
-                if in_slot { self.reapply_manual().await; }
+                if in_slot {
+                    st.applied = None;
+                    st.failed = None;
+                    let errs = self.tick_locked(&mut st, true).await;
+                    if !errs.is_empty() { return Response::err(format!("curves reset, but re-applying Manual failed: {}", errs.join("; "))); }
+                }
                 Response::ok(serde_json::to_value(raw.iter().filter_map(fan::from_raw).collect::<Vec<_>>()).unwrap())
             }
             Request::SaveManualProfile { mut profile, original_name } => {
@@ -1044,6 +1081,8 @@ struct SysSource {
     last_check: Option<tokio::time::Instant>,
     /// Power source seen by the mode switch (None until the first active tick).
     mode_on_ac: Option<bool>,
+    /// asusd's own AC/battery switching was turned off this active run.
+    asusd_switching_off: bool,
 }
 
 const REFRESH_RECHECK: Duration = Duration::from_secs(60);
@@ -1090,6 +1129,20 @@ struct ApplyState {
     probe_retry_at: Option<tokio::time::Instant>,
     /// Set by switch_profile for the apply that follows its own policy change.
     mode_just_set: bool,
+    /// asusd slots whose custom fan curves armouryd turned on and hasn't turned off yet.
+    /// Survives re-applies and failures (unlike `applied`), so a stock mode can never
+    /// inherit a Manual profile's curves.
+    curve_slots: Vec<Profile>,
+    /// The current slot's curves were turned off once this active run (G-Helper may have left them on).
+    startup_cleaned: bool,
+    /// Consecutive failures applying `failed`, for the retry backoff.
+    fail_count: u32,
+}
+
+/// 30 s, doubling per consecutive failure, capped at 10 min: a failure that has nothing to
+/// do with the EC must not turn into endless periodic firmware writes.
+fn retry_backoff(fail_count: u32) -> Duration {
+    RETRY_BACKOFF.saturating_mul(1 << fail_count.saturating_sub(1).min(5)).min(Duration::from_secs(600))
 }
 
 /// What the apply loop keeps in force.
@@ -2283,7 +2336,8 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
     async fn takeover_re_enters_manual() {
         let r = mrig(true, &GAMING.replace("enabled = false", "enabled = true"));
         r.d.tick().await; // first active tick (firmware still balanced)
-        assert_eq!(acalls_of(&r)[0], "set_profile 1", "{:?}", acalls_of(&r));
+        // G-Helper may have left the current slot's curves on: off once, then Manual's base
+        assert_eq!(acalls_of(&r)[..2], ["set_fan_curves_enabled 0 false", "set_profile 1"], "{:?}", acalls_of(&r));
         assert!(r.d.config.lock().await.manual.enabled, "re-entering is not an outside change");
     }
 
@@ -2341,7 +2395,7 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
         assert!(r.d.handle(set("manual")).await.ok);
         clear(&r);
         assert!(r.d.handle(Request::ActivateManualProfile { name: "Quiet work".into() }).await.ok);
-        assert_eq!(acalls_of(&r)[0], "set_profile 2", "{:?}", acalls_of(&r));
+        assert_eq!(acalls_of(&r)[..2], ["set_fan_curves_enabled 1 false", "set_profile 2"], "old base's curves off, then the new base");
         r.d.tick().await;
         assert!(r.d.config.lock().await.manual.enabled, "switching base for a new profile is ours");
     }
@@ -2365,5 +2419,63 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
         let saved = r.d.config.lock().await.manual.profiles[0].clone();
         assert_eq!(saved.curves.len(), 1, "copied from asusd's Silent slot");
         assert!(!acalls_of(&r).iter().any(|c| c.starts_with("reset_fan_curves") || c.starts_with("set_fan_curve")), "read only: {:?}", acalls_of(&r));
+    }
+
+    // ---- final-review fixes ----
+
+    #[tokio::test]
+    async fn stock_mode_after_switching_manual_base_turns_old_slot_off() {
+        let r = mrig(true, &format!("{GAMING}\n[[manual.profiles]]\nname = \"Quiet work\"\nbase = \"quiet\"\n"));
+        *r.asusd.mirror.lock().unwrap() = Some(r.sys.clone());
+        r.d.tick().await;
+        assert!(r.d.handle(set("manual")).await.ok); // Gaming on Turbo: slot 1 curves on
+        clear(&r);
+        assert!(r.d.handle(Request::ActivateManualProfile { name: "Quiet work".into() }).await.ok); // slot 1 off, slot 2 on
+        assert!(r.d.handle(set("performance")).await.ok);
+        let c = acalls_of(&r);
+        assert!(c.contains(&"set_fan_curves_enabled 1 false".to_string()), "Turbo must not keep Gaming's curves: {c:?}");
+        assert!(c.contains(&"set_fan_curves_enabled 2 false".to_string()), "{c:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failing_stock_apply_does_not_resend_cleanup() {
+        let r = mrig(true, "");
+        *r.svc.fail_on.lock().unwrap() = Some("set-limits".into());
+        r.d.tick().await; // first apply: cleanup of the current slot, boost call fails
+        clear(&r);
+        for _ in 0..3 { tokio::time::advance(Duration::from_secs(31)).await; r.d.tick().await; }
+        assert!(acalls_of(&r).is_empty(), "retries touch only the failed root step: {:?}", acalls_of(&r));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failing_manual_apply_backs_off() {
+        let r = mrig(true, &GAMING.replace("enabled = false", "enabled = true"));
+        *r.asusd.mirror.lock().unwrap() = Some(r.sys.clone());
+        *r.svc.fail_on.lock().unwrap() = Some("set-limits".into());
+        r.d.tick().await; // fail #1 → retry after 30 s
+        tokio::time::advance(Duration::from_secs(31)).await; r.d.tick().await; // fail #2 → retry after 60 s
+        tokio::time::advance(Duration::from_secs(31)).await; r.d.tick().await; // too early
+        let writes = acalls_of(&r).iter().filter(|c| *c == "set_fan_curve 1 CPU").count();
+        assert_eq!(writes, 2, "backoff grows after repeated failures: {:?}", acalls_of(&r));
+    }
+
+    #[tokio::test]
+    async fn default_curves_waits_for_the_apply_lock() {
+        let r = mrig(true, GAMING);
+        let _held = r.d.apply.lock().await; // a mode switch in progress
+        let res = tokio::time::timeout(Duration::from_millis(300), r.d.handle(Request::DefaultCurves { base: Profile::Quiet })).await;
+        assert!(res.is_err(), "firmware curve reset must not overlap another firmware write");
+    }
+
+    #[tokio::test]
+    async fn asusd_source_switching_turned_off_once_when_armouryd_owns_it() {
+        let r = sys_rig(true, "[system]\nprofile_ac = \"performance\"\n");
+        r.d.tick().await;
+        r.d.tick().await;
+        let n = r.asusd.calls.lock().unwrap().iter().filter(|c| *c == "disable_source_switching").count();
+        assert_eq!(n, 1);
+        let none = sys_rig(true, "");
+        none.d.tick().await;
+        assert!(!none.asusd.calls.lock().unwrap().iter().any(|c| c == "disable_source_switching"));
     }
 }

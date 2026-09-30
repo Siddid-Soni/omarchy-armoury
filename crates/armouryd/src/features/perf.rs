@@ -93,7 +93,7 @@ pub async fn apply_nv(s: &ModeSettings, svc: &dyn Services) -> Vec<String> {
 }
 
 /// Time for the EC to settle after a thermal-policy write (g-helper waits 100 ms).
-const POLICY_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+pub(crate) const POLICY_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
 
 #[cfg(test)]
 mod tests {

@@ -4,26 +4,19 @@
 //! that mode's asusd slot and enabled, then the usual apply_mode for limits and GPU.
 use crate::features::fan::{self, RawCurve};
 use crate::features::limits::{self, Bounds, Limit};
-use crate::features::perf::{apply_mode, HwCtx};
+use crate::features::perf::{apply_mode, HwCtx, POLICY_SETTLE};
 use crate::hw::{with_retry, Asusd, Services};
 use armoury_proto::{Fan, FanCurve, ManualProfile, ModeSettings, Profile};
 
 /// A stock mode is the firmware's own: switch_profile has already changed the policy, and
-/// nothing else is sent (no curves, EPP or PPT; the user's rule after the EC hang).
-/// Only when leaving Manual, or at start/takeover (`cleanup`: the slot whose custom
-/// curves may be on), is there a one-time cleanup: that slot's curves off, the policy
-/// re-asserted if it didn't change (so the firmware reloads its own PPT), and
-/// boost / undervolt / NVIDIA back to stock where they aren't already.
-pub async fn apply_stock(p: Profile, cleanup: Option<Profile>, ctx: HwCtx, asusd: &dyn Asusd, svc: &dyn Services) -> Vec<String> {
+/// nothing else is sent (no curves, EPP or PPT; the user's rule after the EC hang). The
+/// caller turns off any custom curves armouryd left on; `reassert` is set when the current
+/// slot's curves were just turned off, so the firmware reloads its own power limits.
+pub async fn apply_stock(p: Profile, reassert: bool, ctx: HwCtx, asusd: &dyn Asusd, svc: &dyn Services) -> Vec<String> {
     let mut errors = Vec::new();
-    if let Some(slot) = cleanup {
-        if let Err(e) = with_retry(|| asusd.set_fan_curves_enabled(slot.to_asusd(), false)).await {
-            errors.push(format!("fan curves off: {e:#}"));
-        }
-        if slot == p && !ctx.mode_just_set {
-            if let Err(e) = with_retry(|| asusd.set_profile(p.to_asusd())).await {
-                errors.push(format!("re-assert mode: {e:#}"));
-            }
+    if reassert && !ctx.mode_just_set {
+        if let Err(e) = with_retry(|| asusd.set_profile(p.to_asusd())).await {
+            errors.push(format!("re-assert mode: {e:#}"));
         }
     }
     // no limits → apply_mode only restores boost (skipped when already on) and resets
@@ -37,6 +30,9 @@ pub async fn apply_manual(p: &ManualProfile, ctx: HwCtx, asusd: &dyn Asusd, svc:
     if let Err(e) = with_retry(|| asusd.set_profile(base)).await {
         return vec![format!("set base mode: {e:#}")];
     }
+    // let the firmware and asusd finish reacting to the policy change (asusd rewrites the
+    // mode's stored curves) before writing ours: overlapping EC writes hung this laptop
+    tokio::time::sleep(POLICY_SETTLE).await;
     let mut errors = Vec::new();
     for c in &p.curves {
         let raw = fan::to_raw(&FanCurve { enabled: true, ..c.clone() });
@@ -110,25 +106,34 @@ mod tests {
     async fn stock_to_stock_sends_nothing_extra() {
         let (asusd, svc) = (FakeAsusd::default(), FakeServices::default());
         let ctx = HwCtx { cpu_boost_now: Some(true), mode_just_set: true, uv_at_stock: true, nv_at_stock: true, ..Default::default() };
-        let errs = apply_stock(Profile::Quiet, None, ctx, &asusd, &svc).await;
+        let errs = apply_stock(Profile::Quiet, false, ctx, &asusd, &svc).await;
         assert!(errs.is_empty(), "{errs:?}");
         assert!(asusd.calls.lock().unwrap().is_empty(), "no curves / EPP / policy re-assert");
         assert!(svc.calls.lock().unwrap().is_empty(), "no root call when boost is already on");
     }
 
     #[tokio::test]
-    async fn leaving_manual_cleans_up_once() {
+    async fn stock_reasserts_only_when_its_slot_was_cleaned_and_policy_unchanged() {
         let (asusd, svc) = (FakeAsusd::default(), FakeServices::default());
-        // Manual ran on Turbo; the user picks Turbo (policy unchanged): curves off + re-assert
+        // Manual ran on Turbo; the user picks Turbo (policy unchanged): re-assert once, restore boost
         let ctx = HwCtx { cpu_boost_now: Some(false), ..Default::default() };
-        apply_stock(Profile::Performance, Some(Profile::Performance), ctx, &asusd, &svc).await;
-        assert_eq!(*asusd.calls.lock().unwrap(), ["set_fan_curves_enabled 1 false", "set_profile 1"]);
+        apply_stock(Profile::Performance, true, ctx, &asusd, &svc).await;
+        assert_eq!(*asusd.calls.lock().unwrap(), ["set_profile 1"]);
         assert!(svc.calls.lock().unwrap().iter().any(|c| c.ends_with("set-limits cpu_boost=on")), "boost was off");
-        // Manual on Turbo → Silent: the policy already changed, so only the old slot's curves go off
+        // the policy just changed: no re-assert
         let (asusd, svc) = (FakeAsusd::default(), FakeServices::default());
         let ctx = HwCtx { cpu_boost_now: Some(true), mode_just_set: true, ..Default::default() };
-        apply_stock(Profile::Quiet, Some(Profile::Performance), ctx, &asusd, &svc).await;
-        assert_eq!(*asusd.calls.lock().unwrap(), ["set_fan_curves_enabled 1 false"]);
+        apply_stock(Profile::Quiet, true, ctx, &asusd, &svc).await;
+        assert!(asusd.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_waits_for_the_policy_to_settle_before_writing_curves() {
+        let (asusd, svc) = (FakeAsusd::default(), FakeServices::default());
+        let p = ManualProfile { name: "G".into(), base: Profile::Quiet, curves: vec![curve(Fan::Cpu)], settings: ModeSettings::default() };
+        let t = tokio::time::Instant::now();
+        apply_manual(&p, HwCtx::default(), &asusd, &svc).await;
+        assert!(t.elapsed() >= std::time::Duration::from_millis(150), "spec §2: settle after the base change");
     }
 
     #[tokio::test]
