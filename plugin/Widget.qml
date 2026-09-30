@@ -30,7 +30,8 @@ Panel {
   readonly property var modes: [
     { id: "quiet", label: "Silent", icon: "󰾆" },
     { id: "balanced", label: "Balanced", icon: "󰾅" },
-    { id: "performance", label: "Turbo", icon: "󰓅" }
+    { id: "performance", label: "Turbo", icon: "󰓅" },
+    { id: "manual", label: "Manual", icon: "󰈐" }
   ]
   readonly property var gpuModes: [
     { id: "Integrated", label: "Integrated" },
@@ -38,7 +39,7 @@ Panel {
     { id: "AsusMuxDgpu", label: "Ultimate" }
   ]
 
-  readonly property string profile: snap && snap.perf ? (snap.perf.profile || "") : ""
+  readonly property string profile: snap && snap.perf ? (snap.perf.mode || snap.perf.profile || "") : ""
   readonly property var modeInfo: {
     for (var i = 0; i < modes.length; i++) if (modes[i].id === profile) return modes[i]
     return { id: "", label: "—", icon: "󰢮" }
@@ -230,7 +231,7 @@ Panel {
               model: root.modes
               Button {
                 required property var modelData
-                width: (modeRow.width - modeRow.spacing * 2) / 3
+                width: (modeRow.width - modeRow.spacing * (root.modes.length - 1)) / root.modes.length
                 iconText: modelData.icon
                 iconSize: Style.font.title
                 text: modelData.label

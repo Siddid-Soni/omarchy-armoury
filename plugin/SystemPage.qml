@@ -38,7 +38,7 @@ Flickable {
     for (var i = 0; i < rs.length; i++) out.push({ label: Math.round(rs[i]) + " Hz", value: Math.round(rs[i]) })
     return out
   }
-  readonly property var modeOptions: [{ label: "Silent", value: "quiet" }, { label: "Balanced", value: "balanced" }, { label: "Turbo", value: "performance" }]
+  readonly property var modeOptions: [{ label: "Silent", value: "quiet" }, { label: "Balanced", value: "balanced" }, { label: "Turbo", value: "performance" }, { label: "Manual", value: "manual" }]
   function onOff(v) { return [{ label: "On", value: true }, { label: "Off", value: false }] }
 
   Column {
@@ -103,7 +103,7 @@ Flickable {
     Text {
       width: parent.width
       wrapMode: Text.WordWrap
-      text: "asusd switches to these modes when you plug in or unplug."
+      text: "Switched automatically when you plug in or unplug. Manual uses the active manual profile."
       color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption
     }
     ChoiceRow {

@@ -25,6 +25,7 @@ Item {
     var p = {}
     try { p = JSON.parse(payloadJson || "{}") || {} } catch (e) {}
     var pg = p.page ? String(p.page) : ""
+    if (pg === "fans" || pg === "cpugpu") pg = "manual"   // pages merged into Manual
     root.page = pageTitle(pg) !== "" ? pg : ""
     root.opened = true
   }
@@ -36,7 +37,7 @@ Item {
     else close()
   }
 
-  function modeLabel(p) { return p === "quiet" ? "Silent" : p === "balanced" ? "Balanced" : p === "performance" ? "Turbo" : "—" }
+  function modeLabel(p) { return p === "quiet" ? "Silent" : p === "balanced" ? "Balanced" : p === "performance" ? "Turbo" : p === "manual" ? "Manual" : "—" }
   function gpuLabel(m) { return m === "AsusMuxDgpu" ? "Ultimate" : (m || "—") }
 
   ArmouryClient { id: armoury }
@@ -103,7 +104,7 @@ Item {
               }
               Text {
                 text: (!armoury.online ? "armouryd not running"
-                  : root.modeLabel(root.snap.perf.profile) + " · GPU " + root.gpuLabel(root.snap.gpu.mode)
+                  : root.modeLabel(root.snap.perf.mode || root.snap.perf.profile) + " · GPU " + root.gpuLabel(root.snap.gpu.mode)
                     + (root.snap.gpu.pending ? " → " + root.gpuLabel(root.snap.gpu.pending) + " after reboot" : "")
                     + (root.snap.keystone ? " · Keystone" : "")
                     + (armoury.active ? "" : " · watching (G-Helper in control)")).toUpperCase()
@@ -165,19 +166,11 @@ Item {
               readonly property real tileH: (height - spacing) / 2
 
               Tile {
-                pageId: "fans"; icon: "󰈐"; title: "Fans"
+                pageId: "manual"; icon: "󰈐"; title: "Manual"
                 lines: root.snap && root.snap.perf ? [
+                  root.snap.perf.mode === "manual" ? "In use: " + (root.snap.perf.manual_profile || "—") : "Profile: " + (root.snap.perf.manual_profile || "none yet"),
                   "CPU " + (root.snap.perf.cpu_fan_rpm || 0) + " rpm · GPU " + (root.snap.perf.gpu_fan_rpm || 0) + " rpm",
-                  root.snap.perf.cpu_temp_c ? "CPU " + Math.round(root.snap.perf.cpu_temp_c) + "°C" : "",
-                  "Curves per mode"
-                ] : []
-              }
-              Tile {
-                pageId: "cpugpu"; icon: "󰍛"; title: "CPU / GPU"
-                lines: root.snap ? [
-                  root.modeLabel(root.snap.perf.profile) + " mode",
-                  "dGPU " + (root.snap.gpu.dgpu_active === true ? "awake" : root.snap.gpu.dgpu_active === false ? "asleep" : "—"),
-                  root.snap.perf.undervolt ? (root.snap.perf.undervolt.unlocked ? "Undervolt available" : "Undervolt locked by BIOS") : "Power limits, EPP, boost"
+                  "Fan curves, power limits, GPU"
                 ] : []
               }
               Tile {
@@ -218,8 +211,7 @@ Item {
             Loader {
               anchors.fill: parent
               active: root.page !== ""
-              sourceComponent: root.page === "fans" ? fansPage
-                : root.page === "cpugpu" ? cpuGpuPage
+              sourceComponent: root.page === "manual" ? manualPage
                 : root.page === "lighting" ? lightingPage
                 : root.page === "battery" ? batteryPage
                 : root.page === "input" ? inputPage
@@ -232,11 +224,10 @@ Item {
   }
 
   function pageTitle(p) {
-    return ({ fans: "Fans", cpugpu: "CPU / GPU", lighting: "Lighting", battery: "Battery", input: "Input", system: "System" })[p] || ""
+    return ({ manual: "Manual", lighting: "Lighting", battery: "Battery", input: "Input", system: "System" })[p] || ""
   }
 
-  Component { id: fansPage; FansPage { client: armoury; fg: root.fg; fontFamily: root.fontFamily } }
-  Component { id: cpuGpuPage; CpuGpuPage { client: armoury; fg: root.fg; fontFamily: root.fontFamily } }
+  Component { id: manualPage; ManualPage { client: armoury; fg: root.fg; fontFamily: root.fontFamily } }
   Component { id: lightingPage; LightingPage { client: armoury; fg: root.fg; fontFamily: root.fontFamily } }
   Component { id: batteryPage; BatteryPage { client: armoury; fg: root.fg; fontFamily: root.fontFamily } }
   Component { id: inputPage; InputPage { client: armoury; fg: root.fg; fontFamily: root.fontFamily } }
