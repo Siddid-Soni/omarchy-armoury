@@ -53,6 +53,7 @@ Column {
       var span = Math.max(hi - lo, 1e-6)
       for (var i = 0; i < root.series.length; i++) {
         var v = root.series[i].values || []
+        if (v.length === 1) v = [v[0], v[0]]   // one reading so far: a flat line, not a blank graph
         if (v.length < 2) continue
         var c = root.series[i].color
         var step = width / (v.length - 1)
