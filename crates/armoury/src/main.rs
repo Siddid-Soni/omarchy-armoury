@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-use armoury_proto::{HotKey, KeyAction, ManualView, ModeChoice, SleepMode, Toggle, AuraEffect, AuraMode, AuraZone, ControlMode, LightingInfo, ZonePower, GpuMode, GpuStep, GpuSwitchResult, Request, Response, Snapshot, socket_path};
+use armoury_proto::{KeystoneAction, KeystoneEvent, HotKey, KeyAction, ManualView, ModeChoice, SleepMode, Toggle, AuraEffect, AuraMode, AuraZone, ControlMode, LightingInfo, ZonePower, GpuMode, GpuStep, GpuSwitchResult, Request, Response, Snapshot, socket_path};
 use clap::{Parser, Subcommand};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -40,6 +40,11 @@ enum Cmd {
     Music {
         #[command(subcommand)]
         action: Option<MusicAction>,
+    },
+    /// Keystone actions: show, change what insert/remove do, LED flash on insert
+    Keystone {
+        #[command(subcommand)]
+        action: Option<KeystoneCmd>,
     },
     /// List manual-mode profiles (* in use, - active but a stock mode is on)
     Manual {
@@ -239,6 +244,32 @@ fn parse_mode_choice(s: &str) -> Result<ModeChoice, String> {
 fn parse_key_action(s: &str) -> Result<KeyAction, String> {
     serde_json::from_value(serde_json::json!(s.replace('-', "_")))
         .map_err(|_| format!("unknown action {s:?} (none|open-window|cycle-mode|cycle-brightness|cycle-effect|toggle-numpad|toggle-music|command)"))
+}
+
+#[derive(Subcommand)]
+enum KeystoneCmd {
+    /// Change what happens on insert or remove; unspecified options keep their value
+    Set {
+        #[arg(value_parser = ["insert", "remove"])]
+        on: String,
+        /// quiet|balanced|performance|manual, or none
+        #[arg(long)]
+        mode: Option<String>,
+        /// unchanged|music|previous (remove only)|an effect such as rainbow-wave
+        #[arg(long)]
+        light: Option<String>,
+        /// Shell command to run ("" for none)
+        #[arg(long)]
+        command: Option<String>,
+        /// Lock the screen (remove only)
+        #[arg(long)]
+        lock: Option<bool>,
+    },
+    /// Flash the Keystone LED on insert
+    Flash {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -562,6 +593,33 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 scheme: enm(scheme).map(serde_json::from_value).transpose()?,
                 colour1: color1, colour2: color2, sensitivity,
             })?;
+        }
+        Cmd::Keystone { action: None } => {
+            let s: Snapshot = serde_json::from_value(call(&Request::Status)?)?;
+            let k = call(&Request::Config)?["keystone"].clone();
+            println!("Keystone   {}", match s.keystone { Some(true) => "inserted", Some(false) => "removed", None => "-" });
+            println!("LED flash  {}", if k["flash"].as_bool().unwrap_or(true) { "on" } else { "off" });
+            for ev in ["insert", "remove"] {
+                let a: KeystoneAction = serde_json::from_value(k[ev].clone()).unwrap_or_default();
+                let mut parts = vec![format!("mode {}", a.mode.map(|m| m.label().to_string()).unwrap_or("unchanged".into())),
+                                     format!("lighting {}", serde_json::to_value(a.light)?.as_str().unwrap_or("-").replace('_', "-"))];
+                if let Some(c) = &a.command { parts.push(format!("command {c:?}")); }
+                if a.lock { parts.push("lock".into()); }
+                println!("On {ev:<7} {}", parts.join(", "));
+            }
+        }
+        Cmd::Keystone { action: Some(KeystoneCmd::Flash { state }) } => { call(&Request::SetKeystoneFlash { on: state == "on" })?; }
+        Cmd::Keystone { action: Some(KeystoneCmd::Set { on, mode, light, command, lock }) } => {
+            let event = if on == "insert" { KeystoneEvent::Insert } else { KeystoneEvent::Remove };
+            let mut a: KeystoneAction = serde_json::from_value(call(&Request::Config)?["keystone"][on.as_str()].clone()).unwrap_or_default();
+            if let Some(m) = mode { a.mode = if m == "none" { None } else { Some(parse_mode_choice(&m).map_err(anyhow::Error::msg)?) }; }
+            if let Some(l) = light {
+                a.light = serde_json::from_value(serde_json::json!(l.replace('-', "_")))
+                    .map_err(|_| anyhow::anyhow!("unknown lighting {l:?} (unchanged, music, previous, or an effect)"))?;
+            }
+            if let Some(c) = command { a.command = (!c.trim().is_empty()).then_some(c); }
+            if let Some(l) = lock { a.lock = l; }
+            call(&Request::SetKeystoneAction { event, action: a })?;
         }
         Cmd::Manual { action } => {
             let req = match action {

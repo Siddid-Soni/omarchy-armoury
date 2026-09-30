@@ -41,6 +41,9 @@ Design: `docs/superpowers/specs/`.
   lighting, or run any command; touchpad toggle.
 - **System**: panel refresh rate on AC and on battery, overdrive and gamma,
   performance mode on AC and on battery, sleep mode, lid-closed behaviour, boot sound.
+- **Keystone**: actions when the Keystone goes in or out: performance mode,
+  lighting (an effect, Music, or back to what was on before), a command, and lock
+  the screen on remove. The Keystone light flashes on insert. `armoury keystone`.
 
 ### Daemon extras
 

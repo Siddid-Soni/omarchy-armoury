@@ -48,6 +48,14 @@ don't blind-probe them. Instead, capture what Armoury Crate sends:
    SET_REPORT (bRequest 9) feature reports, add the bar as its own light to the per-key
    layer and music, and drop the F5/Delete mirroring.
 
+## Identify Keystones via NFC (read-only) — 2026-10-01
+
+The Keystone is an NFC tag read by an NXP reader (ACPI `NXP3001`, `\_SB.PC00.I2C1.NFC1`,
+on i2c-5). No Linux driver binds it: nxp-nci_i2c only knows NXP1001/NXP1002/NXP7471.
+Research whether nxp-nci works with it (forced match, or a kernel patch adding the ID),
+then read the tag UID so actions can be set per Keystone. Never write to the tag, because
+Armoury Crate relies on it.
+
 ## Other deferred items
 
 - Software Fn-lock: the user doesn't use it. There is no firmware attribute

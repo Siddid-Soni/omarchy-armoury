@@ -28,7 +28,8 @@ async fn main() -> anyhow::Result<()> {
     .with_numpad(np_tx, np_state.clone());
     let (mu_tx, mu_rx) = tokio::sync::mpsc::channel(16);
     let mu_status: armouryd::features::music::worker::Status = std::sync::Arc::new(std::sync::Mutex::new((armoury_proto::MusicState::Unavailable, None)));
-    let daemon = daemon.with_music(mu_tx, mu_status.clone());
+    let daemon = daemon.with_music(mu_tx, mu_status.clone())
+        .with_keyboard(Box::new(armouryd::features::music::worker::open_keyboard));
     eprintln!("armouryd: {:?} mode, socket {}", daemon.control.lock().await.mode(), armoury_proto::socket_path().display());
     tokio::spawn(daemon.clone().poll_loop(Duration::from_secs(2)));
     let np_cfg = daemon.config.lock().await.numpad;
