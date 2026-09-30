@@ -189,8 +189,9 @@ enum LightAction {
     },
     /// Set the lighting effect
     Effect {
+        /// An effect, or `music` (music lighting; its settings: `armoury music set`)
         #[arg(value_parser = parse_aura_mode)]
-        mode: AuraMode,
+        mode: EffectArg,
         /// Primary colour, RRGGBB
         #[arg(long, value_parser = parse_colour, default_value = "ff0000")]
         color: [u8; 3],
@@ -285,9 +286,14 @@ fn parse_level(s: &str) -> Result<u8, String> {
     }
 }
 
-fn parse_aura_mode(s: &str) -> Result<AuraMode, String> {
-    serde_json::from_value(serde_json::json!(s.replace('-', "_")))
-        .map_err(|_| format!("unknown effect {s:?} (static, breathe, rainbow-cycle, rainbow-wave, star, rain, highlight, laser, ripple, pulse, comet, flash)"))
+/// An asusd effect, or music lighting.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum EffectArg { Aura(AuraMode), Music }
+
+fn parse_aura_mode(s: &str) -> Result<EffectArg, String> {
+    if s == "music" { return Ok(EffectArg::Music); }
+    serde_json::from_value(serde_json::json!(s.replace('-', "_"))).map(EffectArg::Aura)
+        .map_err(|_| format!("unknown effect {s:?} (static, breathe, rainbow-cycle, rainbow-wave, star, rain, highlight, laser, ripple, pulse, comet, flash, music)"))
 }
 
 #[derive(Subcommand)]
@@ -454,7 +460,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         Cmd::Light { action: Some(LightAction::Brightness { level }) } => { call(&Request::SetBrightness { level })?; }
-        Cmd::Light { action: Some(LightAction::Effect { mode, color, color2, speed, direction }) } => {
+        Cmd::Light { action: Some(LightAction::Effect { mode: EffectArg::Music, .. }) } => { call(&Request::SetMusic { on: true })?; }
+        Cmd::Light { action: Some(LightAction::Effect { mode: EffectArg::Aura(mode), color, color2, speed, direction }) } => {
             let effect = AuraEffect {
                 mode, colour1: color, colour2: color2,
                 speed: serde_json::from_value(serde_json::json!(speed))?,
@@ -648,7 +655,7 @@ mod tests {
         assert_eq!(parse_level("high"), Ok(3));
         assert_eq!(parse_level("2"), Ok(2));
         assert!(parse_level("4").is_err());
-        assert_eq!(parse_aura_mode("rainbow-wave"), Ok(armoury_proto::AuraMode::RainbowWave));
+        assert_eq!(parse_aura_mode("rainbow-wave"), Ok(EffectArg::Aura(armoury_proto::AuraMode::RainbowWave)));
         assert!(parse_aura_mode("disco").is_err());
     }
 
@@ -673,5 +680,7 @@ mod tests {
         assert_eq!(parse_key_action("open-window"), Ok(armoury_proto::KeyAction::OpenWindow));
         assert!(parse_key_action("reboot").is_err());
         assert_eq!(parse_key_action("toggle-music"), Ok(armoury_proto::KeyAction::ToggleMusic));
+        assert_eq!(parse_aura_mode("music"), Ok(EffectArg::Music));
+        assert_eq!(parse_aura_mode("rainbow-wave"), Ok(EffectArg::Aura(AuraMode::RainbowWave)));
     }
 }

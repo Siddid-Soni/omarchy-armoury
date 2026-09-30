@@ -29,11 +29,11 @@ Design: `docs/superpowers/specs/`.
 - **Lighting**: keyboard brightness (remembered separately on AC and battery),
   effects with colours, speed and direction, and per-zone control including logo, lightbar
   and the light bar under the display (Lid).
-- **Music lighting**: the keyboard reacts to whatever is playing (per-key keyboards).
-  Spectrum (bass to treble, left to right, bars rising with each band) or Pulse
-  (everything follows loudness), in a gradient, rainbow or single colour, with a
-  sensitivity setting. Setting an effect turns it off; it remembers on/off.
-  `armoury music on|off|toggle|set …`.
+- **Music effect** (per-key keyboards): pick *Music* in the effect list and the keyboard
+  reacts to whatever is playing. Spectrum (bass to treble, left to right, bars rising
+  with each band) or Pulse (everything follows loudness), in a gradient, rainbow or
+  single colour, with a sensitivity setting. Fn+F4 cycles through it; it remembers
+  on/off. `armoury light effect music`, `armoury music on|off|toggle|set …`.
 - **Battery**: charge, health, cycles, voltage, draw and time left; charge limit
   with a one-shot "charge to 100%".
 - **Input**: bind the ROG key, Fn+F5 and Fn+F4 (Aura) to open Armoury, cycle mode,
