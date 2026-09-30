@@ -5,3 +5,4 @@ pub mod gpu;
 pub mod lighting;
 pub mod clamshell;
 pub mod keys;
+pub mod manual;

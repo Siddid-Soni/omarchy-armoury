@@ -25,6 +25,8 @@ pub struct HwCtx {
     /// CPU boost as the kernel reports it now; the root call is skipped when a mode
     /// without limits would only re-send the same boost state.
     pub cpu_boost_now: Option<bool>,
+    /// The caller already enabled this mode's custom fan curves (Manual writes and enables them).
+    pub curves_on: bool,
 }
 
 pub async fn apply_mode(profile: Profile, s: &ModeSettings, ctx: HwCtx, asusd: &dyn Asusd, svc: &dyn Services) -> Vec<String> {
@@ -44,7 +46,7 @@ pub async fn apply_mode(profile: Profile, s: &ModeSettings, ctx: HwCtx, asusd: &
     if let Some(epp) = s.epp {
         if let Err(e) = with_retry(|| asusd.set_profile_epp(profile.to_asusd(), epp.to_asusd())).await { errors.push(format!("EPP: {e:#}")); }
     }
-    if has_limits {
+    if has_limits && !ctx.curves_on {
         // Some ASUS firmware also ignores PPT unless the EC is in manual fan mode,
         // i.e. the mode's custom fan curves are on (g-helper and asusd both require it).
         if let Err(e) = with_retry(|| asusd.set_fan_curves_enabled(profile.to_asusd(), true)).await {

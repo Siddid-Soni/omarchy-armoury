@@ -548,6 +548,7 @@ impl Daemon {
             nv_at_stock: st.nv_at_stock,
             mode_just_set: st.mode_just_set,
             cpu_boost_now: None,
+            curves_on: false,
         }
     }
 
