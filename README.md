@@ -6,6 +6,10 @@ built into the Omarchy bar. It has a bar widget and a settings window (the
 (`armouryd`), a CLI (`armoury`) and a small root helper (`armoury-root`).
 Design notes: `docs/superpowers/specs/`. Open follow-ups: `docs/superpowers/backlog.md`.
 
+![Armoury window: dashboard](docs/screenshots/dashboard.png)
+
+<img src="docs/screenshots/popup.png" alt="Bar popup" width="420">
+
 ## Features
 
 ### Bar widget and popup
