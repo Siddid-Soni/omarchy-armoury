@@ -67,6 +67,10 @@ pub struct Daemon {
     keystone_prev: std::sync::Mutex<Option<PrevLight>>,
     /// Opens the keyboard for direct (per-key) frames: the Keystone LED flash.
     kbd_open: Option<music::worker::OpenKeyboard>,
+    /// Music band levels for subscribers (empty while music isn't running).
+    bands: tokio::sync::watch::Receiver<Vec<f32>>,
+    /// The keyboard effect asusd reports, read each active tick (None in observe mode).
+    effect: std::sync::Mutex<Option<armoury_proto::AuraEffect>>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +106,8 @@ impl Daemon {
             keystone_seen: std::sync::Mutex::new(None),
             keystone_prev: std::sync::Mutex::new(None),
             kbd_open: None,
+            bands: tokio::sync::watch::channel(Vec::new()).1,
+            effect: std::sync::Mutex::new(None),
         })
     }
 
@@ -148,6 +154,12 @@ impl Daemon {
         let mut d = Arc::try_unwrap(self).ok().expect("with_music before the daemon is shared");
         d.music_tx = Some(tx);
         d.music_status = status;
+        Arc::new(d)
+    }
+
+    pub fn with_bands(self: Arc<Self>, rx: tokio::sync::watch::Receiver<Vec<f32>>) -> Arc<Self> {
+        let mut d = Arc::try_unwrap(self).ok().expect("with_bands before the daemon is shared");
+        d.bands = rx;
         Arc::new(d)
     }
 
@@ -647,6 +659,8 @@ impl Daemon {
                     validate_effect(&effect, &supported).map_err(anyhow::Error::msg)?;
                     self.stop_music_for_effect().await?;
                     with_retry(|| self.aura.set_mode_data(effect_to_raw(&effect))).await?;
+                    *self.effect.lock().unwrap() = Some(effect);
+                    self.refresh().await;
                     Ok(serde_json::to_value(effect)?)
                 }
                 Request::SetZonePower { zone } => {
@@ -714,6 +728,9 @@ impl Daemon {
         if *self.music_env.lock().unwrap() != Some(env.0) && self.music_send(music::worker::Cmd::Env { active: env.0 }) {
             *self.music_env.lock().unwrap() = Some(env.0);
         }
+        // the dashboard's lighting preview: asusd answers from its saved config (no hardware access)
+        let effect = if env.0 { self.aura.info().await.ok().and_then(|(m, ..)| effect_from_raw(&m)) } else { None };
+        *self.effect.lock().unwrap() = effect;
         let snap = self.refresh().await;
         if self.mode.get() != ControlMode::Active {
             *st = ApplyState::default(); // re-apply after the next takeover
@@ -1078,6 +1095,7 @@ impl Daemon {
         s.gpu.armoury_pending = self.gpu_record();
         s.system.touchpad = Some(self.touchpad_enabled());
         s.system.numpad = *self.numpad_state.lock().unwrap();
+        s.lighting.effect = *self.effect.lock().unwrap();
         (s.lighting.music, s.lighting.music_error) = self.music_status.lock().unwrap().clone();
         {
             let cfg = self.config.lock().await;
@@ -1387,9 +1405,24 @@ impl Daemon {
             }
         };
         write_line(w, &Event::Snapshot(first)).await?;
-        while rx.changed().await.is_ok() {
-            let Some(s) = rx.borrow_and_update().clone() else { continue };
-            write_line(w, &Event::Snapshot(s)).await?;
+        let mut bands = Some(self.bands.clone());
+        if let Some(b) = bands.as_mut() { b.mark_unchanged(); }
+        loop {
+            tokio::select! {
+                r = rx.changed() => {
+                    if r.is_err() { break; }
+                    let Some(s) = rx.borrow_and_update().clone() else { continue };
+                    write_line(w, &Event::Snapshot(s)).await?;
+                }
+                // no music worker (closed channel): this branch just switches off
+                r = async { bands.as_mut().unwrap().changed().await }, if bands.is_some() => match r {
+                    Err(_) => bands = None,
+                    Ok(()) => {
+                        let b = bands.as_mut().unwrap().borrow_and_update().clone();
+                        write_line(w, &Event::MusicBands(b)).await?;
+                    }
+                },
+            }
         }
         Ok(())
     }
@@ -3155,5 +3188,45 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
         assert!(r.d.handle(req(serde_json::json!({"cmd":"set_keystone_flash","on":false}))).await.ok);
         let k = r.d.config.lock().await.keystone.clone();
         assert_eq!((k.insert.mode, k.flash), (Some(ModeChoice::Performance), false));
+    }
+
+    #[tokio::test]
+    async fn subscribers_get_music_bands_and_the_current_effect() {
+        let (r, _log, _s) = music_rig(true, "");
+        let tx = tokio::sync::watch::Sender::new(Vec::<f32>::new());
+        let LightRig { d, sys, aura, svc, dir } = r;
+        let d = Arc::try_unwrap(d).ok().map(Arc::new).expect("sole owner").with_bands(tx.subscribe());
+        let r = LightRig { d, sys, aura, svc, dir };
+        r.d.tick().await;
+        assert_eq!(r.d.refresh().await.lighting.effect.map(|e| e.mode), Some(armoury_proto::AuraMode::Static), "effect from asusd");
+        let path = r.dir.path().join("s.sock");
+        let listener = bind(&path).unwrap();
+        tokio::spawn(r.d.clone().serve(listener));
+        let stream = UnixStream::connect(&path).await.unwrap();
+        let (rd, mut w) = stream.into_split();
+        w.write_all(b"{\"cmd\":\"subscribe\"}\n").await.unwrap();
+        let mut lines = BufReader::new(rd).lines();
+        assert!(lines.next_line().await.unwrap().unwrap().contains("\"ok\":true"), "subscribe ack");
+        assert!(lines.next_line().await.unwrap().unwrap().contains("\"snapshot\""));
+        tx.send_replace(vec![0.25; 18]);
+        let l = tokio::time::timeout(Duration::from_secs(2), lines.next_line()).await.unwrap().unwrap().unwrap();
+        assert!(l.starts_with("{\"event\":\"music_bands\"") && l.contains("0.25"), "{l}");
+    }
+
+    #[tokio::test]
+    async fn snapshots_still_stream_without_a_music_worker() {
+        let (r, _log, _s) = music_rig(true, ""); // default: band channel already closed
+        let path = r.dir.path().join("s.sock");
+        tokio::spawn(r.d.clone().serve(bind(&path).unwrap()));
+        let stream = UnixStream::connect(&path).await.unwrap();
+        let (rd, mut w) = stream.into_split();
+        w.write_all(b"{\"cmd\":\"subscribe\"}\n").await.unwrap();
+        let mut lines = BufReader::new(rd).lines();
+        lines.next_line().await.unwrap(); // ack
+        assert!(lines.next_line().await.unwrap().unwrap().contains("\"snapshot\""), "the first snapshot");
+        set_brightness_sysfs(&r, "1");
+        r.d.refresh().await;
+        let l = tokio::time::timeout(Duration::from_secs(2), lines.next_line()).await.expect("a change still arrives").unwrap().unwrap();
+        assert!(l.contains("\"snapshot\""));
     }
 }

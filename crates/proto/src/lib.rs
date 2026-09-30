@@ -115,6 +115,9 @@ pub struct LightingInfo {
 pub struct LightingState {
     pub brightness: Option<u8>,
     pub on_ac: Option<bool>,
+    /// The keyboard's current effect (asusd; active mode only).
+    #[serde(default)]
+    pub effect: Option<AuraEffect>,
     #[serde(default)]
     pub music: MusicState,
     /// Why music lighting stopped by itself (capture or keyboard failures).
@@ -641,7 +644,12 @@ impl Response {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
-pub enum Event { Snapshot(Snapshot) }
+pub enum Event {
+    Snapshot(Snapshot),
+    /// Music lighting's band levels (0..1, bass → treble), ~10 per second while it runs;
+    /// an empty list once when it stops.
+    MusicBands(Vec<f32>),
+}
 
 #[cfg(test)]
 mod tests {
@@ -800,6 +808,11 @@ mod tests {
         let r: Request = serde_json::from_str(r#"{"cmd":"set_numpad_config","idle_dim_secs":0}"#).unwrap();
         assert_eq!(r, Request::SetNumpadConfig { start_brightness: None, allow_when_touchpad_off: None, idle_dim_secs: Some(0), hold_ms: None, key_repeat: None, repeat_delay_ms: None, repeat_rate_hz: None });
         assert_eq!(serde_json::from_str::<KeyAction>("\"toggle_numpad\"").unwrap(), KeyAction::ToggleNumpad);
+    }
+
+    #[test]
+    fn music_bands_event_wire_format() {
+        assert_eq!(serde_json::to_string(&Event::MusicBands(vec![0.5, 1.0])).unwrap(), r#"{"event":"music_bands","data":[0.5,1.0]}"#);
     }
 
     #[test]

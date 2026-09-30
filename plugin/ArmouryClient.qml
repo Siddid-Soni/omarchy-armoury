@@ -19,6 +19,36 @@ Item {
 
   property var pending: []
 
+  // Music lighting's band levels (bass → treble, 0..1) while it runs; [] otherwise.
+  property var bands: []
+
+  // Short histories for the dashboard graphs, sampled from the snapshot (it only arrives
+  // on change). hist: every 2 s for 3 min; battery: every 20 s for 30 min.
+  property var hist: ({ cpuTemp: [], cpuFan: [], gpuFan: [], power: [] })
+  property var batteryHist: []
+  readonly property int histLen: 90
+  function push(list, v, len) { var l = list.slice(Math.max(0, list.length - len + 1)); l.push(v); return l }
+  Timer {
+    interval: 2000
+    running: root.online
+    repeat: true
+    triggeredOnStart: true
+    property int tick: 0
+    onTriggered: {
+      var p = root.snap.perf || {}
+      var h = root.hist
+      root.hist = {
+        cpuTemp: root.push(h.cpuTemp, p.cpu_temp_c || 0, root.histLen),
+        cpuFan: root.push(h.cpuFan, p.cpu_fan_rpm || 0, root.histLen),
+        gpuFan: root.push(h.gpuFan, p.gpu_fan_rpm || 0, root.histLen),
+        power: root.push(h.power, p.power_draw_w || 0, root.histLen)
+      }
+      var b = root.snap.battery_info || {}
+      if (tick % 10 === 0 && b.capacity !== undefined && b.capacity !== null) root.batteryHist = root.push(root.batteryHist, b.capacity, root.histLen)
+      tick++
+    }
+  }
+
   signal snapshotChanged()
 
   // Sends `req` (an object) and calls `cb(response)`; response is {ok, data, error}.
@@ -51,6 +81,7 @@ Item {
         flush()
       } else {
         root.snap = null
+        root.bands = []
       }
     }
     parser: SplitParser {
@@ -60,6 +91,9 @@ Item {
         if (msg.event === "snapshot") {
           root.snap = msg.data
           root.snapshotChanged()
+          if (!msg.data.lighting || msg.data.lighting.music !== "on") root.bands = []
+        } else if (msg.event === "music_bands") {
+          root.bands = msg.data || []
         }
       }
     }
