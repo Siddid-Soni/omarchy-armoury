@@ -43,14 +43,22 @@ pub fn parse_level(raw: &[u8]) -> Option<u8> {
     std::str::from_utf8(raw).ok()?.trim().parse::<u8>().ok().filter(|l| *l <= 3)
 }
 
+/// `brightness_hw_changed` reads ENODATA until the firmware first changes the backlight
+/// after boot: that means "nothing yet", not a broken watch.
+pub fn no_change_yet(r: std::io::Result<Option<u8>>) -> std::io::Result<Option<u8>> {
+    match r {
+        Err(e) if e.raw_os_error() == Some(61) => Ok(None), // ENODATA
+        other => other,
+    }
+}
+
 /// Forwards every firmware keyboard-brightness change (0–3). Reopens after errors.
 pub async fn run_kbd_watch(tx: tokio::sync::mpsc::Sender<u8>) {
     use std::os::unix::fs::FileExt;
     use tokio::io::{unix::AsyncFd, Interest};
     let read = |f: &std::fs::File| -> std::io::Result<Option<u8>> {
         let mut buf = [0u8; 8];
-        let n = f.read_at(&mut buf, 0)?;
-        Ok(parse_level(&buf[..n]))
+        no_change_yet(f.read_at(&mut buf, 0).map(|n| parse_level(&buf[..n])))
     };
     let mut failures = 0u32;
     loop {
@@ -121,6 +129,14 @@ mod tests {
         b.extend(code.to_ne_bytes());
         b.extend(value.to_ne_bytes());
         b
+    }
+
+    #[test]
+    fn no_brightness_change_since_boot_is_not_an_error() {
+        // the kernel answers ENODATA until the first firmware change after boot
+        assert_eq!(no_change_yet(Err(std::io::Error::from_raw_os_error(61))).unwrap(), None);
+        assert!(no_change_yet(Err(std::io::Error::from_raw_os_error(5))).is_err());
+        assert_eq!(no_change_yet(Ok(Some(2))).unwrap(), Some(2));
     }
 
     #[test]

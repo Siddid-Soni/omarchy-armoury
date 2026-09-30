@@ -498,6 +498,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 Some(ManualAction::Activate { name }) => Request::ActivateManualProfile { name },
             };
             let v: ManualView = serde_json::from_value(call(&req)?)?;
+            if v.profiles.is_empty() { println!("no manual profiles yet (the first is created when you switch to Manual)"); }
             for p in v.profiles {
                 let mark = if v.active.as_deref() == Some(p.name.as_str()) { if v.enabled { "* " } else { "- " } } else { "  " };
                 println!("{mark}{} (on {})", p.name, ModeChoice::from(p.base).label());
