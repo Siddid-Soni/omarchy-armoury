@@ -38,8 +38,12 @@ Flickable {
     { label: "Cycle mode", value: "cycle_mode" },
     { label: "Keyboard brightness", value: "cycle_brightness" },
     { label: "Lighting effect", value: "cycle_effect" },
+    { label: "Toggle NumberPad", value: "toggle_numpad" },
     { label: "Run command", value: "command" }
   ]
+
+  readonly property var np: cfg.numpad || ({ start_brightness: 8, allow_when_touchpad_off: false, idle_dim_secs: 60, hold_ms: 1000 })
+  function setNp(key, v) { var r = { cmd: "set_numpad_config" }; r[key] = v; client.run(r, function() { root.reload() }) }
 
   function bindKey(key, action, command) {
     var req = { cmd: "set_key_binding", key: key, action: action }
@@ -112,6 +116,52 @@ Flickable {
       options: [{ label: "On", value: true }, { label: "Off", value: false }]
       value: root.sys.touchpad !== false
       onChosen: function(v) { root.client.run({ cmd: "set_toggle", toggle: "touchpad", on: v }) }
+    }
+
+    Section { text: "NUMBERPAD"; fg: root.fg }
+    Text {
+      visible: root.sys.numpad === "unavailable" || root.sys.numpad === undefined
+      width: parent.width
+      wrapMode: Text.WordWrap
+      text: root.usable ? "No NumberPad touchpad found." : "The NumberPad works while armouryd is in control (Take over)."
+      color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption
+    }
+    ChoiceRow {
+      fg: root.fg
+      label: "NumberPad"
+      usable: root.usable && root.sys.numpad !== "unavailable"
+      options: [{ label: "On", value: true }, { label: "Off", value: false }]
+      value: root.sys.numpad === "on"
+      onChosen: function(v) { root.client.run({ cmd: "set_numpad", on: v }) }
+    }
+    ValueSlider {
+      fg: root.fg; label: "Brightness when it turns on"; unit: ""
+      minimum: 1; maximum: 8
+      value: root.np.start_brightness
+      usable: root.usable
+      onCommitted: function(v) { root.setNp("start_brightness", v) }
+    }
+    ValueSlider {
+      fg: root.fg; label: "Dark after no touch (0 = never)"; unit: "s"
+      minimum: 0; maximum: 600; step: 10
+      value: root.np.idle_dim_secs
+      usable: root.usable
+      onCommitted: function(v) { root.setNp("idle_dim_secs", v) }
+    }
+    ValueSlider {
+      fg: root.fg; label: "Hold time to toggle"; unit: "ms"
+      minimum: 300; maximum: 3000; step: 100
+      value: root.np.hold_ms
+      usable: root.usable
+      onCommitted: function(v) { root.setNp("hold_ms", v) }
+    }
+    ChoiceRow {
+      fg: root.fg
+      label: "While the touchpad is off"
+      usable: root.usable
+      options: [{ label: "NumberPad off too", value: false }, { label: "Allow NumberPad", value: true }]
+      value: root.np.allow_when_touchpad_off === true
+      onChosen: function(v) { root.setNp("allow_when_touchpad_off", v) }
     }
 
     Section { text: "KEYBOARD BACKLIGHT WHEN IDLE"; fg: root.fg }

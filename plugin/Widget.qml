@@ -317,6 +317,13 @@ Panel {
               onClicked: root.setToggle("touchpad", !on)
             }
             Toggle {
+              icon: "󰎠"; label: "NumberPad"
+              visible: grid.sys.numpad !== undefined
+              on: grid.sys.numpad === "on"
+              usable: root.active && grid.sys.numpad !== "unavailable"
+              onClicked: client.run({ cmd: "set_numpad", on: !on })
+            }
+            Toggle {
               icon: "󰌢"; label: "Lid awake (AC)"
               on: grid.sys.clamshell === true
               onClicked: root.setToggle("clamshell", !on)
