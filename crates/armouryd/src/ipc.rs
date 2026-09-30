@@ -255,17 +255,24 @@ impl Daemon {
                 }
             }
             KeyAction::CycleEffect => {
+                // Static → … → Flash → Music (per-key keyboards) → Static
+                let music_was_on = self.music_on();
                 if let Err(e) = self.stop_music_for_effect().await { eprintln!("armouryd: {e:#}"); return; }
                 if let Ok((mode, _, modes, _)) = with_retry(|| self.aura.info()).await {
                     let codes: Vec<u32> = modes.into_iter().filter(|c| armoury_proto::AuraMode::from_code(*c).is_some()).collect();
-                    if let Some(pos) = codes.iter().position(|c| *c == mode.0).or(Some(0)) {
-                        let next = codes.get((pos + 1) % codes.len().max(1)).copied().unwrap_or(0);
-                        let mut raw = mode.clone();
-                        raw.0 = next;
-                        if with_retry(|| self.aura.set_mode_data(raw.clone())).await.is_ok() {
-                            let name = armoury_proto::AuraMode::from_code(next).map(|m| format!("{m:?}")).unwrap_or_default();
-                            self.osd("keyboard", &format!("Lighting: {name}")).await;
-                        }
+                    let pos = codes.iter().position(|c| *c == mode.0);
+                    let music_available = self.music_status.lock().unwrap().0 != armoury_proto::MusicState::Unavailable;
+                    if !music_was_on && music_available && pos.is_some_and(|p| p + 1 == codes.len()) {
+                        let r = self.handle(Request::SetMusic { on: true }).await;
+                        self.osd("keyboard", &if r.ok { "Lighting: Music".to_string() } else { format!("Lighting: Music: {}", r.error.unwrap_or_default()) }).await;
+                        return;
+                    }
+                    let next = if music_was_on { codes.first().copied() } else { codes.get((pos.unwrap_or(0) + 1) % codes.len().max(1)).copied() };
+                    let mut raw = mode.clone();
+                    raw.0 = next.unwrap_or(0);
+                    if with_retry(|| self.aura.set_mode_data(raw.clone())).await.is_ok() {
+                        let name = armoury_proto::AuraMode::from_code(raw.0).map(|m| format!("{m:?}")).unwrap_or_default();
+                        self.osd("keyboard", &format!("Lighting: {name}")).await;
                     }
                 }
             }
@@ -2754,8 +2761,11 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
     /// A stand-in music worker: logs commands (and whether G-Helper was already started),
     /// acks, and publishes on/off like the real one.
     fn music_rig(active: bool, toml: &str) -> (LightRig, Arc<std::sync::Mutex<Vec<String>>>, crate::features::music::worker::Status) {
+        music_rig_with(active, toml, FakeAura::default())
+    }
+    fn music_rig_with(active: bool, toml: &str, aura: FakeAura) -> (LightRig, Arc<std::sync::Mutex<Vec<String>>>, crate::features::music::worker::Status) {
         use crate::features::music::worker::Cmd;
-        let LightRig { d, sys, aura, svc, dir } = light_rig(active, FakeAura::default(), toml);
+        let LightRig { d, sys, aura, svc, dir } = light_rig(active, aura, toml);
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let status: crate::features::music::worker::Status = Arc::new(std::sync::Mutex::new((armoury_proto::MusicState::On, None)));
         let d = d.with_music(tx, status.clone());
@@ -2865,5 +2875,30 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
         r.d.tick().await;
         tokio::task::yield_now().await;
         assert_eq!(mlog(&log), ["env true"], "no Env {{ active: true }} between release and observe");
+    }
+
+    #[tokio::test]
+    async fn cycle_effect_goes_through_music() {
+        let last = FakeAura { mode: std::sync::Mutex::new((12, 0, (166, 0, 0), (0, 0, 0), "Med".into(), "Right".into())), ..FakeAura::default() };
+        let (r, log, status) = music_rig_with(true, "[keys]\naura = \"cycle_effect\"\n", last);
+        status.lock().unwrap().0 = armoury_proto::MusicState::Off;
+        r.d.on_hotkey(HotKey::Aura).await; // Flash → Music
+        tokio::task::yield_now().await;
+        assert_eq!(mlog(&log), ["set true"]);
+        assert!(acalls(&r).is_empty(), "no effect written: {:?}", acalls(&r));
+        r.d.on_hotkey(HotKey::Aura).await; // Music → Static
+        assert_eq!(mlog(&log), ["set true", "set false"]);
+        assert_eq!(acalls(&r), ["restore", "set_mode_data 0"]);
+        assert!(!r.d.config.lock().await.music.on);
+    }
+
+    #[tokio::test]
+    async fn cycle_effect_skips_music_without_a_per_key_keyboard() {
+        let last = FakeAura { mode: std::sync::Mutex::new((12, 0, (166, 0, 0), (0, 0, 0), "Med".into(), "Right".into())), ..FakeAura::default() };
+        let (r, log, status) = music_rig_with(true, "[keys]\naura = \"cycle_effect\"\n", last);
+        status.lock().unwrap().0 = armoury_proto::MusicState::Unavailable;
+        r.d.on_hotkey(HotKey::Aura).await;
+        assert!(mlog(&log).is_empty());
+        assert_eq!(acalls(&r), ["set_mode_data 0"], "Flash wraps to Static");
     }
 }
