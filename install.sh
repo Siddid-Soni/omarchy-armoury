@@ -1,9 +1,23 @@
 #!/bin/bash
-# Build and install omarchy-armoury. armouryd starts in observe mode (G-Helper keeps working).
+# Install (or update) omarchy-armoury's daemon, CLI and root helper, then let armouryd
+# take control. Uses the prebuilt release matching this plugin's version when there is
+# one, else builds with cargo.
+#   --build    always build from source
 set -euo pipefail
 cd "$(dirname "$0")"
 
 LIB=/usr/local/lib/omarchy-armoury
+REPO=https://github.com/Siddid-Soni/omarchy-armoury
+BUILD=0
+for arg in "$@"; do
+  case $arg in
+    --build) BUILD=1 ;;
+    *) echo "unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+VERSION=$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' manifest.json | head -1)
 
 # yes/no question with a default; without a terminal the answer is "no" (nothing
 # optional changes without the user saying so)
@@ -22,16 +36,38 @@ omarchy-armoury installs:
     (polkit rule for your user)
   - udev rules giving your seat access to the ASUS keyboard, touchpad, i2c and uinput
   - a pacman hook and a fix to asusd's model file (all lighting zones on the G533Z)
-It builds the daemon with cargo and asks for sudo once. uninstall.sh reverses all of it.
+It downloads the prebuilt binaries for this version from GitHub releases (checksum
+verified), or builds them with cargo, and asks for sudo once. uninstall.sh reverses all of it.
 INFO
 if [ -t 0 ] && ! ask "Continue? [Y/n]" y; then echo "Nothing installed."; exit 0; fi
 UNIT_DIR=~/.config/systemd/user
 
-# Build outside the source tree: when installed with `omarchy plugin add`, this folder is
-# the live plugin, and a Rust target directory (several GB) doesn't belong in it.
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-armoury/target}"
-cargo build --release --workspace
-BIN="$CARGO_TARGET_DIR/release"
+# Prebuilt binaries for this exact version, checked against the release's sha256.
+fetch_release() {
+  local dir=$1 name="armoury-$VERSION-$(uname -m)-linux.tar.gz"
+  command -v curl >/dev/null || return 1
+  curl -fsSL "$REPO/releases/download/v$VERSION/$name" -o "$dir/$name" 2>/dev/null || return 1
+  curl -fsSL "$REPO/releases/download/v$VERSION/$name.sha256" -o "$dir/$name.sha256" 2>/dev/null || return 1
+  (cd "$dir" && sha256sum --quiet -c "$name.sha256") || { echo "Checksum mismatch for $name" >&2; return 1; }
+  tar -xzf "$dir/$name" -C "$dir"
+}
+
+if [ "$BUILD" = 0 ] && fetch_release "$TMP"; then
+  echo "Using the prebuilt release v$VERSION."
+  BIN=$TMP
+else
+  if ! command -v cargo >/dev/null; then
+    echo "No prebuilt release for v$VERSION could be downloaded, and cargo isn't installed." >&2
+    echo "Install Rust (sudo pacman -S rust) and run this again." >&2
+    exit 1
+  fi
+  [ "$BUILD" = 1 ] || echo "No prebuilt release for v$VERSION; building from source."
+  # Build outside the source tree: when installed with `omarchy plugin add`, this folder is
+  # the live plugin, and a Rust target directory (several GB) doesn't belong in it.
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-armoury/target}"
+  cargo build --release --workspace
+  BIN="$CARGO_TARGET_DIR/release"
+fi
 
 install -Dm755 "$BIN"/armouryd ~/.local/bin/armouryd
 install -Dm755 "$BIN"/armoury ~/.local/bin/armoury

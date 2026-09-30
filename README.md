@@ -119,19 +119,25 @@ zone fix), not code.
 
 ## Install
 
-Needs Omarchy, **asusd** (asusctl), **supergfxd** (supergfxctl), PipeWire and a Rust
-toolchain (`cargo`, to build the daemon).
+Needs Omarchy, **asusd** (asusctl), **supergfxd** (supergfxctl) and PipeWire.
 
     omarchy plugin add https://github.com/Siddid-Soni/omarchy-armoury.git --enable
-    ~/.config/omarchy/plugins/io.github.siddid-soni.armoury/install.sh
 
-The first command adds the bar widget and window. The second builds and installs the
-daemon: the plugin does nothing without it, and the popup says so until it runs.
-`install.sh` lists what it installs and asks before it starts, then asks for sudo once
-(see *What it installs*). It asks again before adding the SUPER+W line to your
-`bindings.lua`, and before stopping G-Helper if it's installed. At the end, armouryd
-takes control and starts asusd. The build goes to
-`~/.cache/omarchy-armoury`, not the plugin folder.
+Then click the Armoury icon in the bar and press **Set up**. That opens a terminal
+running the plugin's `install.sh`, which sets up the daemon.
+
+- **Binaries:** it downloads the prebuilt binaries for this version from the GitHub
+  release and checks them against the release's sha256.
+  - If there's no release for this version, or you pass `--build`, it builds them with
+    cargo instead. That needs Rust, and the build goes to `~/.cache/omarchy-armoury`.
+- **Questions it asks:**
+  - it lists what it installs and asks before starting, then asks for sudo once (see
+    *What it installs*)
+  - before adding the SUPER+W line to your `bindings.lua`
+  - before stopping G-Helper, if it's installed
+- **At the end**, armouryd takes control and starts asusd.
+
+You can also run it directly: `~/.config/omarchy/plugins/io.github.siddid-soni.armoury/install.sh`.
 
 ## Usage
 
@@ -143,9 +149,9 @@ takes control and starts asusd. The build goes to
 ## Update
 
     omarchy plugin update io.github.siddid-soni.armoury
-    ~/.config/omarchy/plugins/io.github.siddid-soni.armoury/install.sh
 
-Rerun `install.sh` after every update, so the daemon matches the plugin.
+After an update, the popup notices that the daemon is older than the plugin and offers
+**Update**, which reruns `install.sh`.
 
 ## Remove
 
@@ -188,4 +194,5 @@ Unix socket (`$XDG_RUNTIME_DIR/armoury.sock`). Everything else comes from `insta
 - **Audio**: the Music effect records the default output's audio with `pw-record` while
   it runs. The audio is analysed in memory only, never stored or sent.
 
-Nothing is downloaded at run time. armouryd makes no network connections.
+`install.sh` downloads the release binaries from this repository's GitHub releases
+(sha256-checked). Nothing else is downloaded, and armouryd makes no network connections.

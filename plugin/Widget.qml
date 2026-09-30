@@ -27,6 +27,27 @@ Panel {
   readonly property color dim: Qt.darker(fg, 1.5)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
+  // Setup: the plugin folder (install.sh, manifest.json) and whether the daemon is there
+  readonly property string pluginDir: String(Qt.resolvedUrl("..")).replace(/^file:\/\//, "").replace(/\/$/, "")
+  readonly property string omarchyBin: (Quickshell.env("OMARCHY_PATH") || "/usr/share/omarchy") + "/bin"
+  FileView { id: manifestFile; path: root.pluginDir + "/manifest.json"; blockLoading: true }
+  readonly property string pluginVersion: { try { return JSON.parse(manifestFile.text()).version || "" } catch (e) { return "" } }
+  property bool daemonInstalled: true
+  Process {
+    id: daemonProbe
+    command: ["sh", "-c", "test -x \"$HOME/.local/bin/armouryd\""]
+    onExited: function(code) { root.daemonInstalled = code === 0 }
+  }
+  onOnlineChanged: if (!online) daemonProbe.running = true
+  Component.onCompleted: daemonProbe.running = true
+  // after `omarchy plugin update` the daemon is older than the plugin
+  readonly property bool needsUpdate: online && !!snap && !!snap.version && pluginVersion !== "" && snap.version !== pluginVersion
+  // install.sh in Omarchy's floating terminal: its prompts and the sudo password stay visible
+  function runSetup() {
+    Quickshell.execDetached([root.omarchyBin + "/omarchy-launch-floating-terminal-with-presentation", "'" + root.pluginDir + "/install.sh'"])
+    root.close()
+  }
+
   readonly property var modes: [
     { id: "quiet", label: "Silent", icon: "󰾆" },
     { id: "balanced", label: "Balanced", icon: "󰾅" },
@@ -177,9 +198,9 @@ Panel {
           }
         }
 
-        // ---------- Offline banner ----------
+        // ---------- Setup / offline / update banner ----------
         Rectangle {
-          visible: !root.online
+          visible: !root.online || root.needsUpdate
           width: parent.width
           implicitHeight: bannerRow.implicitHeight + Style.space(16)
           radius: Style.space(6)
@@ -194,13 +215,28 @@ Panel {
             spacing: Style.space(10)
 
             Text {
-              width: parent.width
+              width: parent.width - setupBtn.width - parent.spacing
               anchors.verticalCenter: parent.verticalCenter
               wrapMode: Text.WordWrap
-              text: "armouryd is not running. First time? Run install.sh in the plugin folder (see the README). Otherwise: systemctl --user start armouryd"
+              text: root.needsUpdate ? "Armoury was updated to " + root.pluginVersion + "; its daemon is still " + root.snap.version + "."
+                : root.daemonInstalled ? "armouryd isn't running."
+                : "Armoury needs its daemon. Set it up once; it asks for your password."
               color: root.fg
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
+            }
+            Button {
+              id: setupBtn
+              anchors.verticalCenter: parent.verticalCenter
+              text: root.needsUpdate ? "Update" : root.daemonInstalled ? "Start" : "Set up"
+              foreground: root.fg
+              fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
+              bordered: true
+              onClicked: {
+                if (!root.needsUpdate && root.daemonInstalled) Quickshell.execDetached(["systemctl", "--user", "start", "armouryd"])
+                else root.runSetup()
+              }
             }
           }
         }

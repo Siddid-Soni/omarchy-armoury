@@ -530,6 +530,9 @@ pub struct BatteryState {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// armouryd's version (the plugin offers a daemon update when it differs from its own).
+    #[serde(default)]
+    pub version: String,
     pub model: Option<String>,
     pub control: ControlMode,
     pub keystone: Option<bool>,
