@@ -177,21 +177,27 @@ Item {
                   "Fan curves, power limits, GPU"
                 ] : []
                 Column {
+                  id: perfGraphs
                   width: parent.width
                   spacing: Style.space(10)
+                  // three graphs share the space under the text
+                  readonly property real graphH: Math.max(Style.space(14), (parent.height - spacing * 2) / 3 - Style.space(20))
                   Sparkline {
+                    graphHeight: perfGraphs.graphH
                     label: "CPU temperature"; fg: root.fg; fontFamily: root.fontFamily
                     value: root.snap && root.snap.perf && root.snap.perf.cpu_temp_c ? Math.round(root.snap.perf.cpu_temp_c) + " °C" : "—"
                     series: [{ values: armoury.hist.cpuTemp, color: root.accent }]
                     minimum: 30; maximum: 100
                   }
                   Sparkline {
+                    graphHeight: perfGraphs.graphH
                     label: "Fans (CPU · GPU)"; fg: root.fg; fontFamily: root.fontFamily
                     value: root.snap && root.snap.perf ? (root.snap.perf.cpu_fan_rpm || 0) + " · " + (root.snap.perf.gpu_fan_rpm || 0) + " rpm" : "—"
                     series: [{ values: armoury.hist.cpuFan, color: root.accent }, { values: armoury.hist.gpuFan, color: root.dim }]
                     minimum: 0
                   }
                   Sparkline {
+                    graphHeight: perfGraphs.graphH
                     label: "Power draw"; fg: root.fg; fontFamily: root.fontFamily
                     value: root.snap && root.snap.perf && root.snap.perf.power_draw_w ? root.snap.perf.power_draw_w.toFixed(1) + " W" : "—"
                     series: [{ values: armoury.hist.power, color: root.accent }]
