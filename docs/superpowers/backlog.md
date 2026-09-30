@@ -25,6 +25,14 @@ Proposed approach (not yet approved):
 - First step: a key-capture session with the user to list the exact codes
   each key sends.
 
+## Keystone LED in music lighting — for Plan 10, 2026-09-30
+
+The light bar under the display is the Keystone LED. It stays dark while music lighting
+is on: direct-mode frames don't drive it. We send loudness to LED 0 (g-helper's "KSTN"),
+and lighting-packet slots 8–17 (LEDs 175+) had no effect either. It does light with
+normal asusd effects. Find out how to drive it (another report or zone), or leave it on
+its effect while music runs.
+
 ## Other deferred items
 
 - Software Fn-lock: the user doesn't use it. There is no firmware attribute
