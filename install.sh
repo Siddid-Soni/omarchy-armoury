@@ -27,8 +27,8 @@ sudo install -Dm644 packaging/udev/70-omarchy-armoury.rules /etc/udev/rules.d/70
 sudo install -Dm644 packaging/modules-load/omarchy-armoury.conf /etc/modules-load.d/omarchy-armoury.conf
 sudo modprobe i2c-dev
 sudo udevadm control --reload
-# every device class the rules cover: N-KEY + touchpad (input), /dev/uinput (misc), /dev/i2c-* (i2c-dev)
-sudo udevadm trigger --subsystem-match=input --subsystem-match=misc --subsystem-match=i2c-dev --action=change
+# every device class the rules cover: N-KEY + touchpad (input), /dev/uinput (misc), /dev/i2c-* (i2c-dev), N-KEY Aura (hidraw)
+sudo udevadm trigger --subsystem-match=input --subsystem-match=misc --subsystem-match=i2c-dev --subsystem-match=hidraw --action=change
 sudo "$LIB/armoury-root" asusd-support-fix
 
 systemctl --user daemon-reload

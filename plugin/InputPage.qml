@@ -39,6 +39,7 @@ Flickable {
     { label: "Keyboard brightness", value: "cycle_brightness" },
     { label: "Lighting effect", value: "cycle_effect" },
     { label: "Toggle NumberPad", value: "toggle_numpad" },
+    { label: "Toggle music lighting", value: "toggle_music" },
     { label: "Run command", value: "command" }
   ]
 

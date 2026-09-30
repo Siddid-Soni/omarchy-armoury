@@ -18,6 +18,7 @@ pub async fn collect(sys: &dyn Sysfs, gfx: &dyn Gfx, svc: &dyn Services, nv: &dy
         lighting: LightingState {
             brightness: sys.read(sysfs::KBD_BRIGHTNESS).and_then(|v| v.parse().ok()),
             on_ac: on_ac(sys),
+            ..Default::default()
         },
         config_error: None,
         apply_error: None,

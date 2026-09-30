@@ -27,11 +27,18 @@ Design: `docs/superpowers/specs/`.
   - NVIDIA: Dynamic Boost, temperature target, core and memory clock offsets.
   - Live GPU status: clocks, temperature, power, load, VRAM, and what is keeping the dGPU awake.
 - **Lighting**: keyboard brightness (remembered separately on AC and battery),
-  effects with colours, speed and direction, and per-zone control including logo and lightbar.
+  effects with colours, speed and direction, and per-zone control including logo, lightbar
+  and the light bar under the display (Lid).
+- **Music lighting**: the keyboard reacts to whatever is playing (per-key keyboards).
+  Spectrum (bass to treble, left to right, bars rising with each band) or Pulse
+  (everything follows loudness), in a gradient, rainbow or single colour, with a
+  sensitivity setting. Setting an effect turns it off; it remembers on/off.
+  `armoury music on|off|toggle|set …`.
 - **Battery**: charge, health, cycles, voltage, draw and time left; charge limit
   with a one-shot "charge to 100%".
 - **Input**: bind the ROG key, Fn+F5 and Fn+F4 (Aura) to open Armoury, cycle mode,
-  cycle keyboard brightness, cycle lighting effect, or run any command; touchpad toggle.
+  cycle keyboard brightness, cycle lighting effect, toggle the NumberPad or music
+  lighting, or run any command; touchpad toggle.
 - **System**: panel refresh rate on AC and on battery, overdrive and gamma,
   performance mode on AC and on battery, sleep mode, lid-closed behaviour, boot sound.
 
@@ -49,8 +56,8 @@ Design: `docs/superpowers/specs/`.
 
 ## asusd lighting fix
 
-asusd's model database lists the G533Z as keyboard-only, so the logo and
-lightbar never light. `armoury-root asusd-support-fix` adds the missing zones;
+asusd's model database lists the G533Z as keyboard-only, so the logo,
+lightbar and the light bar under the display (Lid) never light. `armoury-root asusd-support-fix` adds the missing zones;
 a pacman hook re-applies it after asusctl upgrades.
 
 ## Uninstall

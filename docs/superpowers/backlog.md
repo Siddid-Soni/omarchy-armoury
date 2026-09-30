@@ -25,6 +25,12 @@ Proposed approach (not yet approved):
 - First step: a key-capture session with the user to list the exact codes
   each key sends.
 
+## Keystone LED — for Plan 10, 2026-09-30
+
+The Keystone LED is direct-mode LED 175 (slot 8 of the lightbar/logo packet), confirmed on
+the G533ZW. g-helper's "KSTN" LED 0 lights nothing. Music lighting drives 175 with the
+ambient lights. Plan 10 can use it, e.g. to flash on insert/remove.
+
 ## Other deferred items
 
 - Software Fn-lock: the user doesn't use it. There is no firmware attribute

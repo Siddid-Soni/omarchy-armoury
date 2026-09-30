@@ -342,8 +342,10 @@ Panel {
             }
             Toggle {
               icon: "󰝚"; label: "Music"
-              on: false
-              usable: false
+              readonly property string st: root.snap && root.snap.lighting && root.snap.lighting.music ? root.snap.lighting.music : "unavailable"
+              on: st === "on"
+              usable: root.active && st !== "unavailable"
+              onClicked: client.run({ cmd: "set_music", on: !on })
             }
           }
         }

@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::control::{Control, ModeHandle, handback, takeover};
-use crate::features::{fan, manual, numpad};
+use crate::features::{fan, manual, music, numpad};
 use crate::features::limits::{self, Bounds, Limit};
 use crate::features::perf::{HwCtx, apply_mode, apply_nv, nv_is_stock};
 use crate::features::lighting::{effect_from_raw, effect_to_raw, power_from_raw, set_zone, validate_effect};
@@ -53,6 +53,14 @@ pub struct Daemon {
     numpad_tx: Option<tokio::sync::mpsc::Sender<numpad::worker::Cmd>>,
     numpad_state: Arc<std::sync::Mutex<NumpadState>>,
     numpad_env: std::sync::Mutex<Option<(bool, bool)>>,
+    /// Music worker commands, its published state, and the active flag last sent to it.
+    music_tx: Option<tokio::sync::mpsc::Sender<music::worker::Cmd>>,
+    music_status: music::worker::Status,
+    music_env: std::sync::Mutex<Option<bool>>,
+    /// Set from the NumberPad/music release until the handback has finished: the poll tick
+    /// must not tell a released worker that armouryd is still active (it would restart just
+    /// before asusd stops).
+    handing_back: std::sync::atomic::AtomicBool,
 }
 
 impl Daemon {
@@ -78,6 +86,10 @@ impl Daemon {
             numpad_tx: None,
             numpad_state: Arc::new(std::sync::Mutex::new(NumpadState::Unavailable)),
             numpad_env: std::sync::Mutex::new(None),
+            music_tx: None,
+            music_status: Arc::new(std::sync::Mutex::new((armoury_proto::MusicState::Unavailable, None))),
+            music_env: std::sync::Mutex::new(None),
+            handing_back: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -118,6 +130,48 @@ impl Daemon {
         } else {
             eprintln!("armouryd: NumberPad didn't confirm release before handback");
         }
+    }
+
+    pub fn with_music(self: Arc<Self>, tx: tokio::sync::mpsc::Sender<music::worker::Cmd>, status: music::worker::Status) -> Arc<Self> {
+        let mut d = Arc::try_unwrap(self).ok().expect("with_music before the daemon is shared");
+        d.music_tx = Some(tx);
+        d.music_status = status;
+        Arc::new(d)
+    }
+
+    fn music_send(&self, c: music::worker::Cmd) -> bool {
+        self.music_tx.as_ref().is_some_and(|tx| tx.try_send(c).is_ok())
+    }
+
+    /// Sends a command that carries an ack and waits for it (bounded: a stuck worker
+    /// must not block handback or an effect change). False if it didn't confirm.
+    async fn music_ack(&self, cmd: impl FnOnce(tokio::sync::oneshot::Sender<()>) -> music::worker::Cmd) -> bool {
+        let Some(tx) = &self.music_tx else { return true };
+        let (ack, done) = tokio::sync::oneshot::channel();
+        let sent = tokio::time::timeout(Duration::from_secs(2), tx.send(cmd(ack))).await;
+        // restoring the effect goes through asusd (3 s timeout, one retry)
+        matches!(sent, Ok(Ok(()))) && tokio::time::timeout(Duration::from_secs(8), done).await.is_ok()
+    }
+
+    /// Before asusd stops: music stops and the effect is back.
+    async fn release_music(&self) {
+        if self.music_ack(music::worker::Cmd::Release).await {
+            *self.music_env.lock().unwrap() = Some(false);
+        } else {
+            eprintln!("armouryd: music didn't confirm release before handback");
+        }
+    }
+
+    fn music_on(&self) -> bool { self.music_status.lock().unwrap().0 == armoury_proto::MusicState::On }
+
+    /// An effect is about to be written: music (if on) turns off first, and stays off.
+    async fn stop_music_for_effect(&self) -> anyhow::Result<()> {
+        if !self.music_on() { return Ok(()); }
+        anyhow::ensure!(self.music_ack(|ack| music::worker::Cmd::Set { on: false, ack: Some(ack) }).await, "music lighting didn't stop");
+        let mut cfg = self.config.lock().await;
+        cfg.music.on = false;
+        cfg.save(&self.config_path)?;
+        Ok(())
     }
 
     fn numpad_send(&self, c: numpad::worker::Cmd) -> bool {
@@ -165,6 +219,12 @@ impl Daemon {
                 let r = self.handle(Request::SetNumpad { on: !on }).await;
                 if !r.ok { self.osd("keyboard", &format!("NumberPad: {}", r.error.unwrap_or_default())).await; }
             }
+            KeyAction::ToggleMusic => {
+                let on = !self.music_on();
+                let r = self.handle(Request::SetMusic { on }).await;
+                let msg = if r.ok { format!("Music lighting {}", if on { "on" } else { "off" }) } else { format!("Music lighting: {}", r.error.unwrap_or_default()) };
+                self.osd("keyboard", &msg).await;
+            }
             KeyAction::CycleMode => {
                 // Keys are handled one at a time and switch_profile holds the apply lock,
                 // so presses are serialized: each switch finishes before the next starts
@@ -195,6 +255,7 @@ impl Daemon {
                 }
             }
             KeyAction::CycleEffect => {
+                if let Err(e) = self.stop_music_for_effect().await { eprintln!("armouryd: {e:#}"); return; }
                 if let Ok((mode, _, modes, _)) = with_retry(|| self.aura.info()).await {
                     let codes: Vec<u32> = modes.into_iter().filter(|c| armoury_proto::AuraMode::from_code(*c).is_some()).collect();
                     if let Some(pos) = codes.iter().position(|c| *c == mode.0).or(Some(0)) {
@@ -460,6 +521,7 @@ impl Daemon {
                     let (_, _, modes, _) = info().await?;
                     let supported: Vec<_> = modes.into_iter().filter_map(armoury_proto::AuraMode::from_code).collect();
                     validate_effect(&effect, &supported).map_err(anyhow::Error::msg)?;
+                    self.stop_music_for_effect().await?;
                     with_retry(|| self.aura.set_mode_data(effect_to_raw(&effect))).await?;
                     Ok(serde_json::to_value(effect)?)
                 }
@@ -468,6 +530,7 @@ impl Daemon {
                     anyhow::ensure!(zones.contains(&zone.zone.code()), "{:?} lighting is not available on this laptop", zone.zone);
                     let new = set_zone(&power, &zone);
                     with_retry(|| self.aura.set_power(new.clone())).await?;
+                    self.music_send(music::worker::Cmd::Lit(music::render::Lit::from_zones(&power_from_raw(&new))));
                     Ok(serde_json::to_value(power_from_raw(&new))?)
                 }
                 Request::KbdIdle => {
@@ -485,9 +548,11 @@ impl Daemon {
                         if saved_now { self.light.lock().unwrap().idle_saved = None; }
                         return Err(e);
                     }
+                    self.music_send(music::worker::Cmd::Idle(true));
                     Ok(serde_json::json!({"dimmed": true}))
                 }
                 Request::KbdResume => {
+                    self.music_send(music::worker::Cmd::Idle(false));
                     let saved = self.light.lock().unwrap().idle_saved.take();
                     let current = self.refresh().await.lighting.brightness.unwrap_or(0);
                     // a level set while dimmed (Fn key) wins over the saved one
@@ -517,9 +582,13 @@ impl Daemon {
     }
 
     async fn tick_locked(&self, st: &mut ApplyState, force: bool) -> Vec<String> {
-        let env = (self.mode.get() == ControlMode::Active, self.touchpad_enabled());
+        let active = self.mode.get() == ControlMode::Active && !self.handing_back.load(std::sync::atomic::Ordering::SeqCst);
+        let env = (active, self.touchpad_enabled());
         if *self.numpad_env.lock().unwrap() != Some(env) && self.numpad_send(numpad::worker::Cmd::Env { active: env.0, touchpad_enabled: env.1 }) {
             *self.numpad_env.lock().unwrap() = Some(env);
+        }
+        if *self.music_env.lock().unwrap() != Some(env.0) && self.music_send(music::worker::Cmd::Env { active: env.0 }) {
+            *self.music_env.lock().unwrap() = Some(env.0);
         }
         let snap = self.refresh().await;
         if self.mode.get() != ControlMode::Active {
@@ -885,6 +954,7 @@ impl Daemon {
         s.gpu.armoury_pending = self.gpu_record();
         s.system.touchpad = Some(self.touchpad_enabled());
         s.system.numpad = *self.numpad_state.lock().unwrap();
+        (s.lighting.music, s.lighting.music_error) = self.music_status.lock().unwrap().clone();
         {
             let cfg = self.config.lock().await;
             s.perf.mode = if mode == ControlMode::Active && cfg.manual.enabled { Some(ModeChoice::Manual) } else { s.perf.profile.map(ModeChoice::from) };
@@ -913,14 +983,19 @@ impl Daemon {
             }
             Request::Subscribe => Response::ok(serde_json::Value::Null),
             Request::Takeover | Request::Handback => {
-                if req == Request::Handback && self.mode.get() == ControlMode::Active {
+                let releasing = req == Request::Handback && self.mode.get() == ControlMode::Active;
+                if releasing {
+                    self.handing_back.store(true, std::sync::atomic::Ordering::SeqCst);
                     self.release_numpad().await;
+                    self.release_music().await;
                     self.reset_to_stock().await;
                 }
                 let result = {
                     let mut ctl = self.control.lock().await;
                     if req == Request::Takeover { takeover(&mut ctl, &*self.svc).await } else { handback(&mut ctl, &*self.svc).await }
                 };
+                // a failed handback leaves armouryd active: the next tick restarts the workers
+                if releasing { self.handing_back.store(false, std::sync::atomic::Ordering::SeqCst); }
                 let snap = self.refresh().await;
                 match result {
                     Ok(()) => Response::ok(serde_json::to_value(snap).unwrap()),
@@ -1045,6 +1120,37 @@ impl Daemon {
                 drop(cfg);
                 self.numpad_send(numpad::worker::Cmd::Config(n));
                 Response::ok(serde_json::to_value(n).unwrap())
+            }
+            Request::SetMusic { on } => {
+                if let Err(r) = self.write_guard().await { return r; }
+                if on && self.music_status.lock().unwrap().0 == armoury_proto::MusicState::Unavailable {
+                    return Response::err("music lighting needs a per-key keyboard (not available on this laptop)");
+                }
+                {
+                    let mut cfg = self.config.lock().await;
+                    cfg.music.on = on;
+                    if let Err(e) = cfg.save(&self.config_path) { return Response::err(format!("save config: {e}")); }
+                }
+                let sent = if on { self.music_send(music::worker::Cmd::Set { on, ack: None }) }
+                           else { self.music_ack(|ack| music::worker::Cmd::Set { on, ack: Some(ack) }).await };
+                if !sent { return Response::err("music lighting not available"); }
+                Response::ok(serde_json::json!({"on": on}))
+            }
+            Request::SetMusicConfig { style, scheme, colour1, colour2, sensitivity } => {
+                if let Err(r) = self.write_guard().await { return r; }
+                let mut cfg = self.config.lock().await;
+                let mut m = cfg.music;
+                if let Some(v) = style { m.style = v; }
+                if let Some(v) = scheme { m.scheme = v; }
+                if let Some(v) = colour1 { m.colour1 = v; }
+                if let Some(v) = colour2 { m.colour2 = v; }
+                if let Some(v) = sensitivity { m.sensitivity = v; }
+                if let Err(e) = m.validate() { return Response::err(e); }
+                cfg.music = m;
+                if let Err(e) = cfg.save(&self.config_path) { return Response::err(format!("save config: {e}")); }
+                drop(cfg);
+                self.music_send(music::worker::Cmd::Config(m));
+                Response::ok(serde_json::to_value(m).unwrap())
             }
             Request::Keys => Response::ok(serde_json::to_value(self.config.lock().await.keys.clone()).unwrap()),
             Request::SetKeyBinding { key, action, command } => {
@@ -2643,5 +2749,121 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
         });
         r.d.handle(Request::Handback).await;
         assert!(seen.await.unwrap(), "NumberPad released (ungrabbed, dark) before the handback started G-Helper");
+    }
+
+    /// A stand-in music worker: logs commands (and whether G-Helper was already started),
+    /// acks, and publishes on/off like the real one.
+    fn music_rig(active: bool, toml: &str) -> (LightRig, Arc<std::sync::Mutex<Vec<String>>>, crate::features::music::worker::Status) {
+        use crate::features::music::worker::Cmd;
+        let LightRig { d, sys, aura, svc, dir } = light_rig(active, FakeAura::default(), toml);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let status: crate::features::music::worker::Status = Arc::new(std::sync::Mutex::new((armoury_proto::MusicState::On, None)));
+        let d = d.with_music(tx, status.clone());
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (l, st, a, sv) = (log.clone(), status.clone(), aura.clone(), svc.clone());
+        tokio::spawn(async move {
+            while let Some(c) = rx.recv().await {
+                let entry = match c {
+                    Cmd::Env { active } => format!("env {active}"),
+                    Cmd::Set { on, ack } => {
+                        st.lock().unwrap().0 = if on { armoury_proto::MusicState::On } else { armoury_proto::MusicState::Off };
+                        if !on { a.calls.lock().unwrap().push("restore".into()); }
+                        if let Some(ack) = ack { let _ = ack.send(()); }
+                        format!("set {on}")
+                    }
+                    Cmd::Config(c) => format!("config {:?}", c.style),
+                    Cmd::Lit(l) => format!("lit {}", l.lightbar),
+                    Cmd::Idle(i) => format!("idle {i}"),
+                    Cmd::Release(ack) => {
+                        let g_helper_started = sv.calls.lock().unwrap().iter().any(|c| c.contains("handback"));
+                        let _ = ack.send(());
+                        format!("release (g-helper started: {g_helper_started})")
+                    }
+                };
+                l.lock().unwrap().push(entry);
+            }
+        });
+        (LightRig { d, sys, aura, svc, dir }, log, status)
+    }
+    fn mlog(l: &Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> { l.lock().unwrap().clone() }
+
+    #[tokio::test]
+    async fn music_on_off_is_remembered_and_shown() {
+        let (r, log, status) = music_rig(true, "");
+        status.lock().unwrap().0 = armoury_proto::MusicState::Off;
+        assert!(r.d.handle(req(serde_json::json!({"cmd":"set_music","on":true}))).await.ok);
+        assert!(r.d.config.lock().await.music.on);
+        assert!(std::fs::read_to_string(r.dir.path().join("config.toml")).unwrap().contains("on = true"));
+        tokio::task::yield_now().await;
+        assert_eq!(r.d.refresh().await.lighting.music, armoury_proto::MusicState::On);
+        assert!(r.d.handle(req(serde_json::json!({"cmd":"set_music","on":false}))).await.ok);
+        assert!(!r.d.config.lock().await.music.on);
+        assert_eq!(mlog(&log), ["set true", "set false"]);
+        let resp = r.d.handle(req(serde_json::json!({"cmd":"set_music_config","style":"pulse","sensitivity":8}))).await;
+        assert!(resp.ok, "{resp:?}");
+        assert_eq!(r.d.config.lock().await.music.sensitivity, 8);
+        assert!(!r.d.handle(req(serde_json::json!({"cmd":"set_music_config","sensitivity":0}))).await.ok, "validated");
+    }
+
+    #[tokio::test]
+    async fn music_refused_in_observe_mode_and_without_a_per_key_keyboard() {
+        let (o, _l, _s) = music_rig(false, "");
+        assert!(o.d.handle(Request::SetMusic { on: true }).await.error.unwrap().contains("observe"));
+        let (r, _l, status) = music_rig(true, "");
+        status.lock().unwrap().0 = armoury_proto::MusicState::Unavailable;
+        assert!(r.d.handle(Request::SetMusic { on: true }).await.error.unwrap().contains("per-key"));
+        assert!(!r.d.config.lock().await.music.on);
+    }
+
+    #[tokio::test]
+    async fn setting_an_effect_turns_music_off_first() {
+        let (r, log, _s) = music_rig(true, "[music]\non = true\n");
+        let resp = r.d.handle(req(serde_json::json!({"cmd":"set_effect","effect":{"mode":"static","colour1":[255,0,0],"colour2":[0,0,0],"speed":"med","direction":"right"}}))).await;
+        assert!(resp.ok, "{resp:?}");
+        assert_eq!(mlog(&log), ["set false"]);
+        assert_eq!(acalls(&r), ["restore", "set_mode_data 0"], "music restored, then the new effect");
+        assert!(!r.d.config.lock().await.music.on, "music stays off after an effect change");
+    }
+
+    #[tokio::test]
+    async fn music_follows_zones_and_idle() {
+        let (r, log, _s) = music_rig(true, "");
+        assert!(r.d.handle(req(serde_json::json!({"cmd":"set_zone_power","zone":{"zone":"lightbar","boot":true,"awake":false,"sleep":true,"shutdown":true}}))).await.ok);
+        assert!(r.d.handle(Request::KbdIdle).await.ok);
+        assert!(r.d.handle(Request::KbdResume).await.ok);
+        tokio::task::yield_now().await;
+        assert_eq!(mlog(&log), ["lit false", "idle true", "idle false"]);
+    }
+
+    #[tokio::test]
+    async fn tick_tells_music_the_mode_and_handback_releases_it_first() {
+        let (r, log, _s) = music_rig(true, "");
+        r.d.tick().await;
+        r.d.tick().await;
+        r.d.handle(Request::Handback).await;
+        assert_eq!(mlog(&log), ["env true", "release (g-helper started: false)"]);
+    }
+
+    #[tokio::test]
+    async fn toggle_music_key() {
+        let (r, log, status) = music_rig(true, "[keys]\nrog = \"toggle_music\"\n");
+        status.lock().unwrap().0 = armoury_proto::MusicState::Off;
+        r.d.on_hotkey(HotKey::Rog).await;
+        tokio::task::yield_now().await;
+        assert_eq!(mlog(&log), ["set true"]);
+        r.d.on_hotkey(HotKey::Rog).await;
+        assert_eq!(mlog(&log), ["set true", "set false"]);
+        assert!(r.svc.calls.lock().unwrap().iter().any(|c| c.contains("Music lighting off")));
+    }
+
+    #[tokio::test]
+    async fn a_tick_during_handback_does_not_restart_released_workers() {
+        let (r, log, _s) = music_rig(true, "");
+        r.d.tick().await; // env true
+        r.d.handing_back.store(true, std::sync::atomic::Ordering::SeqCst); // released, mode not yet observe
+        *r.d.music_env.lock().unwrap() = Some(false);
+        r.d.tick().await;
+        tokio::task::yield_now().await;
+        assert_eq!(mlog(&log), ["env true"], "no Env {{ active: true }} between release and observe");
     }
 }

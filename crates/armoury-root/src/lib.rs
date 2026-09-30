@@ -113,7 +113,9 @@ pub struct Fix {
 }
 
 /// asusd's database under-reports power zones for these models (verified against G-Helper's firmware probe).
-pub const FIXES: &[Fix] = &[Fix { device: "G533Z", zones: &["Keyboard", "Lightbar", "Logo"] }];
+/// G533Z Lid: the light bar under the display, which stays dark in direct (per-key) mode unless
+/// its power bit is on (measured on a G533ZW, 2026-09-30).
+pub const FIXES: &[Fix] = &[Fix { device: "G533Z", zones: &["Keyboard", "Lightbar", "Logo", "Lid"] }];
 
 pub fn fix_for_board(board: &str) -> Option<&'static Fix> {
     FIXES.iter().find(|f| board.starts_with(f.device))
@@ -254,9 +256,9 @@ mod tests {
     #[test]
     fn patches_only_target_entry() {
         let out = patch_support(DB, g533z()).unwrap().unwrap();
-        assert!(out.contains("device_name: \"G533Z\",\n        product_id: \"\",\n        layout_name: \"g533q-per-key\",\n        basic_modes: [Static, Breathe],\n        basic_zones: [],\n        advanced_type: PerKey,\n        power_zones: [Keyboard, Lightbar, Logo],"));
+        assert!(out.contains("device_name: \"G533Z\",\n        product_id: \"\",\n        layout_name: \"g533q-per-key\",\n        basic_modes: [Static, Breathe],\n        basic_zones: [],\n        advanced_type: PerKey,\n        power_zones: [Keyboard, Lightbar, Logo, Lid],"));
         assert_eq!(out.matches("power_zones: [Keyboard, Lightbar],").count(), 2, "neighbours untouched");
-        assert_eq!(out.len(), DB.len() + ", Lightbar, Logo".len());
+        assert_eq!(out.len(), DB.len() + ", Lightbar, Logo, Lid".len());
     }
 
     #[test]
@@ -269,7 +271,7 @@ mod tests {
     fn keeps_existing_extra_zones() {
         let db = DB.replace("power_zones: [Keyboard],", "power_zones: [Keyboard, Lid],");
         let out = patch_support(&db, g533z()).unwrap().unwrap();
-        assert!(out.contains("power_zones: [Keyboard, Lid, Lightbar, Logo],"));
+        assert!(out.contains("power_zones: [Keyboard, Lid, Lightbar, Logo],"), "Lid already there: not added twice");
     }
 
     #[test]
@@ -289,7 +291,9 @@ mod tests {
     fn stale_config_detection() {
         let only_kbd = "states: [ ( zone: Keyboard, boot: false, ), ]";
         assert!(aura_config_stale(only_kbd, g533z()));
-        let full = "( zone: Keyboard, ) ( zone: Lightbar, ) ( zone: Logo, )";
+        let no_lid = "( zone: Keyboard, ) ( zone: Lightbar, ) ( zone: Logo, )";
+        assert!(aura_config_stale(no_lid, g533z()), "a config from before the Lid fix is regenerated");
+        let full = "( zone: Keyboard, ) ( zone: Lightbar, ) ( zone: Logo, ) ( zone: Lid, )";
         assert!(!aura_config_stale(full, g533z()));
     }
 }

@@ -12,6 +12,8 @@ Flickable {
   readonly property bool usable: client && client.active
   property var info: null
   property string error: ""
+  property var music: null   // config.toml [music]
+  readonly property string musicState: snap && snap.lighting && snap.lighting.music ? snap.lighting.music : "unavailable"
 
   // effect being edited
   property string mode: "static"
@@ -44,7 +46,11 @@ Flickable {
       }
     })
   }
-  Component.onCompleted: reload()
+  function reloadMusic() {
+    client.call({ cmd: "config" }, function(r) { if (r.ok) root.music = r.data.music })
+  }
+  function setMusic(key, v) { var r = { cmd: "set_music_config" }; r[key] = v; client.run(r, function() { root.reloadMusic() }) }
+  Component.onCompleted: { reload(); reloadMusic() }
 
   function applyEffect() {
     if (!valid(colour1) || !valid(colour2)) { root.error = "Colours must be RRGGBB"; return }
@@ -161,6 +167,101 @@ Flickable {
       foreground: root.fg
       enabled: root.usable
       onClicked: root.applyEffect()
+    }
+
+    Section { visible: !!root.music; text: "MUSIC"; fg: root.fg }
+    Column {
+      visible: !!root.music
+      width: parent.width
+      spacing: Style.space(12)
+      Row {
+        spacing: Style.space(10)
+        Button {
+          text: root.musicState === "on" ? "Music lighting: on" : "Music lighting: off"
+          bordered: true
+          foreground: root.fg
+          active: root.musicState === "on"
+          enabled: root.usable && root.musicState !== "unavailable"
+          onClicked: root.client.run({ cmd: "set_music", on: root.musicState !== "on" }, function() { root.reloadMusic() })
+        }
+      }
+      Text {
+        width: parent.width
+        wrapMode: Text.WordWrap
+        text: root.musicState === "failed" ? "Stopped: " + (root.snap.lighting.music_error || "repeated failures") + " — turn it on to retry."
+          : root.musicState === "unavailable" ? (root.usable ? "Needs a per-key keyboard." : "Press Take over to use music lighting.")
+          : "Lights the keyboard to whatever is playing. Setting an effect turns it off."
+        color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption
+      }
+      ChoiceRow {
+        fg: root.fg
+        label: "Style"
+        usable: root.usable
+        options: [{ label: "Spectrum", value: "spectrum" }, { label: "Pulse", value: "pulse" }]
+        value: root.music ? root.music.style : undefined
+        onChosen: function(v) { root.setMusic("style", v) }
+      }
+      ChoiceRow {
+        fg: root.fg
+        label: "Colours"
+        usable: root.usable
+        options: [{ label: "Gradient", value: "gradient" }, { label: "Rainbow", value: "rainbow" }, { label: "Single", value: "single" }]
+        value: root.music ? root.music.scheme : undefined
+        onChosen: function(v) { root.setMusic("scheme", v) }
+      }
+      Repeater {
+        model: root.music && root.music.scheme !== "rainbow"
+          ? (root.music.scheme === "single" ? [{ key: "colour1", label: "Colour" }] : [{ key: "colour1", label: "Low / quiet" }, { key: "colour2", label: "High / loud" }])
+          : []
+        Column {
+          id: mc
+          required property var modelData
+          readonly property string current: root.music ? root.hex(root.music[modelData.key]) : "000000"
+          width: col.width
+          spacing: Style.space(6)
+          Text { text: mc.modelData.label; color: root.fg; opacity: 0.7; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+          Row {
+            spacing: Style.space(6)
+            Rectangle {
+              width: Style.space(34); height: Style.space(34); radius: Style.space(6)
+              color: "#" + mc.current
+              border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.3)
+            }
+            TextField {
+              width: Style.space(110)
+              text: mc.current
+              foreground: root.fg
+              enabled: root.usable
+              onEditingFinished: {
+                var h = text.replace("#", "")
+                if (root.valid(h) && h.toLowerCase() !== mc.current) root.setMusic(mc.modelData.key, root.rgb(h))
+              }
+            }
+            Repeater {
+              model: root.presets
+              Rectangle {
+                required property var modelData
+                width: Style.space(26); height: Style.space(26); radius: width / 2
+                anchors.verticalCenter: parent.verticalCenter
+                color: "#" + modelData
+                border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.3)
+                MouseArea {
+                  anchors.fill: parent; cursorShape: Qt.PointingHandCursor
+                  enabled: root.usable
+                  onClicked: root.setMusic(mc.modelData.key, root.rgb(parent.modelData))
+                }
+              }
+            }
+          }
+        }
+      }
+      ValueSlider {
+        fg: root.fg; label: "Sensitivity"; unit: ""
+        minimum: 1; maximum: 10
+        value: root.music ? root.music.sensitivity : 5
+        usable: root.usable
+        onCommitted: function(v) { root.setMusic("sensitivity", v) }
+      }
     }
 
     Section { visible: !!root.info; text: "ZONES"; fg: root.fg }

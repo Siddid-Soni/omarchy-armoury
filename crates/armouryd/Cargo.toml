@@ -16,6 +16,8 @@ zbus.workspace = true
 nvml-wrapper = "0.13"
 evdev = { version = "0.13", features = ["tokio"] }
 i2cdev = "0.6"
+rustfft = "6"
+nix = { workspace = true, features = ["ioctl"] }
 
 [dev-dependencies]
 tempfile.workspace = true
