@@ -115,6 +115,46 @@ pub struct LightingInfo {
 pub struct LightingState {
     pub brightness: Option<u8>,
     pub on_ac: Option<bool>,
+    #[serde(default)]
+    pub music: MusicState,
+    /// Why music lighting stopped by itself (capture or keyboard failures).
+    #[serde(default)]
+    pub music_error: Option<String>,
+}
+
+/// Music-reactive lighting (armouryd's, active mode only).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MusicState {
+    /// Observe mode, or no per-key keyboard.
+    #[default]
+    Unavailable,
+    Off,
+    On,
+    /// Turned itself off after repeated failures (see `music_error`).
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MusicStyle {
+    /// Bass → treble left → right, bars rise with each band's level.
+    #[default]
+    Spectrum,
+    /// Everything follows the loudness.
+    Pulse,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MusicScheme {
+    /// Colour 1 → colour 2 (by bar height, or by loudness in Pulse).
+    #[default]
+    Gradient,
+    /// Hue by key column.
+    Rainbow,
+    /// Colour 1 only.
+    Single,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -208,6 +248,8 @@ pub enum KeyAction {
     CycleEffect,
     /// Turns the NumberPad on or off.
     ToggleNumpad,
+    /// Turns music lighting on or off.
+    ToggleMusic,
     /// Runs the configured shell command.
     Command,
 }
@@ -536,6 +578,15 @@ pub enum Request {
         #[serde(default)] repeat_delay_ms: Option<u32>,
         #[serde(default)] repeat_rate_hz: Option<u32>,
     },
+    /// Music lighting on/off (active mode; remembered).
+    SetMusic { on: bool },
+    SetMusicConfig {
+        #[serde(default)] style: Option<MusicStyle>,
+        #[serde(default)] scheme: Option<MusicScheme>,
+        #[serde(default)] colour1: Option<[u8; 3]>,
+        #[serde(default)] colour2: Option<[u8; 3]>,
+        #[serde(default)] sensitivity: Option<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -713,5 +764,16 @@ mod tests {
         let r: Request = serde_json::from_str(r#"{"cmd":"set_numpad_config","idle_dim_secs":0}"#).unwrap();
         assert_eq!(r, Request::SetNumpadConfig { start_brightness: None, allow_when_touchpad_off: None, idle_dim_secs: Some(0), hold_ms: None, key_repeat: None, repeat_delay_ms: None, repeat_rate_hz: None });
         assert_eq!(serde_json::from_str::<KeyAction>("\"toggle_numpad\"").unwrap(), KeyAction::ToggleNumpad);
+    }
+
+    #[test]
+    fn music_wire_format() {
+        assert_eq!(serde_json::from_str::<KeyAction>("\"toggle_music\"").unwrap(), KeyAction::ToggleMusic);
+        let r: Request = serde_json::from_str(r#"{"cmd":"set_music","on":true}"#).unwrap();
+        assert_eq!(r, Request::SetMusic { on: true });
+        let r: Request = serde_json::from_str(r#"{"cmd":"set_music_config","style":"pulse","colour1":[1,2,3]}"#).unwrap();
+        assert_eq!(r, Request::SetMusicConfig { style: Some(MusicStyle::Pulse), scheme: None, colour1: Some([1, 2, 3]), colour2: None, sensitivity: None });
+        let l: LightingState = serde_json::from_str(r#"{"brightness":3,"on_ac":true}"#).unwrap();
+        assert_eq!((l.music, l.music_error), (MusicState::Unavailable, None), "older snapshots still parse");
     }
 }

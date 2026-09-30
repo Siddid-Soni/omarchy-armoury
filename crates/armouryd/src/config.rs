@@ -14,6 +14,7 @@ pub struct Config {
     pub system: SystemConfig,
     pub keys: KeysConfig,
     pub numpad: NumpadConfig,
+    pub music: MusicConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -165,6 +166,32 @@ pub struct NumpadConfig {
     pub repeat_rate_hz: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MusicConfig {
+    /// Music lighting was left on: it starts again in active mode.
+    pub on: bool,
+    pub style: armoury_proto::MusicStyle,
+    pub scheme: armoury_proto::MusicScheme,
+    pub colour1: [u8; 3],
+    pub colour2: [u8; 3],
+    /// 1–10: how far below the peak still lights up.
+    pub sensitivity: u8,
+}
+
+impl Default for MusicConfig {
+    fn default() -> Self {
+        Self { on: false, style: Default::default(), scheme: Default::default(), colour1: [0x00, 0xc8, 0xff], colour2: [0xff, 0x00, 0x40], sensitivity: 5 }
+    }
+}
+
+impl MusicConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=10).contains(&self.sensitivity) { return Err("music sensitivity must be 1–10".into()); }
+        Ok(())
+    }
+}
+
 impl Default for NumpadConfig {
     fn default() -> Self { Self { start_brightness: 8, allow_when_touchpad_off: false, idle_dim_secs: 60, hold_ms: 1000, key_repeat: true, repeat_delay_ms: 0, repeat_rate_hz: 0 } }
 }
@@ -275,6 +302,18 @@ mod tests {
         let (old, err) = Config::load(&path);
         assert!(err.is_none(), "old [modes] must not make the config bad: {err:?}");
         assert!(old.modes.is_none(), "legacy table dropped after load");
+    }
+
+    #[test]
+    fn music_defaults_and_validation() {
+        let c = MusicConfig::default();
+        assert!(!c.on && c.sensitivity == 5 && c.validate().is_ok());
+        assert!(MusicConfig { sensitivity: 0, ..c }.validate().is_err());
+        assert!(MusicConfig { sensitivity: 11, ..c }.validate().is_err());
+        let (cfg, err) = { let d = tempfile::tempdir().unwrap(); let p = d.path().join("c.toml");
+            std::fs::write(&p, "[music]\non = true\nstyle = \"pulse\"\n").unwrap(); Config::load(&p) };
+        assert!(err.is_none());
+        assert_eq!((cfg.music.on, cfg.music.style, cfg.music.sensitivity), (true, armoury_proto::MusicStyle::Pulse, 5));
     }
 
     #[test]
