@@ -10,8 +10,8 @@ import qs.Ui
 // Everything goes through ArmouryClient; no hardware access here.
 Panel {
   id: root
-  moduleName: "asus.armoury"
-  ipcTarget: "asus.armoury"
+  moduleName: "io.github.siddid-soni.armoury"
+  ipcTarget: "io.github.siddid-soni.armoury"
   manageIpc: false
 
   // The bar sizes widgets from their implicit size (as omarchy.power does).
@@ -55,7 +55,7 @@ Panel {
 
   function openWindow() {
     root.close()
-    Quickshell.execDetached(["omarchy-shell", "shell", "summon", "asus.armoury", "{}"])
+    Quickshell.execDetached(["omarchy-shell", "shell", "summon", "io.github.siddid-soni.armoury", "{}"])
   }
 
   function setMode(id) { if (root.active) client.run({ cmd: "set_profile", profile: id }) }
@@ -197,7 +197,7 @@ Panel {
               width: parent.width
               anchors.verticalCenter: parent.verticalCenter
               wrapMode: Text.WordWrap
-              text: "armouryd is not running. Start it with: systemctl --user start armouryd"
+              text: "armouryd is not running. First time? Run install.sh in the plugin folder (see the README). Otherwise: systemctl --user start armouryd"
               color: root.fg
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall

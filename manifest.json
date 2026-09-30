@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.siddid-soni.armoury",
+  "name": "Armoury",
+  "version": "0.3.0",
+  "author": "Siddid Soni",
+  "license": "MIT",
+  "description": "ASUS ROG control for Omarchy: performance modes, fan curves, power limits, lighting (with a music effect), battery, display, GPU, NumberPad and Keystone. Needs its armouryd daemon: run install.sh from the plugin folder once.",
+  "kinds": [
+    "bar-widget",
+    "panel"
+  ],
+  "entryPoints": {
+    "barWidget": "plugin/Widget.qml",
+    "panel": "plugin/Window.qml"
+  },
+  "barWidget": {
+    "displayName": "Armoury",
+    "description": "ASUS performance mode, GPU, quick toggles and status",
+    "category": "System",
+    "allowMultiple": false,
+    "defaults": {
+      "kbdIdleSeconds": 60,
+      "showTemperature": true
+    },
+    "schema": [
+      {
+        "key": "kbdIdleSeconds",
+        "type": "integer",
+        "label": "Dim keyboard after idle (seconds, 0 = never)",
+        "min": 0,
+        "max": 3600,
+        "step": 10,
+        "defaultValue": 60
+      },
+      {
+        "key": "showTemperature",
+        "type": "enum",
+        "label": "Show CPU temperature in the bar",
+        "options": [
+          "true",
+          "false"
+        ],
+        "defaultValue": "true"
+      }
+    ]
+  }
+}
