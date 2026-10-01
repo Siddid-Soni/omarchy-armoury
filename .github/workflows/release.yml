@@ -1,5 +1,6 @@
 # Builds armouryd, armoury and armoury-root for a version tag (v0.3.0 …) and attaches
-# them to the GitHub release, where install.sh downloads them.
+# them to the GitHub release. install.sh does not trust the .sha256 asset: after a release,
+# copy the digest from the job summary into packaging/release.sha256 and commit it.
 name: release
 
 on:
@@ -25,7 +26,7 @@ jobs:
         run: |
           name="armoury-${GITHUB_REF_NAME#v}-$(uname -m)-linux.tar.gz"
           tar -czf "$name" -C target/release armouryd armoury armoury-root
-          sha256sum "$name" > "$name.sha256"
+          sha256sum "$name" | tee "$name.sha256" >> "$GITHUB_STEP_SUMMARY"
       - uses: softprops/action-gh-release@v2
         with:
           files: |

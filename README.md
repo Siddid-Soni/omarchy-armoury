@@ -127,7 +127,8 @@ Then click the Armoury icon in the bar and press **Set up**. That opens a termin
 running the plugin's `install.sh`, which sets up the daemon.
 
 - **Binaries:** it downloads the prebuilt binaries for this version from the GitHub
-  release and checks them against the release's sha256.
+  release and checks them against the sha256 committed in `packaging/release.sha256`, not
+  one downloaded with them. A mismatch falls back to building from source.
   - If there's no release for this version, or you pass `--build`, it builds them with
     cargo instead. That needs Rust, and the build goes to `~/.cache/omarchy-armoury`.
 - **Questions it asks:**
@@ -195,4 +196,4 @@ Unix socket (`$XDG_RUNTIME_DIR/armoury.sock`). Everything else comes from `insta
   it runs. The audio is analysed in memory only, never stored or sent.
 
 `install.sh` downloads the release binaries from this repository's GitHub releases
-(sha256-checked). Nothing else is downloaded, and armouryd makes no network connections.
+(checked against a sha256 committed in this repository). Nothing else is downloaded, and armouryd makes no network connections.

@@ -1,0 +1,4 @@
+# sha256 of each prebuilt release archive, checked in so install.sh verifies downloads
+# against this reviewed file and not against a checksum fetched from the (mutable) release.
+# Format: sha256sum output. Add the line for a new version in the commit that follows its release.
+c8b5501637bb1b9d74093285b574f626be0a2b046e8582b08155e7f8e6d70540  armoury-0.3.0-x86_64-linux.tar.gz

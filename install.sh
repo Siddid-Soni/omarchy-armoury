@@ -36,19 +36,25 @@ omarchy-armoury installs:
     (polkit rule for your user)
   - udev rules giving your seat access to the ASUS keyboard, touchpad, i2c and uinput
   - a pacman hook and a fix to asusd's model file (all lighting zones on the G533Z)
-It downloads the prebuilt binaries for this version from GitHub releases (checksum
-verified), or builds them with cargo, and asks for sudo once. uninstall.sh reverses all of it.
+It downloads the prebuilt binaries for this version from GitHub releases (checked against
+the checksum in this plugin's source), or builds them with cargo, and asks for sudo once. uninstall.sh reverses all of it.
 INFO
 if [ -t 0 ] && ! ask "Continue? [Y/n]" y; then echo "Nothing installed."; exit 0; fi
 UNIT_DIR=~/.config/systemd/user
 
-# Prebuilt binaries for this exact version, checked against the release's sha256.
+# Prebuilt binaries for this exact version. The expected sha256 comes from
+# packaging/release.sha256 in this checkout (the reviewed source), never from the release
+# itself: armoury-root runs as root, so replacing release assets must not be enough to change it.
 fetch_release() {
-  local dir=$1 name="armoury-$VERSION-$(uname -m)-linux.tar.gz"
+  local dir=$1 name="armoury-$VERSION-$(uname -m)-linux.tar.gz" want
+  want=$(awk -v n="$name" '$2 == n && $1 ~ /^[0-9a-f]{64}$/ { print $1 }' packaging/release.sha256)
+  [ -n "$want" ] || return 1
   command -v curl >/dev/null || return 1
   curl -fsSL "$REPO/releases/download/v$VERSION/$name" -o "$dir/$name" 2>/dev/null || return 1
-  curl -fsSL "$REPO/releases/download/v$VERSION/$name.sha256" -o "$dir/$name.sha256" 2>/dev/null || return 1
-  (cd "$dir" && sha256sum --quiet -c "$name.sha256") || { echo "Checksum mismatch for $name" >&2; return 1; }
+  if [ "$(sha256sum "$dir/$name" | cut -d' ' -f1)" != "$want" ]; then
+    echo "The downloaded $name does not match the checksum in packaging/release.sha256; not using it." >&2
+    return 1
+  fi
   tar -xzf "$dir/$name" -C "$dir"
 }
 
@@ -57,9 +63,13 @@ if [ "$BUILD" = 0 ] && fetch_release "$TMP"; then
   BIN=$TMP
 else
   if ! command -v cargo >/dev/null; then
-    echo "No prebuilt release for v$VERSION could be downloaded, and cargo isn't installed." >&2
-    echo "Install Rust (sudo pacman -S rust) and run this again." >&2
-    exit 1
+    echo "No verified prebuilt release for v$VERSION is available, and cargo isn't installed." >&2
+    if ask "Install Rust (sudo pacman -S --needed rust) and build from source? [Y/n]" y; then
+      sudo pacman -S --needed --noconfirm rust
+    else
+      echo "Install Rust (sudo pacman -S rust) and run this again." >&2
+      exit 1
+    fi
   fi
   [ "$BUILD" = 1 ] || echo "No prebuilt release for v$VERSION; building from source."
   # Build outside the source tree: when installed with `omarchy plugin add`, this folder is
