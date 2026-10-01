@@ -130,7 +130,9 @@ running the plugin's `install.sh`, which sets up the daemon.
   release and checks them against the sha256 committed in `packaging/release.sha256`, not
   one downloaded with them. A mismatch falls back to building from source.
   - If there's no release for this version, or you pass `--build`, it builds them with
-    cargo instead. That needs Rust, and the build goes to `~/.cache/omarchy-armoury`.
+    cargo instead. That needs Rust; if it isn't installed, the installer asks before running
+    `sudo pacman -S --needed rust` (with no terminal it installs nothing and stops).
+    The build goes to `~/.cache/omarchy-armoury`. `uninstall.sh` leaves Rust installed.
 - **Questions it asks:**
   - it lists what it installs and asks before starting, then asks for sudo once (see
     *What it installs*)

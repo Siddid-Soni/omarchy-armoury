@@ -37,7 +37,8 @@ omarchy-armoury installs:
   - udev rules giving your seat access to the ASUS keyboard, touchpad, i2c and uinput
   - a pacman hook and a fix to asusd's model file (all lighting zones on the G533Z)
 It downloads the prebuilt binaries for this version from GitHub releases (checked against
-the checksum in this plugin's source), or builds them with cargo, and asks for sudo once. uninstall.sh reverses all of it.
+the checksum in this plugin's source), or builds them with cargo (asking first to install
+Rust if it's missing), and asks for sudo once. uninstall.sh reverses all of it.
 INFO
 if [ -t 0 ] && ! ask "Continue? [Y/n]" y; then echo "Nothing installed."; exit 0; fi
 UNIT_DIR=~/.config/systemd/user
