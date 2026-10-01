@@ -32,7 +32,11 @@ impl Services for RealServices {
         let (prog, args) = argv.split_first().context("empty argv")?;
         if !std::path::Path::new(prog).exists() { bail!("cannot launch {prog}: not found"); }
         let path = format!("{path_prepend}:{}", std::env::var("PATH").unwrap_or_default());
-        let st = Command::new("setsid").arg("-f").arg(prog).args(args).env("PATH", path)
+        // armouryd can start before the graphical session exists, so its own environment lacks
+        // WAYLAND_DISPLAY, XDG_CURRENT_DESKTOP and friends, and a terminal launched from it dies.
+        // The systemd user manager has the session's environment (uwsm imports it).
+        let session = self.output(&["systemctl", "--user", "show-environment"]).await.map(|o| session_env(&o)).unwrap_or_default();
+        let st = Command::new("setsid").arg("-f").arg(prog).args(args).envs(session).env("PATH", path)
             .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
             .status().await.with_context(|| format!("launch {prog}"))?;
         if !st.success() { bail!("launch {prog} failed ({st})"); }
@@ -50,6 +54,15 @@ impl Services for RealServices {
     }
 }
 
+/// KEY=value lines of `systemctl --user show-environment`; values systemd shell-quotes ($'…') are skipped.
+fn session_env(out: &str) -> Vec<(String, String)> {
+    out.lines()
+        .filter_map(|l| l.split_once('='))
+        .filter(|(k, v)| !k.is_empty() && !v.starts_with("$'") && *k != "PATH")
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,5 +73,11 @@ mod tests {
         let s = RealServices { timeout: Duration::from_millis(100) };
         let err = s.run(&["sleep", "5"]).await.unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn session_env_parses_plain_values_only() {
+        let e = session_env("WAYLAND_DISPLAY=wayland-1\nHYPRLAND_CMD=$'Hyprland --watchdog-fd 4'\nPATH=/x\nA=b=c\n");
+        assert_eq!(e, vec![("WAYLAND_DISPLAY".into(), "wayland-1".into()), ("A".into(), "b=c".into())]);
     }
 }
