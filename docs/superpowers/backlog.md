@@ -36,7 +36,7 @@ ambient lights. Plan 10 can use it, e.g. to flash on insert/remove.
 In per-key (0x5D 0xBC) mode, the bar under the display takes F5's (28) and Delete's (37)
 colours, and only when the lid power zone is on. LEDs 176/177 don't drive it. OpenRGB's
 G533ZW driver does the same. Windows Armoury Crate drives it independently, so there is
-another packet. The keyboard only has vendor reports (0x5D, 0x5A, 0xA5, 0xC1, 0xC2);
+another packet. Full capture guide: `docs/lightbar-usbpcap-capture.md`. The keyboard only has vendor reports (0x5D, 0x5A, 0xA5, 0xC1, 0xC2);
 don't blind-probe them. Instead, capture what Armoury Crate sends:
 
 1. Windows: install Wireshark with the USBPcap option, then reboot.
