@@ -17,7 +17,7 @@ nvml-wrapper = "0.13"
 evdev = { version = "0.13", features = ["tokio"] }
 i2cdev = "0.6"
 rustfft = "6"
-nix = { workspace = true, features = ["ioctl"] }
+nix = { workspace = true, features = ["ioctl", "time"] }
 
 [dev-dependencies]
 tempfile.workspace = true

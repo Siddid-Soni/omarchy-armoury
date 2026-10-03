@@ -63,8 +63,23 @@ pub struct Io {
 
 /// Fastest frame rate sent to the keyboard (it takes ~45).
 const MIN_FRAME_GAP: Duration = Duration::from_millis(30);
-/// Direct mode is re-entered this often: the firmware drops it on resume and when asusd writes.
-const REINIT_EVERY: Duration = Duration::from_secs(5);
+/// The whole frame is re-sent this often even when unchanged: the keyboard drops packets.
+const REPAINT_EVERY: Duration = Duration::from_secs(5);
+/// The boot clock got this far ahead of the monotonic one: the laptop slept, and the firmware
+/// drops direct mode on resume, so it is entered again. Never on a timer: `5d bc 00` blanks the
+/// keyboard until the next frame (a blink), and frames alone re-enter direct mode with the
+/// light bars copying keys.
+const SLEPT: Duration = Duration::from_secs(1);
+
+/// Time spent suspended since boot: CLOCK_BOOTTIME counts it, CLOCK_MONOTONIC doesn't.
+fn suspended_total() -> Duration {
+    use nix::time::{ClockId, clock_gettime};
+    let t = |c| clock_gettime(c).map(Duration::from).unwrap_or_default();
+    t(ClockId::CLOCK_BOOTTIME).saturating_sub(t(ClockId::CLOCK_MONOTONIC))
+}
+
+/// Whether the laptop slept between two `suspended_total` readings.
+fn slept(before: Duration, now: Duration) -> bool { now.saturating_sub(before) >= SLEPT }
 /// How often band levels go to the UI.
 const BANDS_EVERY: Duration = Duration::from_millis(100);
 /// More failures than this within a minute: music turns itself off.
@@ -147,7 +162,9 @@ async fn session(
     let mut analyzer = Analyzer::new();
     let mut last: Option<Frame> = None;
     let mut last_sent = Instant::now() - MIN_FRAME_GAP;
-    let mut init_at: Option<Instant> = None;
+    let mut need_init = true;
+    let mut repaint_at = Instant::now();
+    let mut suspended = suspended_total();
     let mut animate = false;
     let mut bands_at: Option<Instant> = None;
     loop {
@@ -162,15 +179,20 @@ async fn session(
                 }
                 if *idle || now.duration_since(last_sent) < MIN_FRAME_GAP { continue; }
                 let mut out = Vec::new();
-                if init_at.is_none_or(|t| now.duration_since(t) >= REINIT_EVERY) {
+                let s = suspended_total();
+                if slept(suspended, s) { need_init = true; }
+                suspended = s;
+                if std::mem::take(&mut need_init) {
                     out.push(init_packet());
-                    init_at = Some(now);
                     last = None; // repaint after entering direct mode
+                    repaint_at = now;
+                } else if now.duration_since(repaint_at) >= REPAINT_EVERY {
+                    last = None;
+                    repaint_at = now;
                 }
                 if std::mem::take(&mut animate) {
                     // plays over the stream, which comes back by itself afterwards
                     out.extend(keystone_animation_packets([0, 0, 0])); // the hold colour is unused: the stream comes back
-                    init_at = Some(now); // a re-init mid-animation could cut it short
                     last = None;
                 }
                 let frame = render(layout, &a, cfg, lit);
@@ -190,7 +212,8 @@ async fn session(
                 }
                 Some(Cmd::Config(c)) => { *cfg = c; last = None; }
                 Some(Cmd::Lit(l)) => { lit = l; *lit_override = Some(l); last = None; }
-                Some(Cmd::Idle(i)) => { *idle = i; last = None; }
+                // back from the idle dim: enter direct mode again (the keyboard was dark anyway)
+                Some(Cmd::Idle(i)) => { *idle = i; last = None; if !i { need_init = true; } }
                 Some(Cmd::Release(a)) => { *active = false; *ack = Some(a); return End::Stopped; }
                 Some(Cmd::KeystoneAnimation) => animate = true,
             },
@@ -361,6 +384,51 @@ mod tests {
         let l = log(&r);
         assert_eq!(l[0], "init+frame", "direct mode entered with the first frame: {l:?}");
         assert!(l.len() >= 2 && l[1] == "frame", "{l:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn direct_mode_is_entered_once_not_on_a_timer() {
+        // re-entering blinks the keyboard: 5d bc 00 blanks it until the next frame
+        let r = start(true);
+        r.cmds.send(Cmd::Env { active: true }).await.unwrap(); settle().await;
+        play(&r, (0..400).map(tone)).await; // ~13 s
+        let l = log(&r);
+        assert_eq!(l.iter().filter(|l| l.starts_with("init+")).count(), 1, "{:?}", &l[..5]);
+        assert_eq!(l[0], "init+frame");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unchanged_frame_is_still_repainted_every_few_seconds() {
+        // the keyboard drops packets: a frame sent once can stay half dark
+        let r = start(true);
+        r.cmds.send(Cmd::Env { active: true }).await.unwrap(); settle().await;
+        play(&r, (0..360).map(|_| vec![0.0; CHUNK])).await; // ~12 s of silence: one frame, repeated
+        let l = log(&r);
+        assert!((3..=4).contains(&l.len()) && l[1..].iter().all(|l| l == "frame"), "first frame, then a repaint every 5 s: {l:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_end_of_the_idle_dim_enters_direct_mode_again() {
+        let r = start(true);
+        r.cmds.send(Cmd::Env { active: true }).await.unwrap(); settle().await;
+        play(&r, (0..3).map(tone)).await;
+        r.cmds.send(Cmd::Idle(true)).await.unwrap(); settle().await;
+        play(&r, (3..6).map(tone)).await;
+        let n = log(&r).len();
+        r.cmds.send(Cmd::Idle(false)).await.unwrap(); settle().await;
+        play(&r, (6..9).map(tone)).await;
+        let l = log(&r);
+        assert_eq!(l[n], "init+frame", "{l:?}");
+        assert!(l[n + 1..].iter().all(|l| l == "frame"), "{l:?}");
+    }
+
+    #[test]
+    fn a_suspend_is_a_jump_of_the_boot_clock() {
+        let s = Duration::from_secs;
+        assert!(!slept(s(10), s(10)) && !slept(s(10), s(10) + Duration::from_millis(5)), "clock jitter");
+        assert!(slept(s(10), s(70)), "a minute asleep");
+        assert!(!slept(s(70), s(10)), "never backwards");
+        assert!(suspended_total() < s(365 * 24 * 3600), "readable");
     }
 
     #[tokio::test(start_paused = true)]
