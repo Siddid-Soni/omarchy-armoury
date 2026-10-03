@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.siddid-soni.armoury",
   "name": "Armoury",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "author": "Siddid Soni",
   "license": "MIT",
   "description": "ASUS ROG control for Omarchy: performance modes, fan curves, power limits, lighting (with a music effect), battery, display, GPU, NumberPad and Keystone. Needs its armouryd daemon: run install.sh from the plugin folder once.",
