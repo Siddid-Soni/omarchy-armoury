@@ -31,22 +31,13 @@ The Keystone LED is direct-mode LED 175 (slot 8 of the lightbar/logo packet), co
 the G533ZW. g-helper's "KSTN" LED 0 lights nothing. Music lighting drives 175 with the
 ambient lights. Plan 10 can use it, e.g. to flash on insert/remove.
 
-## Display light bar independent of F5/Delete — 2026-10-01
+## Display light bar independent of F5/Delete — done 2026-10-04
 
-In per-key (0x5D 0xBC) mode, the bar under the display takes F5's (28) and Delete's (37)
-colours, and only when the lid power zone is on. LEDs 176/177 don't drive it. OpenRGB's
-G533ZW driver does the same. Windows Armoury Crate drives it independently, so there is
-another packet. Full capture guide: `docs/lightbar-usbpcap-capture.md`. The keyboard only has vendor reports (0x5D, 0x5A, 0xA5, 0xC1, 0xC2);
-don't blind-probe them. Instead, capture what Armoury Crate sends:
-
-1. Windows: install Wireshark with the USBPcap option, then reboot.
-2. Wireshark as Administrator: find the USBPcapN interface that shows traffic while typing.
-3. Capture while in Armoury Crate: all keys white (wait 5 s) → only the display bar
-   00FF00 (5 s) → FF0000 (5 s) → 0000FF (5 s) → only F5 00FF00 (5 s). Press Apply at
-   each step if Armoury Crate needs it. Optionally, a second capture during its music effect.
-4. Save as .pcapng somewhere Linux can read and give Claude the path. Then decode the
-   SET_REPORT (bRequest 9) feature reports, add the bar as its own light to the per-key
-   layer and music, and drop the F5/Delete mirroring.
+The cause was the direct-mode init byte, found in a USBPcap capture of Armoury Crate switching
+to Aura mode. `5d bc 01` (g-helper's, armouryd's before) makes the logo, front light bar and
+display bar copy nearby keys (Esc, Ctrl/Fn/Win, Down/Right/PrtSc, F5/Delete) and ignore their
+own LEDs. `5d bc 00`, which Armoury Crate sends, leaves them independent. `perkey::init_packet`
+now sends `5d bc 00`. Probe and capture tools: `tools/lighting-probe/`.
 
 ## Identify Keystones via NFC (read-only) — 2026-10-01
 

@@ -67,7 +67,9 @@ pub struct Daemon {
     keystone_prev: std::sync::Mutex<Option<PrevLight>>,
     /// The kernel notified a Keystone change (keys::run_keystone_watch): wakes the poll.
     pub keystone_changed: tokio::sync::Notify,
-    /// Opens the keyboard for direct (per-key) frames: the Keystone LED flash.
+    /// When to re-apply the effect after the Keystone animation (it leaves the keyboard red).
+    keystone_restore_at: std::sync::Mutex<Option<tokio::time::Instant>>,
+    /// Opens the keyboard for the Keystone animation (and its effect restore).
     kbd_open: Option<music::worker::OpenKeyboard>,
     /// Music band levels for subscribers (empty while music isn't running).
     bands: tokio::sync::watch::Receiver<Vec<f32>>,
@@ -107,6 +109,7 @@ impl Daemon {
             handing_back: std::sync::atomic::AtomicBool::new(false),
             keystone_seen: std::sync::Mutex::new(None),
             keystone_prev: std::sync::Mutex::new(None),
+            keystone_restore_at: std::sync::Mutex::new(None),
             keystone_changed: tokio::sync::Notify::new(),
             kbd_open: None,
             bands: tokio::sync::watch::channel(Vec::new()).1,
@@ -347,6 +350,7 @@ impl Daemon {
             *self.keystone_seen.lock().unwrap() = None;
             return;
         }
+        self.finish_keystone_animation().await;
         let Some(now) = self.snap.borrow().as_ref().and_then(|s| s.keystone) else { return };
         let before = self.keystone_seen.lock().unwrap().replace(now);
         if before.is_none_or(|b| b == now) || !self.config.lock().await.keystone.enabled { return; }
@@ -354,9 +358,9 @@ impl Daemon {
     }
 
     async fn on_keystone(&self, event: KeystoneEvent) {
-        let (action, flash) = {
+        let (action, animation) = {
             let k = &self.config.lock().await.keystone;
-            (if event == KeystoneEvent::Insert { k.insert.clone() } else { k.remove.clone() }, k.flash)
+            (if event == KeystoneEvent::Insert { k.insert.clone() } else { k.remove.clone() }, k.animation)
         };
         self.osd("󰌆", if event == KeystoneEvent::Insert { "Keystone inserted" } else { "Keystone removed" }).await;
         if let Some(m) = action.mode {
@@ -369,8 +373,8 @@ impl Daemon {
         {
             eprintln!("armouryd: Keystone command: {e:#}");
         }
-        // last: the flash takes a while (KEYSTONE_SWEEP), and the actions shouldn't wait for it
-        if event == KeystoneEvent::Insert && flash { self.flash_keystone().await; }
+        // after the lighting action, so the effect re-applied after the animation is the new one
+        if event == KeystoneEvent::Insert && animation { self.play_keystone_animation().await; }
         if event == KeystoneEvent::Remove && action.lock {
             let lock = self.omarchy_bin().join("omarchy-system-lock");
             if let Err(e) = self.svc.spawn(&[&lock.to_string_lossy()], &self.omarchy_bin().to_string_lossy()).await {
@@ -411,35 +415,48 @@ impl Daemon {
         Ok(())
     }
 
-    /// The Keystone insert flash. With music on, its LED fades over music's frames. Otherwise
-    /// the keyboard goes to direct mode for the Keystone sweep (a red pulse from the Keystone
-    /// across a dark keyboard, which hides the mode switch's blink), then back to the effect.
-    /// Only on laptops with a per-key layout.
-    async fn flash_keystone(&self) {
-        use music::perkey::{Frame, KEYSTONE_SWEEP, effect_packets, init_packet, keystone_sweep, layout_for, packets};
-        if self.music_on() { self.music_send(music::worker::Cmd::Flash); return; }
+    /// The firmware's Keystone animation on insert. With music on, it plays over music's frames,
+    /// which come back by themselves. Otherwise the keyboard holds the effect's colour after it:
+    /// for Static that is the effect, so nothing more is sent (a re-apply blinks); a moving
+    /// effect is re-applied once it has played (finish_keystone_animation, woken by the poll
+    /// loop). Only on laptops with a per-key layout (the Keystone ones).
+    async fn play_keystone_animation(&self) {
+        use music::perkey::{KEYSTONE_ANIMATION, keystone_animation_packets, layout_for};
+        if self.music_on() { self.music_send(music::worker::Cmd::KeystoneAnimation); return; }
         if self.music_status.lock().unwrap().0 == armoury_proto::MusicState::Unavailable { return; }
         let Some(open) = &self.kbd_open else { return };
-        let Some(layout) = self.snap.borrow().as_ref().and_then(|s| s.model.as_deref()).and_then(layout_for) else { return };
+        if self.snap.borrow().as_ref().and_then(|s| s.model.as_deref()).and_then(layout_for).is_none() { return; }
         let Ok((mode, ..)) = with_retry(|| self.aura.info()).await else { return };
-        let mut kb = match open() { Ok(k) => k, Err(e) => { eprintln!("armouryd: Keystone flash: {e}"); return; } };
-        // The whole frame every step, like music does: the keyboard drops some packets now and
-        // then, and a frame sent once stays half dark (or dark).
-        let mut result = kb.write(vec![init_packet()]).await;
-        let start = tokio::time::Instant::now();
-        while result.is_ok() && start.elapsed() < KEYSTONE_SWEEP {
-            // over a dark keyboard: over the effect's colour, the mode switch's blink still shows
-            result = kb.write(packets(&keystone_sweep(&layout, [0, 0, 0], start.elapsed()))).await;
-            tokio::time::sleep(Duration::from_millis(25)).await;
+        let hold = [mode.2.0, mode.2.1, mode.2.2];
+        let result = match open() {
+            Ok(mut kb) => kb.write(keystone_animation_packets(hold).to_vec()).await,
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(()) if mode.0 != armoury_proto::AuraMode::Static.code() =>
+                *self.keystone_restore_at.lock().unwrap() = Some(tokio::time::Instant::now() + KEYSTONE_ANIMATION),
+            Ok(()) => {}
+            Err(e) => eprintln!("armouryd: Keystone animation: {e}"),
         }
-        // all off, the Keystone LED included: a faint level keeps flickering after direct mode
-        if result.is_ok() { result = kb.write(packets(&Frame::default())).await; }
-        // back to the effect on the same handle: asusd's set_mode_data flickers the keyboard
-        if result.is_ok() { result = kb.write(effect_packets(&mode).to_vec()).await; }
-        drop(kb);
+    }
+
+    /// Re-applies asusd's effect once the Keystone animation has played. The effect is read
+    /// now, so a lighting change made meanwhile (a quick remove) is kept. Not with music on:
+    /// its stream already came back over the animation.
+    async fn finish_keystone_animation(&self) {
+        use music::perkey::effect_packets;
+        let due = { let mut at = self.keystone_restore_at.lock().unwrap(); if at.is_some_and(|t| t <= tokio::time::Instant::now()) { at.take() } else { None } };
+        if due.is_none() || self.music_on() { return; }
+        let Ok((mode, ..)) = with_retry(|| self.aura.info()).await else { return };
+        // on the keyboard handle: asusd's set_mode_data flickers the keyboard
+        let result = match self.kbd_open.as_ref().map(|open| open()) {
+            Some(Ok(mut kb)) => kb.write(effect_packets(&mode).to_vec()).await,
+            Some(Err(e)) => Err(e),
+            None => return,
+        };
         if let Err(e) = result {
-            eprintln!("armouryd: Keystone flash: {e}");
-            if let Err(e) = with_retry(|| self.aura.set_mode_data(mode.clone())).await { eprintln!("armouryd: Keystone flash: restoring the effect: {e:#}"); }
+            eprintln!("armouryd: Keystone animation: {e}");
+            if let Err(e) = with_retry(|| self.aura.set_mode_data(mode.clone())).await { eprintln!("armouryd: Keystone animation: restoring the effect: {e:#}"); }
         }
     }
 
@@ -1339,10 +1356,10 @@ impl Daemon {
                     Err(e) => Response::err(format!("save config: {e}")),
                 }
             }
-            Request::SetKeystoneFlash { on } | Request::SetKeystoneEnabled { on } => {
+            Request::SetKeystoneAnimation { on } | Request::SetKeystoneEnabled { on } => {
                 if let Err(r) = self.write_guard().await { return r; }
                 let mut cfg = self.config.lock().await;
-                if matches!(req, Request::SetKeystoneFlash { .. }) { cfg.keystone.flash = on } else { cfg.keystone.enabled = on }
+                if matches!(req, Request::SetKeystoneAnimation { .. }) { cfg.keystone.animation = on } else { cfg.keystone.enabled = on }
                 match cfg.save(&self.config_path) {
                     Ok(()) => Response::ok(serde_json::to_value(&cfg.keystone).unwrap()),
                     Err(e) => Response::err(format!("save config: {e}")),
@@ -1481,9 +1498,11 @@ impl Daemon {
         loop {
             self.tick().await;
             self.follow_keystone().await;
+            let restore_at = *self.keystone_restore_at.lock().unwrap();
             tokio::select! {
                 _ = tokio::time::sleep(every) => {}
                 _ = self.keystone_changed.notified() => {}
+                _ = async { match restore_at { Some(t) => tokio::time::sleep_until(t).await, None => std::future::pending().await } } => {}
             }
         }
     }
@@ -3107,7 +3126,7 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
                     Cmd::Config(c) => format!("config {:?}", c.style),
                     Cmd::Lit(l) => format!("lit {}", l.lightbar),
                     Cmd::Idle(i) => format!("idle {i}"),
-                    Cmd::Flash => "flash".into(),
+                    Cmd::KeystoneAnimation => "keystone".into(),
                     Cmd::Release(ack) => {
                         let g_helper_started = sv.calls.lock().unwrap().iter().any(|c| c.contains("handback"));
                         let _ = ack.send(());
@@ -3231,19 +3250,19 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
     async fn keystone_step(r: &LightRig) { r.d.tick().await; r.d.follow_keystone().await; tokio::task::yield_now().await; }
     fn spawned(r: &LightRig) -> Vec<String> { r.svc.calls.lock().unwrap().iter().filter(|c| c.starts_with("spawn")).cloned().collect() }
 
-    /// Fake keyboard for the Keystone flash: logs each write (packets, Keystone LED level).
-    struct FlashKb(Arc<std::sync::Mutex<Vec<String>>>);
+    /// Fake keyboard for the Keystone animation: logs each write as its packets' commands.
+    struct AnimKb(Arc<std::sync::Mutex<Vec<String>>>);
     #[async_trait::async_trait]
-    impl crate::features::music::worker::Keyboard for FlashKb {
+    impl crate::features::music::worker::Keyboard for AnimKb {
         async fn write(&mut self, packets: Vec<[u8; 64]>) -> std::io::Result<()> {
-            self.0.lock().unwrap().push(format!("{} packets, keystone {}", packets.len(), packets.last().unwrap()[9 + 3 * 8]));
+            self.0.lock().unwrap().push(packets.iter().map(|p| format!("{:02x}{}", p[1], match (p[1], p[3]) { (0xB3, 0x0D) => format!(":0d:{:02x}{:02x}{:02x}", p[4], p[5], p[6]), (0xB3, m) => format!(":{m:02x}"), _ => String::new() })).collect::<Vec<_>>().join(" "));
             Ok(())
         }
     }
 
     #[tokio::test]
     async fn keystone_actions_run_on_change_only() {
-        let toml = "[keystone]\nflash = false\n[keystone.insert]\nlight = \"music\"\ncommand = \"echo in\"\n[keystone.remove]\nlock = true\ncommand = \"echo out\"\n";
+        let toml = "[keystone]\nanimation = false\n[keystone.insert]\nlight = \"music\"\ncommand = \"echo in\"\n[keystone.remove]\nlock = true\ncommand = \"echo out\"\n";
         let (r, log, status) = music_rig(true, toml);
         status.lock().unwrap().0 = armoury_proto::MusicState::Off;
         set_keystone(&r, "1");
@@ -3287,38 +3306,65 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
     }
 
     #[tokio::test]
-    async fn keystone_flash_goes_through_music_when_it_is_on() {
-        let (r, log, _status) = music_rig(true, ""); // music On, flash on by default
+    async fn keystone_animation_goes_through_music_when_it_is_on() {
+        let (r, log, _status) = music_rig(true, ""); // music On, animation on by default
         set_keystone(&r, "0");
         keystone_step(&r).await;
         set_keystone(&r, "1");
         keystone_step(&r).await;
-        assert!(mlog(&log).contains(&"flash".to_string()), "{:?}", mlog(&log));
+        assert!(mlog(&log).contains(&"keystone".to_string()), "{:?}", mlog(&log));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn keystone_flash_without_music_uses_direct_frames_then_restores() {
-        let (r, _log, status) = music_rig(true, "");
+    /// A rig whose keyboard is an AnimKb on a G533ZW (per-key layout), music off.
+    fn animation_rig(toml: &str) -> (LightRig, Arc<std::sync::Mutex<Vec<String>>>) {
+        let (r, _log, status) = music_rig(true, toml);
         status.lock().unwrap().0 = armoury_proto::MusicState::Off;
         let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let w = writes.clone();
         let LightRig { d, sys, aura, svc, dir } = r;
         let d = Arc::try_unwrap(d).ok().map(Arc::new).expect("sole owner")
-            .with_keyboard(Box::new(move || Ok(Box::new(FlashKb(w.clone())) as Box<dyn crate::features::music::worker::Keyboard>)));
+            .with_keyboard(Box::new(move || Ok(Box::new(AnimKb(w.clone())) as Box<dyn crate::features::music::worker::Keyboard>)));
         let r = LightRig { d, sys, aura, svc, dir };
-        r.sys.files.lock().unwrap().insert(crate::hw::sysfs::PRODUCT_NAME.into(), "ROG Strix G533ZW_G533ZW".into()); // has a per-key layout
+        r.sys.files.lock().unwrap().insert(crate::hw::sysfs::PRODUCT_NAME.into(), "ROG Strix G533ZW_G533ZW".into());
+        (r, writes)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keystone_animation_over_static_holds_the_effect_colour_and_sends_nothing_more() {
+        use crate::features::music::perkey::KEYSTONE_ANIMATION;
+        let (r, writes) = animation_rig("");
+        let colour = { let (m, ..) = r.aura.info().await.unwrap(); assert_eq!(m.0, 0, "Static"); m.2 };
         set_keystone(&r, "0");
         keystone_step(&r).await;
         set_keystone(&r, "1");
         keystone_step(&r).await;
-        let w = writes.lock().unwrap().clone();
-        assert_eq!(w[0], "1 packets, keystone 0", "direct mode first: {w:?}");
-        let (last, fades) = w[1..].split_last().unwrap();
-        assert!(fades.len() > 30 && fades.iter().all(|l| l.starts_with("12 packets")), "whole frames (the keyboard drops packets): {w:?}");
-        assert_eq!(fades.last().unwrap(), "12 packets, keystone 0", "the Keystone LED ends off");
-        assert!(fades.iter().any(|l| l.split(' ').last().unwrap().parse::<u8>().unwrap() > 240), "reaches full: {w:?}");
-        assert!(last.starts_with("3 packets"), "the effect is re-applied on the keyboard handle: {last}");
-        assert!(acalls(&r).is_empty(), "not through asusd (it flickers): {:?}", acalls(&r));
+        assert_eq!(*writes.lock().unwrap(), [format!("b3:0d:{:02x}{:02x}{:02x} b5", colour.0, colour.1, colour.2)],
+            "the firmware animation holding the effect's colour, not saved (no b4)");
+        tokio::time::advance(KEYSTONE_ANIMATION * 2).await;
+        keystone_step(&r).await;
+        assert_eq!(writes.lock().unwrap().len(), 1, "no re-apply: the hold is the effect, and a re-apply blinks");
+        assert!(acalls(&r).is_empty(), "{:?}", acalls(&r));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keystone_animation_over_a_moving_effect_reapplies_it_after() {
+        use crate::features::music::perkey::KEYSTONE_ANIMATION;
+        let (r, writes) = animation_rig("[keystone.insert]\nlight = \"breathe\"\n");
+        set_keystone(&r, "0");
+        keystone_step(&r).await;
+        set_keystone(&r, "1");
+        keystone_step(&r).await;
+        assert_eq!(acalls(&r), ["set_mode_data 1"], "the insert's lighting action first");
+        assert!(writes.lock().unwrap()[0].starts_with("b3:0d:"), "{:?}", writes.lock().unwrap());
+        tokio::time::advance(KEYSTONE_ANIMATION / 2).await;
+        keystone_step(&r).await;
+        assert_eq!(writes.lock().unwrap().len(), 1, "nothing while it plays");
+        tokio::time::advance(KEYSTONE_ANIMATION).await;
+        keystone_step(&r).await;
+        assert_eq!(writes.lock().unwrap()[1], "b3:01 b5 b4", "then Breathe again, on the keyboard handle");
+        keystone_step(&r).await;
+        assert_eq!(writes.lock().unwrap().len(), 2, "re-applied once");
+        assert_eq!(acalls(&r), ["set_mode_data 1"], "not through asusd (it flickers)");
     }
 
     #[tokio::test]
@@ -3326,7 +3372,7 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
         let (r, log, status) = music_rig(true, "[keystone]\nenabled = false\n[keystone.insert]\nlight = \"music\"\n[keystone.remove]\nlock = true\n");
         status.lock().unwrap().0 = armoury_proto::MusicState::Off;
         for v in ["1", "0", "1"] { set_keystone(&r, v); keystone_step(&r).await; }
-        assert!(spawned(&r).is_empty() && !mlog(&log).iter().any(|l| l.starts_with("set") || l == "flash"), "{:?}", mlog(&log));
+        assert!(spawned(&r).is_empty() && !mlog(&log).iter().any(|l| l.starts_with("set") || l == "keystone"), "{:?}", mlog(&log));
         assert!(!r.svc.calls.lock().unwrap().iter().any(|c| c.contains("Keystone")), "no OSD either");
         assert!(r.d.handle(req(serde_json::json!({"cmd":"set_keystone_enabled","on":true}))).await.ok);
         assert!(r.d.config.lock().await.keystone.enabled);
@@ -3340,9 +3386,9 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
         let bad = r.d.handle(req(serde_json::json!({"cmd":"set_keystone_action","event":"insert","action":{"lock":true}}))).await;
         assert!(bad.error.unwrap().contains("remove only"));
         assert!(r.d.handle(req(serde_json::json!({"cmd":"set_keystone_action","event":"insert","action":{"mode":"performance"}}))).await.ok);
-        assert!(r.d.handle(req(serde_json::json!({"cmd":"set_keystone_flash","on":false}))).await.ok);
+        assert!(r.d.handle(req(serde_json::json!({"cmd":"set_keystone_animation","on":false}))).await.ok);
         let k = r.d.config.lock().await.keystone.clone();
-        assert_eq!((k.insert.mode, k.flash), (Some(ModeChoice::Performance), false));
+        assert_eq!((k.insert.mode, k.animation), (Some(ModeChoice::Performance), false));
     }
 
     #[tokio::test]

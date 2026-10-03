@@ -41,7 +41,7 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<MusicAction>,
     },
-    /// Keystone actions: show, change what insert/remove do, LED flash on insert
+    /// Keystone actions: show, change what insert/remove do, animation on insert
     Keystone {
         #[command(subcommand)]
         action: Option<KeystoneCmd>,
@@ -248,9 +248,9 @@ fn parse_key_action(s: &str) -> Result<KeyAction, String> {
 
 #[derive(Subcommand)]
 enum KeystoneCmd {
-    /// Turn all Keystone actions (and the LED flash) on
+    /// Turn all Keystone actions (and the animation) on
     On,
-    /// Turn all Keystone actions (and the LED flash) off
+    /// Turn all Keystone actions (and the animation) off
     Off,
     /// Change what happens on insert or remove; unspecified options keep their value
     Set {
@@ -269,8 +269,8 @@ enum KeystoneCmd {
         #[arg(long)]
         lock: Option<bool>,
     },
-    /// Flash the Keystone LED on insert
-    Flash {
+    /// Play the Keystone animation on insert
+    Animation {
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
@@ -603,7 +603,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let k = call(&Request::Config)?["keystone"].clone();
             println!("Keystone   {}", match s.keystone { Some(true) => "inserted", Some(false) => "removed", None => "-" });
             println!("Actions    {}", if k["enabled"].as_bool().unwrap_or(true) { "on" } else { "off" });
-            println!("LED flash  {}", if k["flash"].as_bool().unwrap_or(true) { "on" } else { "off" });
+            println!("Animation  {}", if k["animation"].as_bool().unwrap_or(true) { "on" } else { "off" });
             for ev in ["insert", "remove"] {
                 let a: KeystoneAction = serde_json::from_value(k[ev].clone()).unwrap_or_default();
                 let mut parts = vec![format!("mode {}", a.mode.map(|m| m.label().to_string()).unwrap_or("unchanged".into())),
@@ -615,7 +615,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Keystone { action: Some(KeystoneCmd::On) } => { call(&Request::SetKeystoneEnabled { on: true })?; }
         Cmd::Keystone { action: Some(KeystoneCmd::Off) } => { call(&Request::SetKeystoneEnabled { on: false })?; }
-        Cmd::Keystone { action: Some(KeystoneCmd::Flash { state }) } => { call(&Request::SetKeystoneFlash { on: state == "on" })?; }
+        Cmd::Keystone { action: Some(KeystoneCmd::Animation { state }) } => { call(&Request::SetKeystoneAnimation { on: state == "on" })?; }
         Cmd::Keystone { action: Some(KeystoneCmd::Set { on, mode, light, command, lock }) } => {
             let event = if on == "insert" { KeystoneEvent::Insert } else { KeystoneEvent::Remove };
             let mut a: KeystoneAction = serde_json::from_value(call(&Request::Config)?["keystone"][on.as_str()].clone()).unwrap_or_default();

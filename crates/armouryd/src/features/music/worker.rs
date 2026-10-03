@@ -2,7 +2,7 @@
 //! the keyboard. Active mode only. Every stop (off, failure, handback) puts asusd's effect
 //! back. Frames go over USB HID to the keyboard's controller only (no EC/ACPI calls).
 use super::analyze::{Analyzer, CHUNK};
-use super::perkey::{Frame, KEYSTONE_FLASH, KEYSTONE_LED, Layout, PACKET_LEN, init_packet, keystone_flash_level, packets};
+use super::perkey::{Frame, Layout, PACKET_LEN, init_packet, keystone_animation_packets, packets};
 use super::render::{Lit, render};
 use crate::config::MusicConfig;
 use armoury_proto::MusicState;
@@ -22,8 +22,8 @@ pub enum Cmd {
     Idle(bool),
     /// Handback: stop, restore the effect, and ack, before asusd stops.
     Release(oneshot::Sender<()>),
-    /// The Keystone went in: flash its LED over the music frames.
-    Flash,
+    /// The Keystone went in: play the firmware's Keystone animation over the music frames.
+    KeystoneAnimation,
 }
 
 /// Published state: what the snapshot shows.
@@ -104,7 +104,7 @@ pub async fn run_worker(io: Io, layout: Option<Layout>, mut cmds: mpsc::Receiver
                 Some(Cmd::Lit(l)) => lit_override = Some(l),
                 Some(Cmd::Idle(i)) => idle = i,
                 Some(Cmd::Release(ack)) => { active = false; let _ = ack.send(()); }
-                Some(Cmd::Flash) => {}
+                Some(Cmd::KeystoneAnimation) => {}
             }
             publish(&failed, active);
         }
@@ -148,7 +148,7 @@ async fn session(
     let mut last: Option<Frame> = None;
     let mut last_sent = Instant::now() - MIN_FRAME_GAP;
     let mut init_at: Option<Instant> = None;
-    let mut flash_from: Option<Instant> = None;
+    let mut animate = false;
     let mut bands_at: Option<Instant> = None;
     loop {
         tokio::select! {
@@ -167,12 +167,13 @@ async fn session(
                     init_at = Some(now);
                     last = None; // repaint after entering direct mode
                 }
-                let mut frame = render(layout, &a, cfg, lit);
-                if let Some(t) = flash_from {
-                    let since = now.duration_since(t);
-                    if since >= KEYSTONE_FLASH { flash_from = None; }
-                    frame.0[KEYSTONE_LED as usize] = [keystone_flash_level(since), 0, 0];
+                if std::mem::take(&mut animate) {
+                    // plays over the stream, which comes back by itself afterwards
+                    out.extend(keystone_animation_packets([0, 0, 0])); // the hold colour is unused: the stream comes back
+                    init_at = Some(now); // a re-init mid-animation could cut it short
+                    last = None;
                 }
+                let frame = render(layout, &a, cfg, lit);
                 if last.as_ref() == Some(&frame) { continue; }
                 out.extend(packets(&frame));
                 if let Err(e) = kb.write(out).await { return End::Failed(format!("keyboard: {e}")); }
@@ -191,7 +192,7 @@ async fn session(
                 Some(Cmd::Lit(l)) => { lit = l; *lit_override = Some(l); last = None; }
                 Some(Cmd::Idle(i)) => { *idle = i; last = None; }
                 Some(Cmd::Release(a)) => { *active = false; *ack = Some(a); return End::Stopped; }
-                Some(Cmd::Flash) => flash_from = Some(Instant::now()),
+                Some(Cmd::KeystoneAnimation) => animate = true,
             },
         }
     }
@@ -295,9 +296,9 @@ mod tests {
     impl Keyboard for FakeKb {
         async fn write(&mut self, packets: Vec<[u8; PACKET_LEN]>) -> std::io::Result<()> {
             if *self.fail.lock().unwrap() { return Err(std::io::Error::other("unplugged")); }
-            let init = packets[0][2] == 1;
-            let keystone = packets.last().map_or(0, |p| p[9 + 3 * 8]);
-            self.log.lock().unwrap().push(format!("{}frame{}", if init { "init+" } else { "" }, if keystone > 0 { " keystone" } else { "" }));
+            let init = packets[0] == init_packet();
+            let keystone = packets.iter().any(|p| p[1] == 0xB3 && p[3] == 0x0D);
+            self.log.lock().unwrap().push(format!("{}{}frame", if init { "init+" } else { "" }, if keystone { "keystone+" } else { "" }));
             Ok(())
         }
     }
@@ -452,16 +453,17 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn keystone_flash_rides_on_music_frames() {
+    async fn keystone_animation_rides_on_music_frames() {
         let r = start(true);
         r.cmds.send(Cmd::Env { active: true }).await.unwrap(); settle().await;
         play(&r, (0..2).map(tone)).await;
-        assert!(!log(&r).iter().any(|l| l.contains("keystone")), "Keystone LED off in music: {:?}", log(&r));
-        r.cmds.send(Cmd::Flash).await.unwrap(); settle().await;
-        play(&r, (2..20).map(tone)).await; // ~0.6 s
-        assert!(log(&r).iter().any(|l| l.contains("keystone")), "{:?}", log(&r));
-        play(&r, (20..90).map(tone)).await; // past 2 s
-        assert!(!log(&r).last().unwrap().contains("keystone"), "flash over: {:?}", log(&r).last());
+        r.cmds.send(Cmd::KeystoneAnimation).await.unwrap(); settle().await;
+        play(&r, (2..20).map(tone)).await;
+        let l = log(&r);
+        assert_eq!(l.iter().filter(|l| l.contains("keystone")).count(), 1, "sent once: {l:?}");
+        let at = l.iter().position(|l| l.contains("keystone")).unwrap();
+        assert_eq!(l[at], "keystone+frame", "with a frame, music keeps streaming: {l:?}");
+        assert!(l[at + 1..].iter().all(|l| l == "frame"), "no re-init right after it: {l:?}");
     }
 
     #[tokio::test(start_paused = true)]

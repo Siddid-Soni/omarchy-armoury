@@ -59,7 +59,7 @@ Design notes: `docs/superpowers/specs/`. Open follow-ups: `docs/superpowers/back
   - Lighting: an effect, Music, or back to what was on before the insert.
   - A command.
   - Lock the screen, on remove only.
-  - The Keystone light flashes on insert. One switch turns it all off.
+  - The firmware's Keystone animation plays on insert (it can be turned off). One switch turns it all off.
 
 ### Daemon
 

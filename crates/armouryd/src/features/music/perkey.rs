@@ -41,10 +41,13 @@ pub struct Layout {
 }
 
 /// Enters direct mode. Sent before the first frame and again now and then (the firmware
-/// drops direct mode on resume and when asusd writes an effect).
+/// drops direct mode on resume and when asusd writes an effect). `5d bc 00`, as Armoury
+/// Crate sends when switching to Aura mode: g-helper's `5d bc 01` makes the logo, light bars
+/// and display bar copy nearby keys (Esc, Ctrl/Fn/Win, Down/Right/PrtSc, F5/Delete) and
+/// ignore their own LEDs (measured on a G533ZW).
 pub fn init_packet() -> [u8; PACKET_LEN] {
     let mut p = [0u8; PACKET_LEN];
-    p[..3].copy_from_slice(&[REPORT_ID, 0xBC, 1]);
+    p[..2].copy_from_slice(&[REPORT_ID, 0xBC]);
     p
 }
 
@@ -79,53 +82,26 @@ pub fn effect_packets(m: &crate::features::lighting::RawMode) -> [[u8; PACKET_LE
     out
 }
 
-/// How long the Keystone LED flashes when the Keystone goes in.
-pub const KEYSTONE_FLASH: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long the firmware's Keystone animation runs before the keyboard settles on its colour
+/// (Armoury Crate follows it up about 5 s after sending it).
+pub const KEYSTONE_ANIMATION: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Keystone LED brightness `elapsed` into a flash: fades in and out (the LED is red only).
-pub fn keystone_flash_level(elapsed: std::time::Duration) -> u8 {
-    let t = elapsed.as_secs_f32() / KEYSTONE_FLASH.as_secs_f32();
-    if !(0.0..1.0).contains(&t) { return 0; }
-    (255.0 * (std::f32::consts::PI * t).sin()).round() as u8
-}
-
-/// How long the Keystone sweep runs (the insert animation outside music).
-pub const KEYSTONE_SWEEP: std::time::Duration = std::time::Duration::from_millis(1200);
-/// Where the sweep starts: the Keystone slot, on the right edge a little below the middle
-/// (0 = top row, 1 = bottom row).
-const SWEEP_APEX_Y: f32 = 0.6;
-/// Length of the pulse's fading tail, in keyboard widths.
-const SWEEP_TAIL: f32 = 0.45;
-const SWEEP_RED: Rgb = [255, 16, 32];
-
-/// The Keystone insert animation `elapsed` in: a red pulse leaves the Keystone and runs right
-/// to left across the keys, fanning out until it covers every row, over `base`. The Keystone
-/// LED starts lit and fades as the pulse leaves it.
-pub fn keystone_sweep(layout: &Layout, base: Rgb, elapsed: std::time::Duration) -> Frame {
-    let p = (elapsed.as_secs_f32() / KEYSTONE_SWEEP.as_secs_f32()).clamp(0.0, 1.0);
-    let front = p * (1.0 + SWEEP_TAIL); // distance from the right edge; the tail clears the left edge at the end
-    let mut f = Frame([base; LEDS]);
-    let last_row = (layout.rows.max(2) - 1) as f32;
-    for led in &layout.leds {
-        let Place::Key { x, row } = led.place else { continue };
-        let dx = 1.0 - x;
-        let spread = 0.1 + 1.2 * dx; // the cone widens leftwards
-        let inside = ((1.0 - (row as f32 / last_row - SWEEP_APEX_Y).abs() / spread) * 3.0).clamp(0.0, 1.0);
-        let behind = front - dx;
-        let pulse = if (0.0..=SWEEP_TAIL).contains(&behind) { 1.0 - behind / SWEEP_TAIL } else { 0.0 };
-        let a = inside * pulse;
-        f.0[led.idx as usize] = std::array::from_fn(|i| (base[i] as f32 + (SWEEP_RED[i] as f32 - base[i] as f32) * a).round() as u8);
-    }
-    f.0[KEYSTONE_LED as usize] = [(255.0 * (1.0 - p)).round() as u8, 0, 0];
-    f
+/// The firmware's Keystone insert animation (effect mode `0x0d`), as Armoury Crate sends it:
+/// a red pulse from the Keystone slot, then lasers (both built in). `hold` is the colour the
+/// keyboard stays on afterwards, in effect mode; over a direct-mode stream the stream comes
+/// back by itself. SET without APPLY (`b4`), so the saved effect stays.
+pub fn keystone_animation_packets(hold: Rgb) -> [[u8; PACKET_LEN]; 2] {
+    let mut out = [[0u8; PACKET_LEN]; 2];
+    out[0][..7].copy_from_slice(&[REPORT_ID, 0xB3, 0, 0x0D, hold[0], hold[1], hold[2]]);
+    out[1][..2].copy_from_slice(&[REPORT_ID, 0xB5]);
+    out
 }
 
 /// A key row: (LED index, width in key units), left to right.
 type Row = &'static [(u8, f32)];
 
 /// ROG Strix Scar 15 (G533): the g-helper per-key map without the 17" numpad LEDs.
-/// The light bar under the display (Lid power zone) mirrors F5 (28) and Delete (37): it lights
-/// when their spectrum bars reach the top row. Four LEDs g-helper leaves unnamed (120, 140, 141, 143) are placed by the arrow keys. The
+/// Four LEDs g-helper leaves unnamed (120, 140, 141, 143) are placed by the arrow keys. The
 /// space bar has four LEDs, 130–133 left to right (measured on a G533ZW; g-helper maps only 131).
 const G533_ROWS: [Row; 7] = [
     // Vol-, Vol+, mic mute, fan, Armoury Crate: above F1–F5 (placed on the F-row's grid below)
@@ -149,7 +125,8 @@ const G533_ROWS: [Row; 7] = [
     &[(126, 1.25), (127, 1.0), (128, 1.0), (129, 1.25), (130, 1.5), (131, 1.5), (132, 1.5), (133, 1.5), (135, 1.0), (136, 1.0), (137, 1.0),
       (159, 1.0), (160, 1.0), (161, 1.0), (140, 0.3), (141, 0.3), (143, 0.3), (142, 1.0)],
 ];
-/// Lightbar (left→right), logo, lid left/right. Not the Keystone LED (175; g-helper's "KSTN"
+/// Front light bar (left→right), logo, display bar (two LEDs; lights only while the Lid
+/// power zone is on). Not the Keystone LED (175; g-helper's "KSTN"
 /// LED 0 lights nothing): it stays off, reserved for Keystone actions.
 const G533_AMBIENT: &[u8] = &[174, 173, 172, 171, 170, 169, 167, 176, 177];
 /// The Keystone slot's LED (measured on a G533ZW).
@@ -180,8 +157,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn init_packet_enters_direct_mode() {
-        assert_eq!(init_packet()[..4], [0x5D, 0xBC, 1, 0]);
+    fn init_packet_enters_direct_mode_with_independent_ambient_lights() {
+        // 5d bc 01 makes the logo, light bars and display bar copy nearby keys instead
+        assert_eq!(init_packet()[..4], [0x5D, 0xBC, 0, 0]);
     }
 
     #[test]
@@ -215,40 +193,11 @@ mod tests {
     }
 
     #[test]
-    fn keystone_sweep_runs_right_to_left_from_the_keystone() {
-        use std::time::Duration;
-        let l = layout_for("G533ZW").unwrap();
-        let base = [0x14, 0x29, 0x89];
-        let key = |x0: f32, row: u8| l.leds.iter().filter(|k| matches!(k.place, Place::Key { row: r, .. } if r == row))
-            .min_by(|a, b| { let d = |k: &Led| match k.place { Place::Key { x, .. } => (x - x0).abs(), _ => 9.0 }; d(a).total_cmp(&d(b)) })
-            .unwrap().idx as usize;
-        let (right, left) = (key(0.97, 4), key(0.03, 4));
-        let start = keystone_sweep(&l, base, Duration::ZERO);
-        assert_eq!(start.0[KEYSTONE_LED as usize], [255, 0, 0], "starts at the Keystone");
-        assert_eq!(start.0[left], base);
-        let early = keystone_sweep(&l, base, KEYSTONE_SWEEP / 10);
-        assert!(early.0[right][0] > 150 && early.0[left] == base, "right side first: {:?}", early.0[right]);
-        assert!(early.0[KEYSTONE_LED as usize][0] < 255, "the LED fades as the pulse leaves");
-        let late = keystone_sweep(&l, base, KEYSTONE_SWEEP * 3 / 4);
-        assert!(late.0[left][0] > 150 && late.0[key(0.03, 0)][0] > 150, "fans out to every row on the left: {:?}", late.0[left]);
-        assert_eq!(late.0[right], base, "the tail has left the right side");
-        let end = keystone_sweep(&l, base, KEYSTONE_SWEEP);
-        assert!(l.leds.iter().all(|k| end.0[k.idx as usize] == base || k.idx == KEYSTONE_LED), "ends on the effect's colour");
-        assert_eq!(end.0[KEYSTONE_LED as usize], [0, 0, 0]);
-    }
-
-    #[test]
-    fn keystone_flash_fades_in_and_out() {
-        use std::time::Duration;
-        assert_eq!(keystone_flash_level(Duration::ZERO), 0);
-        assert_eq!(keystone_flash_level(KEYSTONE_FLASH / 2), 255);
-        assert!(keystone_flash_level(KEYSTONE_FLASH / 4) > 150 && keystone_flash_level(KEYSTONE_FLASH / 4) < 200);
-        assert_eq!(keystone_flash_level(KEYSTONE_FLASH), 0);
-        let mut f = Frame::default();
-        f.0[KEYSTONE_LED as usize] = [9, 0, 0];
-        let p = *packets(&f).last().unwrap();
-        assert_eq!(p[4], 4, "the lightbar/logo packet");
-        assert_eq!(p[9 + 3 * 8], 9, "Keystone = slot 8");
+    fn keystone_animation_matches_armoury_crate() {
+        let p = keystone_animation_packets([0xFF, 0, 0]);
+        assert_eq!(p[0][..7], [0x5D, 0xB3, 0, 0x0D, 0xFF, 0, 0], "effect mode 0x0d, held red after");
+        assert!(p[0][7..].iter().all(|b| *b == 0));
+        assert_eq!(p[1][..3], [0x5D, 0xB5, 0], "SET only: never B4, so it isn't saved");
     }
 
     #[test]
@@ -273,7 +222,7 @@ mod tests {
         assert!(x(2) > x(21) && x(6) < 0.4, "media keys over F1–F5");
         let place = |i: u8| l.leds.iter().find(|l| l.idx == i).unwrap().place;
         assert!(l.leds.iter().all(|l| l.idx != KEYSTONE_LED), "Keystone LED left off (Keystone actions only)");
-        assert!(matches!(place(28), Place::Key { row: 1, .. }), "F5 (and the display bar that mirrors it) is a spectrum key");
+        assert!(matches!(place(28), Place::Key { row: 1, .. }), "F5 is a spectrum key");
         assert!(layout_for("ROG Zephyrus G14").is_none());
     }
 }

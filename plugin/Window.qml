@@ -369,7 +369,7 @@ Item {
                 readonly property var k: root.cfg.keystone || null
                 lines: root.snap ? [
                   root.snap.keystone === true ? "Inserted" : root.snap.keystone === false ? "Not inserted" : "—",
-                  !k ? "" : k.enabled === false ? "Actions off" : "Actions on" + (k.flash ? " · light flash" : ""),
+                  !k ? "" : k.enabled === false ? "Actions off" : "Actions on" + (k.animation ? " · animation" : ""),
                   k && k.enabled !== false ? "Insert: " + root.ksSummary(k.insert) : "",
                   k && k.enabled !== false ? "Remove: " + root.ksSummary(k.remove) : ""
                 ] : []

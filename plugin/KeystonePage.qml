@@ -67,11 +67,11 @@ Flickable {
     ChoiceRow {
       visible: !!root.ks && root.ks.enabled !== false
       fg: root.fg
-      label: "Flash the Keystone light on insert"
+      label: "Keystone animation on insert"
       usable: root.usable
       options: root.onOff()
-      value: root.ks ? root.ks.flash : undefined
-      onChosen: function(v) { root.client.run({ cmd: "set_keystone_flash", on: v }, function() { root.reload() }) }
+      value: root.ks ? root.ks.animation : undefined
+      onChosen: function(v) { root.client.run({ cmd: "set_keystone_animation", on: v }, function() { root.reload() }) }
     }
     Repeater {
       model: root.ks && root.ks.enabled !== false ? [{ ev: "insert", title: "When inserted" }, { ev: "remove", title: "When removed" }] : []

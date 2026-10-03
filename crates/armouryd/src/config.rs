@@ -25,12 +25,13 @@ pub struct KeystoneConfig {
     pub enabled: bool,
     pub insert: armoury_proto::KeystoneAction,
     pub remove: armoury_proto::KeystoneAction,
-    /// Flash the Keystone LED when it goes in.
-    pub flash: bool,
+    /// Play the firmware's Keystone animation when it goes in (`flash` before 2026-10-04).
+    #[serde(alias = "flash")]
+    pub animation: bool,
 }
 
 impl Default for KeystoneConfig {
-    fn default() -> Self { Self { enabled: true, insert: Default::default(), remove: Default::default(), flash: true } }
+    fn default() -> Self { Self { enabled: true, insert: Default::default(), remove: Default::default(), animation: true } }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -347,7 +348,7 @@ mod tests {
         assert!(err.is_none(), "{err:?}");
         assert_eq!(cfg.keystone.insert.mode, Some(armoury_proto::ModeChoice::Performance));
         assert_eq!(cfg.keystone.insert.light, armoury_proto::KeystoneLight::Music);
-        assert!(cfg.keystone.remove.lock && cfg.keystone.flash && cfg.keystone.enabled, "flash and the master switch default on");
+        assert!(cfg.keystone.remove.lock && cfg.keystone.animation && cfg.keystone.enabled, "animation and the master switch default on");
         let text = toml::to_string(&cfg).unwrap();
         assert_eq!(toml::from_str::<Config>(&text).unwrap().keystone, cfg.keystone);
     }

@@ -633,9 +633,9 @@ pub enum Request {
     SetMusic { on: bool },
     /// Replaces the actions for one Keystone event.
     SetKeystoneAction { event: KeystoneEvent, action: KeystoneAction },
-    /// Flash the Keystone LED when it is inserted.
-    SetKeystoneFlash { on: bool },
-    /// Master switch: off = nothing happens on insert/remove (no OSD, actions or flash).
+    /// Play the firmware's Keystone animation when it is inserted.
+    SetKeystoneAnimation { on: bool },
+    /// Master switch: off = nothing happens on insert/remove (no OSD, actions or animation).
     SetKeystoneEnabled { on: bool },
     SetMusicConfig {
         #[serde(default)] style: Option<MusicStyle>,
