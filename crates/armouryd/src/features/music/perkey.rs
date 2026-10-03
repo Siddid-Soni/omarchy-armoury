@@ -66,6 +66,19 @@ pub fn packets(frame: &Frame) -> Vec<[u8; PACKET_LEN]> {
     out
 }
 
+/// Leaves direct mode into asusd's effect `m`, as asusd writes it (rog-aura's effect packet,
+/// then SET and APPLY) minus its brightness write. Going through asusd instead flickers the
+/// keyboard on the G533ZW; the effect packet alone (or with SET only) leaves part of it dark.
+pub fn effect_packets(m: &crate::features::lighting::RawMode) -> [[u8; PACKET_LEN]; 3] {
+    let speed = match m.4.as_str() { "Low" => 0xe1, "High" => 0xf5, _ => 0xeb };
+    let direction = match m.5.as_str() { "Left" => 1, "Up" => 2, "Down" => 3, _ => 0 };
+    let mut out = [[0u8; PACKET_LEN]; 3];
+    out[0][..13].copy_from_slice(&[REPORT_ID, 0xB3, m.1 as u8, m.0 as u8, m.2.0, m.2.1, m.2.2, speed, direction, 0, m.3.0, m.3.1, m.3.2]);
+    out[1][..2].copy_from_slice(&[REPORT_ID, 0xB5]); // SET
+    out[2][..2].copy_from_slice(&[REPORT_ID, 0xB4]); // APPLY
+    out
+}
+
 /// How long the Keystone LED flashes when the Keystone goes in.
 pub const KEYSTONE_FLASH: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -76,10 +89,35 @@ pub fn keystone_flash_level(elapsed: std::time::Duration) -> u8 {
     (255.0 * (std::f32::consts::PI * t).sin()).round() as u8
 }
 
-/// The lightbar/logo/lid packet alone (LEDs 167 on): the Keystone LED is in it, so a flash
-/// over a still frame only resends this packet.
-pub fn ambient_packet(frame: &Frame) -> [u8; PACKET_LEN] {
-    *packets(frame).last().unwrap()
+/// How long the Keystone sweep runs (the insert animation outside music).
+pub const KEYSTONE_SWEEP: std::time::Duration = std::time::Duration::from_millis(1200);
+/// Where the sweep starts: the Keystone slot, on the right edge a little below the middle
+/// (0 = top row, 1 = bottom row).
+const SWEEP_APEX_Y: f32 = 0.6;
+/// Length of the pulse's fading tail, in keyboard widths.
+const SWEEP_TAIL: f32 = 0.45;
+const SWEEP_RED: Rgb = [255, 16, 32];
+
+/// The Keystone insert animation `elapsed` in: a red pulse leaves the Keystone and runs right
+/// to left across the keys, fanning out until it covers every row, over `base`. The Keystone
+/// LED starts lit and fades as the pulse leaves it.
+pub fn keystone_sweep(layout: &Layout, base: Rgb, elapsed: std::time::Duration) -> Frame {
+    let p = (elapsed.as_secs_f32() / KEYSTONE_SWEEP.as_secs_f32()).clamp(0.0, 1.0);
+    let front = p * (1.0 + SWEEP_TAIL); // distance from the right edge; the tail clears the left edge at the end
+    let mut f = Frame([base; LEDS]);
+    let last_row = (layout.rows.max(2) - 1) as f32;
+    for led in &layout.leds {
+        let Place::Key { x, row } = led.place else { continue };
+        let dx = 1.0 - x;
+        let spread = 0.1 + 1.2 * dx; // the cone widens leftwards
+        let inside = ((1.0 - (row as f32 / last_row - SWEEP_APEX_Y).abs() / spread) * 3.0).clamp(0.0, 1.0);
+        let behind = front - dx;
+        let pulse = if (0.0..=SWEEP_TAIL).contains(&behind) { 1.0 - behind / SWEEP_TAIL } else { 0.0 };
+        let a = inside * pulse;
+        f.0[led.idx as usize] = std::array::from_fn(|i| (base[i] as f32 + (SWEEP_RED[i] as f32 - base[i] as f32) * a).round() as u8);
+    }
+    f.0[KEYSTONE_LED as usize] = [(255.0 * (1.0 - p)).round() as u8, 0, 0];
+    f
 }
 
 /// A key row: (LED index, width in key units), left to right.
@@ -167,6 +205,39 @@ mod tests {
     }
 
     #[test]
+    fn effect_packets_match_rog_aura() {
+        let m = (0, 0, (0x14, 0x29, 0x89), (1, 2, 3), "High".to_string(), "Left".to_string());
+        let p = effect_packets(&m);
+        assert_eq!(p[0][..13], [0x5D, 0xB3, 0, 0, 0x14, 0x29, 0x89, 0xF5, 1, 0, 1, 2, 3]);
+        assert!(p[0][13..].iter().all(|b| *b == 0));
+        assert_eq!(p[1][..3], [0x5D, 0xB5, 0]);
+        assert_eq!(p[2][..3], [0x5D, 0xB4, 0]);
+    }
+
+    #[test]
+    fn keystone_sweep_runs_right_to_left_from_the_keystone() {
+        use std::time::Duration;
+        let l = layout_for("G533ZW").unwrap();
+        let base = [0x14, 0x29, 0x89];
+        let key = |x0: f32, row: u8| l.leds.iter().filter(|k| matches!(k.place, Place::Key { row: r, .. } if r == row))
+            .min_by(|a, b| { let d = |k: &Led| match k.place { Place::Key { x, .. } => (x - x0).abs(), _ => 9.0 }; d(a).total_cmp(&d(b)) })
+            .unwrap().idx as usize;
+        let (right, left) = (key(0.97, 4), key(0.03, 4));
+        let start = keystone_sweep(&l, base, Duration::ZERO);
+        assert_eq!(start.0[KEYSTONE_LED as usize], [255, 0, 0], "starts at the Keystone");
+        assert_eq!(start.0[left], base);
+        let early = keystone_sweep(&l, base, KEYSTONE_SWEEP / 10);
+        assert!(early.0[right][0] > 150 && early.0[left] == base, "right side first: {:?}", early.0[right]);
+        assert!(early.0[KEYSTONE_LED as usize][0] < 255, "the LED fades as the pulse leaves");
+        let late = keystone_sweep(&l, base, KEYSTONE_SWEEP * 3 / 4);
+        assert!(late.0[left][0] > 150 && late.0[key(0.03, 0)][0] > 150, "fans out to every row on the left: {:?}", late.0[left]);
+        assert_eq!(late.0[right], base, "the tail has left the right side");
+        let end = keystone_sweep(&l, base, KEYSTONE_SWEEP);
+        assert!(l.leds.iter().all(|k| end.0[k.idx as usize] == base || k.idx == KEYSTONE_LED), "ends on the effect's colour");
+        assert_eq!(end.0[KEYSTONE_LED as usize], [0, 0, 0]);
+    }
+
+    #[test]
     fn keystone_flash_fades_in_and_out() {
         use std::time::Duration;
         assert_eq!(keystone_flash_level(Duration::ZERO), 0);
@@ -175,7 +246,7 @@ mod tests {
         assert_eq!(keystone_flash_level(KEYSTONE_FLASH), 0);
         let mut f = Frame::default();
         f.0[KEYSTONE_LED as usize] = [9, 0, 0];
-        let p = ambient_packet(&f);
+        let p = *packets(&f).last().unwrap();
         assert_eq!(p[4], 4, "the lightbar/logo packet");
         assert_eq!(p[9 + 3 * 8], 9, "Keystone = slot 8");
     }

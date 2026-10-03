@@ -65,6 +65,8 @@ pub struct Daemon {
     keystone_seen: std::sync::Mutex<Option<bool>>,
     /// Lighting before the last insert changed it, for a remove's "previous".
     keystone_prev: std::sync::Mutex<Option<PrevLight>>,
+    /// The kernel notified a Keystone change (keys::run_keystone_watch): wakes the poll.
+    pub keystone_changed: tokio::sync::Notify,
     /// Opens the keyboard for direct (per-key) frames: the Keystone LED flash.
     kbd_open: Option<music::worker::OpenKeyboard>,
     /// Music band levels for subscribers (empty while music isn't running).
@@ -105,6 +107,7 @@ impl Daemon {
             handing_back: std::sync::atomic::AtomicBool::new(false),
             keystone_seen: std::sync::Mutex::new(None),
             keystone_prev: std::sync::Mutex::new(None),
+            keystone_changed: tokio::sync::Notify::new(),
             kbd_open: None,
             bands: tokio::sync::watch::channel(Vec::new()).1,
             effect: std::sync::Mutex::new(None),
@@ -336,7 +339,7 @@ impl Daemon {
     }
 
     /// Runs the Keystone actions when its presence changes. Presence comes from the poll
-    /// tick's read (the firmware sends no event), so no extra firmware reads. Nothing runs
+    /// tick's read, so no extra firmware reads; the kernel's notification only wakes it. Nothing runs
     /// for the first reading of an active run, or in observe mode. Outside tick_locked:
     /// a mode action takes the apply lock.
     pub async fn follow_keystone(&self) {
@@ -360,13 +363,14 @@ impl Daemon {
             let r = self.choose_mode(m).await;
             if !r.ok { eprintln!("armouryd: Keystone mode: {}", r.error.unwrap_or_default()); }
         }
-        if event == KeystoneEvent::Insert && flash { self.flash_keystone().await; }
         if let Err(e) = self.keystone_light(event, action.light).await { eprintln!("armouryd: Keystone lighting: {e:#}"); }
         if let Some(cmd) = action.command.filter(|c| !c.trim().is_empty())
             && let Err(e) = self.svc.spawn(&["/usr/bin/systemd-run", "--user", "--scope", "--quiet", "--collect", "/bin/sh", "-c", &cmd], "").await
         {
             eprintln!("armouryd: Keystone command: {e:#}");
         }
+        // last: the flash takes a while (KEYSTONE_SWEEP), and the actions shouldn't wait for it
+        if event == KeystoneEvent::Insert && flash { self.flash_keystone().await; }
         if event == KeystoneEvent::Remove && action.lock {
             let lock = self.omarchy_bin().join("omarchy-system-lock");
             if let Err(e) = self.svc.spawn(&[&lock.to_string_lossy()], &self.omarchy_bin().to_string_lossy()).await {
@@ -407,31 +411,36 @@ impl Daemon {
         Ok(())
     }
 
-    /// Fades the Keystone LED in and out. With music on, over its frames; otherwise the
-    /// keyboard goes to direct mode for the flash (keys in the effect's colour) and the
-    /// effect is re-applied after. Only on laptops with a per-key layout.
+    /// The Keystone insert flash. With music on, its LED fades over music's frames. Otherwise
+    /// the keyboard goes to direct mode for the Keystone sweep (a red pulse from the Keystone
+    /// across a dark keyboard, which hides the mode switch's blink), then back to the effect.
+    /// Only on laptops with a per-key layout.
     async fn flash_keystone(&self) {
-        use music::perkey::{Frame, KEYSTONE_FLASH, KEYSTONE_LED, ambient_packet, init_packet, keystone_flash_level, packets};
+        use music::perkey::{Frame, KEYSTONE_SWEEP, effect_packets, init_packet, keystone_sweep, layout_for, packets};
         if self.music_on() { self.music_send(music::worker::Cmd::Flash); return; }
         if self.music_status.lock().unwrap().0 == armoury_proto::MusicState::Unavailable { return; }
         let Some(open) = &self.kbd_open else { return };
+        let Some(layout) = self.snap.borrow().as_ref().and_then(|s| s.model.as_deref()).and_then(layout_for) else { return };
         let Ok((mode, ..)) = with_retry(|| self.aura.info()).await else { return };
         let mut kb = match open() { Ok(k) => k, Err(e) => { eprintln!("armouryd: Keystone flash: {e}"); return; } };
-        let colour = [mode.2.0, mode.2.1, mode.2.2];
-        let mut frame = Frame([colour; music::perkey::LEDS]);
-        frame.0[KEYSTONE_LED as usize] = [0, 0, 0];
-        let mut out = vec![init_packet()];
-        out.extend(packets(&frame));
-        let mut result = kb.write(out).await;
+        // The whole frame every step, like music does: the keyboard drops some packets now and
+        // then, and a frame sent once stays half dark (or dark).
+        let mut result = kb.write(vec![init_packet()]).await;
         let start = tokio::time::Instant::now();
-        while result.is_ok() && start.elapsed() < KEYSTONE_FLASH {
-            tokio::time::sleep(Duration::from_millis(40)).await;
-            frame.0[KEYSTONE_LED as usize] = [keystone_flash_level(start.elapsed()), 0, 0];
-            result = kb.write(vec![ambient_packet(&frame)]).await;
+        while result.is_ok() && start.elapsed() < KEYSTONE_SWEEP {
+            // over a dark keyboard: over the effect's colour, the mode switch's blink still shows
+            result = kb.write(packets(&keystone_sweep(&layout, [0, 0, 0], start.elapsed()))).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        if let Err(e) = result { eprintln!("armouryd: Keystone flash: {e}"); }
+        // all off, the Keystone LED included: a faint level keeps flickering after direct mode
+        if result.is_ok() { result = kb.write(packets(&Frame::default())).await; }
+        // back to the effect on the same handle: asusd's set_mode_data flickers the keyboard
+        if result.is_ok() { result = kb.write(effect_packets(&mode).to_vec()).await; }
         drop(kb);
-        if let Err(e) = with_retry(|| self.aura.set_mode_data(mode.clone())).await { eprintln!("armouryd: Keystone flash: restoring the effect: {e:#}"); }
+        if let Err(e) = result {
+            eprintln!("armouryd: Keystone flash: {e}");
+            if let Err(e) = with_retry(|| self.aura.set_mode_data(mode.clone())).await { eprintln!("armouryd: Keystone flash: restoring the effect: {e:#}"); }
+        }
     }
 
     fn omarchy_bin(&self) -> PathBuf {
@@ -1467,11 +1476,15 @@ impl Daemon {
         Ok(())
     }
 
+    /// Ticks every `every`, and at once when `keystone_changed` is notified.
     pub async fn poll_loop(self: Arc<Self>, every: Duration) {
         loop {
             self.tick().await;
             self.follow_keystone().await;
-            tokio::time::sleep(every).await;
+            tokio::select! {
+                _ = tokio::time::sleep(every) => {}
+                _ = self.keystone_changed.notified() => {}
+            }
         }
     }
 }
@@ -3293,15 +3306,19 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
         let d = Arc::try_unwrap(d).ok().map(Arc::new).expect("sole owner")
             .with_keyboard(Box::new(move || Ok(Box::new(FlashKb(w.clone())) as Box<dyn crate::features::music::worker::Keyboard>)));
         let r = LightRig { d, sys, aura, svc, dir };
+        r.sys.files.lock().unwrap().insert(crate::hw::sysfs::PRODUCT_NAME.into(), "ROG Strix G533ZW_G533ZW".into()); // has a per-key layout
         set_keystone(&r, "0");
         keystone_step(&r).await;
         set_keystone(&r, "1");
         keystone_step(&r).await;
         let w = writes.lock().unwrap().clone();
-        assert_eq!(w[0], "13 packets, keystone 0", "init + a full frame first: {w:?}");
-        assert!(w.len() > 30 && w[1..].iter().all(|l| l.starts_with("1 packets")), "then only the Keystone packet: {} writes", w.len());
-        assert!(w.iter().any(|l| l.ends_with("keystone 255") || l.split(' ').last().unwrap().parse::<u8>().unwrap() > 240), "reaches full: {w:?}");
-        assert_eq!(acalls(&r), ["set_mode_data 0"], "the effect is re-applied");
+        assert_eq!(w[0], "1 packets, keystone 0", "direct mode first: {w:?}");
+        let (last, fades) = w[1..].split_last().unwrap();
+        assert!(fades.len() > 30 && fades.iter().all(|l| l.starts_with("12 packets")), "whole frames (the keyboard drops packets): {w:?}");
+        assert_eq!(fades.last().unwrap(), "12 packets, keystone 0", "the Keystone LED ends off");
+        assert!(fades.iter().any(|l| l.split(' ').last().unwrap().parse::<u8>().unwrap() > 240), "reaches full: {w:?}");
+        assert!(last.starts_with("3 packets"), "the effect is re-applied on the keyboard handle: {last}");
+        assert!(acalls(&r).is_empty(), "not through asusd (it flickers): {:?}", acalls(&r));
     }
 
     #[tokio::test]

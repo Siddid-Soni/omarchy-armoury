@@ -54,6 +54,10 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(armouryd::features::keys::run_reader(tx));
     let keys = daemon.clone();
     tokio::spawn(async move { while let Some(k) = rx.recv().await { keys.on_hotkey(k).await; } });
+    let (kstx, mut ksrx) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(armouryd::features::keys::run_keystone_watch(kstx));
+    let ks = daemon.clone();
+    tokio::spawn(async move { while ksrx.recv().await.is_some() { ks.keystone_changed.notify_one(); } });
     let (ktx, mut krx) = tokio::sync::mpsc::channel(16);
     tokio::spawn(armouryd::features::keys::run_kbd_watch(ktx));
     let kbd = daemon.clone();

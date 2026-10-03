@@ -86,6 +86,39 @@ pub async fn run_kbd_watch(tx: tokio::sync::mpsc::Sender<u8>) {
     }
 }
 
+/// Signals every Keystone insert/remove: asus-wmi calls sysfs_notify on `keystone`
+/// (seen on the G533ZW). Only waits; the value is read by the poll tick. Reopens after errors.
+pub async fn run_keystone_watch(tx: tokio::sync::mpsc::Sender<()>) {
+    use std::os::unix::fs::FileExt;
+    use tokio::io::{unix::AsyncFd, Interest};
+    let path = Path::new("/").join(crate::hw::sysfs::KEYSTONE);
+    // sysfs arms the notification on read
+    let rearm = |f: &std::fs::File| f.read_at(&mut [0u8; 8], 0).map(|_| ());
+    let mut failures = 0u32;
+    loop {
+        let result: std::io::Result<()> = async {
+            let fd = AsyncFd::with_interest(std::fs::File::open(&path)?, Interest::PRIORITY)?;
+            rearm(fd.get_ref())?;
+            failures = 0;
+            loop {
+                let mut guard = fd.ready(Interest::PRIORITY).await?;
+                rearm(guard.get_inner())?;
+                guard.clear_ready();
+                if tx.send(()).await.is_err() { return Ok(()); }
+            }
+        }.await;
+        match result {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return, // no Keystone slot
+            Err(e) => {
+                eprintln!("armouryd: Keystone watch: {e}");
+                tokio::time::sleep(backoff(failures)).await;
+                failures += 1;
+            }
+        }
+    }
+}
+
 pub fn backoff(failures: u32) -> Duration {
     Duration::from_secs((2u64 << failures.min(4)).min(30))
 }
