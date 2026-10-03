@@ -35,14 +35,33 @@ Item {
     border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.25)
   }
 
-  // glow while seated (the Keystone light); outside the clip below so it stays round
-  Rectangle {
-    x: key.x - Style.space(10); y: key.y - Style.space(10)
-    width: key.width + Style.space(20)
-    height: 29 * root.u + Style.space(20)
-    radius: Style.cornerRadius > 0 ? height / 2 : 0
-    color: Qt.rgba(1, 0.19, 0.25, root.inserted && root.enabled_ ? 0.18 : 0)
-    Behavior on color { ColorAnimation { duration: 350 } }
+  // glow while seated (the Keystone light): a radial fade squashed to an ellipse, so it
+  // never reads as a box whatever the corner style; outside the clip below so it isn't cut
+  Shape {
+    id: glow
+    readonly property real w: key.width + Style.space(32)
+    readonly property real h: 29 * root.u + Style.space(28)
+    x: key.x - Style.space(16); y: key.y - Style.space(14)
+    width: w; height: w
+    transform: Scale { yScale: glow.h / glow.w }
+    preferredRendererType: Shape.CurveRenderer
+    opacity: root.inserted && root.enabled_ ? 1 : 0
+    Behavior on opacity { NumberAnimation { duration: 250 } }
+    ShapePath {
+      strokeWidth: -1
+      fillGradient: RadialGradient {
+        centerX: glow.w / 2; centerY: glow.w / 2; centerRadius: glow.w / 2
+        focalX: glow.w / 2; focalY: glow.w / 2
+        GradientStop { position: 0; color: Qt.rgba(1, 0.19, 0.25, 0.30) }
+        GradientStop { position: 0.55; color: Qt.rgba(1, 0.19, 0.25, 0.12) }
+        GradientStop { position: 1; color: Qt.rgba(1, 0.19, 0.25, 0) }
+      }
+      startX: 0; startY: 0
+      PathLine { x: glow.w; y: 0 }
+      PathLine { x: glow.w; y: glow.w }
+      PathLine { x: 0; y: glow.w }
+      PathLine { x: 0; y: 0 }
+    }
   }
 
   // everything above the slot's middle: the seated tab disappears into it
@@ -61,8 +80,8 @@ Item {
       // seated: the head's bottom edge sits on the slot; lifted: the tab clears it
       y: root.inserted ? slot.y + slot.height / 2 - 32 * root.u : slot.y - root.gap - 57 * root.u
       opacity: root.inserted ? 1 : 0.45
-      Behavior on y { NumberAnimation { duration: 350; easing.type: Easing.OutCubic } }
-      Behavior on opacity { NumberAnimation { duration: 350 } }
+      Behavior on y { NumberAnimation { duration: 250; easing.type: Easing.OutCubic } }
+      Behavior on opacity { NumberAnimation { duration: 250 } }
 
       Shape {
         width: 100
