@@ -615,6 +615,8 @@ pub enum Request {
     SetKeepOn { on: bool },
     /// Never dim the keyboard backlight when idle while on AC.
     SetKeepOnAc { on: bool },
+    /// Remember a lighting colour the user applied (newest first, for the UI's Recent swatches).
+    AddRecentColour { colour: [u8; 3] },
     SetKeyBinding { key: HotKey, action: KeyAction, #[serde(default)] command: Option<String> },
     /// NumberPad on/off (active mode; refused while the touchpad is off unless allowed).
     SetNumpad { on: bool },

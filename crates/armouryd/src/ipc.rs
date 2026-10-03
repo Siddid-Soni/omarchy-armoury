@@ -1265,6 +1265,15 @@ impl Daemon {
                     Err(e) => Response::err(format!("save config: {e}")),
                 }
             }
+            Request::AddRecentColour { colour } => {
+                if let Err(r) = self.write_guard().await { return r; }
+                let mut cfg = self.config.lock().await;
+                cfg.lighting.add_recent_colour(colour);
+                match cfg.save(&self.config_path) {
+                    Ok(()) => Response::ok(serde_json::to_value(&cfg.lighting.recent_colours).unwrap()),
+                    Err(e) => Response::err(format!("save config: {e}")),
+                }
+            }
             Request::Config => Response::ok(serde_json::to_value(&*self.config.lock().await).unwrap()),
             Request::SetNumpad { on } => {
                 if let Err(r) = self.write_guard().await { return r; }
@@ -2691,6 +2700,23 @@ mod tests {
         assert!(r.d.handle(Request::SetKeepOnAc { on: true }).await.ok);
         let t = std::fs::read_to_string(r.dir.path().join("config.toml")).unwrap();
         assert!(t.contains("keep_on_ac = true") && !t.contains("keep_on = true"), "{t}");
+    }
+
+    #[tokio::test]
+    async fn recent_colours_newest_first_deduped_capped() {
+        let r = sys_rig(true, "");
+        for c in [[1, 0, 0], [2, 0, 0], [1, 0, 0]] {
+            assert!(r.d.handle(Request::AddRecentColour { colour: c }).await.ok);
+        }
+        let v = r.d.handle(Request::Config).await.data.unwrap();
+        assert_eq!(v["lighting"]["recent_colours"], serde_json::json!([[1, 0, 0], [2, 0, 0]]), "a reused colour moves to the front");
+        for i in 0..20u8 { r.d.handle(Request::AddRecentColour { colour: [0, i, 0] }).await; }
+        let v = r.d.handle(Request::Config).await.data.unwrap();
+        let l = v["lighting"]["recent_colours"].as_array().unwrap();
+        assert_eq!(l.len(), crate::config::RECENT_COLOURS);
+        assert_eq!(l[0], serde_json::json!([0, 19, 0]));
+        let t = std::fs::read_to_string(r.dir.path().join("config.toml")).unwrap();
+        assert!(t.contains("recent_colours"), "{t}");
     }
 
     fn set_od(r: &SysRig, on: bool) { r.sys.files.lock().unwrap().insert("sys/devices/platform/asus-nb-wmi/panel_od".into(), if on { "1" } else { "0" }.into()); }

@@ -22,6 +22,8 @@ Flickable {
   property string mColour2: "ff0040"
   property int mSensitivity: 5
   property var lcfg: ({})          // config.toml [lighting]
+  // newest first; presets already have a swatch
+  readonly property var recent: (lcfg.recent_colours || []).map(hex).filter(function(h) { return presets.indexOf(h) < 0 })
 
   // effect being edited
   property string mode: "static"
@@ -66,17 +68,30 @@ Flickable {
   }
   Component.onCompleted: { reload(); reloadMusic() }
 
+  // Save applied colours to the Recent swatches (presets already have one); the first one ends up newest.
+  function remember(colours) {
+    colours.map(function(h) { return h.toLowerCase() })
+      .filter(function(h) { return presets.indexOf(h) < 0 })
+      .reverse().forEach(function(h) { client.call({ cmd: "add_recent_colour", colour: rgb(h) }, function() {}) })
+    reloadMusic()
+  }
+
   function applyEffect() {
     if (mode === "music") {
       if (!valid(mColour1) || !valid(mColour2)) { root.error = "Colours must be RRGGBB"; return }
+      var used = mScheme === "rainbow" ? [] : mScheme === "single" ? [mColour1] : [mColour1, mColour2]
       client.run({ cmd: "set_music_config", style: mStyle, scheme: mScheme, colour1: rgb(mColour1), colour2: rgb(mColour2), sensitivity: mSensitivity }, function(r) {
         if (r && r.ok === false) return
-        client.run({ cmd: "set_music", on: true }, function() { root.reloadMusic() })
+        client.run({ cmd: "set_music", on: true }, function(r2) { if (r2.ok) root.remember(used); else root.reloadMusic() })
       })
       return
     }
     if (!valid(colour1) || !valid(colour2)) { root.error = "Colours must be RRGGBB"; return }
-    client.run({ cmd: "set_effect", effect: { mode: mode, colour1: rgb(colour1), colour2: rgb(colour2), speed: speed, direction: direction } }, function() { root.reload() })
+    var used = ["colour1", "colour2"].filter(uses).map(function(k) { return root[k] })
+    client.run({ cmd: "set_effect", effect: { mode: mode, colour1: rgb(colour1), colour2: rgb(colour2), speed: speed, direction: direction } }, function(r) {
+      root.reload()
+      if (r.ok) root.remember(used)
+    })
   }
 
   function modeLabel(m) { return String(m).split("_").map(function(w) { return w.charAt(0).toUpperCase() + w.slice(1) }).join(" ") }
@@ -188,6 +203,7 @@ Flickable {
         : root.mScheme === "single" ? [{ key: "mColour1", label: "Colour" }]
         : [{ key: "mColour1", label: "Low / quiet" }, { key: "mColour2", label: "High / loud" }]
       Column {
+        id: colourRow
         required property var modelData
         visible: root.mode === "music" || root.uses(modelData.key)
         width: col.width
@@ -215,6 +231,28 @@ Flickable {
               color: "#" + modelData
               border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.3)
               MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root[parent.parent.parent.modelData.key] = parent.modelData }
+            }
+          }
+        }
+        Row {
+          visible: root.recent.length > 0
+          spacing: Style.space(6)
+          Text {
+            width: Style.space(34 + 6 + 110)   // under the swatch and the text field, so these line up with the presets
+            text: "Recent"
+            anchors.verticalCenter: parent.verticalCenter
+            color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption
+            horizontalAlignment: Text.AlignRight
+          }
+          Repeater {
+            model: root.recent
+            Rectangle {
+              required property var modelData
+              width: Style.space(26); height: Style.space(26); radius: width / 2
+              anchors.verticalCenter: parent.verticalCenter
+              color: "#" + modelData
+              border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.3)
+              MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root[colourRow.modelData.key] = parent.modelData }
             }
           }
         }

@@ -86,10 +86,20 @@ pub struct LightingConfig {
     /// Never dim the keyboard when idle while on AC; None = same as keep_on (which
     /// covered both sources before AC got its own setting).
     pub keep_on_ac: Option<bool>,
+    /// Colours the user applied, newest first (the UI's Recent swatches).
+    pub recent_colours: Vec<[u8; 3]>,
 }
+
+/// How many recent lighting colours are kept.
+pub const RECENT_COLOURS: usize = 8;
 
 impl LightingConfig {
     pub fn keep_on_ac(&self) -> bool { self.keep_on_ac.unwrap_or(self.keep_on) }
+    pub fn add_recent_colour(&mut self, c: [u8; 3]) {
+        self.recent_colours.retain(|x| *x != c);
+        self.recent_colours.insert(0, c);
+        self.recent_colours.truncate(RECENT_COLOURS);
+    }
 }
 
 pub fn config_path(home: &Path) -> PathBuf {
