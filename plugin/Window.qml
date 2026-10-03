@@ -282,9 +282,8 @@ Item {
                   l.on_ac === false ? "On battery" : "On AC"
                 ] : []
                 KeyboardPreview {
-                  width: parent.width
-                  height: Math.min(parent.height, width * 0.42)
-                  anchors.bottom: parent.bottom
+                  // the whole space under the text: the drawing keeps its proportions and centres itself
+                  anchors.fill: parent
                   fg: root.fg
                   effect: parent.parent.l.effect || null
                   brightness: parent.parent.l.brightness || 0
