@@ -18,7 +18,9 @@ impl Services for RealServices {
 
     async fn output(&self, argv: &[&str]) -> anyhow::Result<String> {
         let (prog, args) = argv.split_first().context("empty argv")?;
-        let child = Command::new(prog).args(args).kill_on_drop(true).output();
+        // the session's environment too: omarchy-osd and omarchy-shell need OMARCHY_PATH and
+        // exit 0 without it, so a missing OSD or window would leave no trace
+        let child = Command::new(prog).args(args).envs(session().await).kill_on_drop(true).output();
         let out = tokio::time::timeout(self.timeout, child).await
             .map_err(|_| anyhow::anyhow!("{} timed out after {:?}", argv.join(" "), self.timeout))?
             .with_context(|| format!("spawn {prog}"))?;
@@ -32,11 +34,7 @@ impl Services for RealServices {
         let (prog, args) = argv.split_first().context("empty argv")?;
         if !std::path::Path::new(prog).exists() { bail!("cannot launch {prog}: not found"); }
         let path = format!("{path_prepend}:{}", std::env::var("PATH").unwrap_or_default());
-        // armouryd can start before the graphical session exists, so its own environment lacks
-        // WAYLAND_DISPLAY, XDG_CURRENT_DESKTOP and friends, and a terminal launched from it dies.
-        // The systemd user manager has the session's environment (uwsm imports it).
-        let session = self.output(&["systemctl", "--user", "show-environment"]).await.map(|o| session_env(&o)).unwrap_or_default();
-        let st = Command::new("setsid").arg("-f").arg(prog).args(args).envs(session).env("PATH", path)
+        let st = Command::new("setsid").arg("-f").arg(prog).args(args).envs(session().await).env("PATH", path)
             .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
             .status().await.with_context(|| format!("launch {prog}"))?;
         if !st.success() { bail!("launch {prog} failed ({st})"); }
@@ -51,6 +49,18 @@ impl Services for RealServices {
         let mut c = Command::new("systemctl");
         if user { c.arg("--user"); }
         c.args(["is-active", "--quiet", unit]).status().await.map(|s| s.success()).unwrap_or(false)
+    }
+}
+
+/// The graphical session's environment, read on every call. armouryd can start before the
+/// session exists, so its own environment lacks WAYLAND_DISPLAY, OMARCHY_PATH and friends (a
+/// terminal launched from it dies, omarchy-osd shows nothing). The systemd user manager has
+/// them (uwsm imports them), and gets the new ones when Hyprland restarts.
+async fn session() -> Vec<(String, String)> {
+    let out = Command::new("systemctl").args(["--user", "show-environment"]).kill_on_drop(true).output();
+    match tokio::time::timeout(std::time::Duration::from_secs(5), out).await {
+        Ok(Ok(o)) if o.status.success() => session_env(&String::from_utf8_lossy(&o.stdout)),
+        _ => Vec::new(),
     }
 }
 
