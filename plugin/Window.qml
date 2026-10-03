@@ -151,7 +151,20 @@ Item {
               }
             }
 
-            Item { width: Math.max(0, header.width - header.children[0].width - header.children[1].width - closeBtn.width - header.spacing * 3); height: 1 }
+            Item {
+              width: Math.max(0, header.width - header.children[0].width - header.children[1].width - closeBtn.width - header.spacing * 3)
+              height: 1
+              anchors.verticalCenter: parent.verticalCenter
+              Text {
+                visible: !!(root.manifest && root.manifest.version)
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                text: "v" + (root.manifest ? root.manifest.version : "")
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
             Button {
               id: closeBtn
               anchors.verticalCenter: parent.verticalCenter
