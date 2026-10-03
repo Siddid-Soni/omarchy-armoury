@@ -111,7 +111,9 @@ sudo udevadm trigger --subsystem-match=input --subsystem-match=misc --subsystem-
 sudo "$LIB/armoury-root" asusd-support-fix
 
 systemctl --user daemon-reload
-systemctl --user enable --now armouryd.service
+systemctl --user enable armouryd.service
+# restart, not --now: on an update armouryd is already running the old binary, and --now leaves it alone
+systemctl --user restart armouryd.service
 
 # armouryd takes control: starts asusd, and stops G-Helper if it is installed (asked first)
 for _ in $(seq 1 20); do ~/.local/bin/armoury status >/dev/null 2>&1 && break; sleep 0.5; done
