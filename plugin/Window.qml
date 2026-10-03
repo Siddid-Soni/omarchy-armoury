@@ -1,5 +1,6 @@
 import QtQuick
 import Quickshell
+import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
@@ -53,11 +54,36 @@ Item {
   // config.toml (music colours for the lighting preview, Keystone summary)
   property var cfg: ({})
   function reloadCfg() { armoury.call({ cmd: "config" }, function(r) { if (r.ok) root.cfg = r.data }) }
-  onOpenedChanged: if (opened) reloadCfg()
+  onOpenedChanged: if (opened) { reloadCfg(); borderProc.running = true; scaleProc.running = true }
   onPageChanged: if (page === "") reloadCfg()
   readonly property color accent: Color.accent
 
   ArmouryClient { id: armoury }
+
+  // Hyprland's general:border_size, so the card's frame matches the tiled windows'
+  property int hyprBorder: 2
+  Process {
+    id: borderProc
+    command: ["hyprctl", "-j", "getoption", "general:border_size"]
+    stdout: StdioCollector {
+      onStreamFinished: { try { var n = Number(JSON.parse(text).int); if (isFinite(n) && n >= 0) root.hyprBorder = n } catch (e) {} }
+    }
+  }
+  // The focused monitor's real scale. Qt rounds a fractional scale up (1.6 -> 2) and
+  // Hyprland shrinks the buffer, so Screen.devicePixelRatio is not the physical grid.
+  property real monitorScale: 1
+  Process {
+    id: scaleProc
+    command: ["hyprctl", "-j", "monitors"]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try {
+          var ms = JSON.parse(text), m = ms.filter(function(x) { return x.focused })[0] || ms[0]
+          var n = Number(m.scale); if (isFinite(n) && n > 0) root.monitorScale = n
+        } catch (e) {}
+      }
+    }
+  }
 
   PanelWindow {
     visible: root.opened
@@ -79,13 +105,18 @@ Item {
 
       Rectangle {
         id: card
-        anchors.centerIn: parent
-        width: Math.min(parent.width - Style.space(48), Style.space(1040))
-        height: Math.min(parent.height - Style.space(48), Style.space(720))
+        // Geometry and border snapped to whole monitor pixels: at a fractional scale
+        // (1.6) a centred card lands between pixels and each side rounds differently.
+        readonly property real dpr: root.monitorScale
+        function snap(v) { return Math.round(v * dpr) / dpr }
+        width: snap(Math.min(parent.width - Style.space(48), Style.space(1040)))
+        height: snap(Math.min(parent.height - Style.space(48), Style.space(720)))
+        x: snap((parent.width - width) / 2)
+        y: snap((parent.height - height) / 2)
         radius: Style.cornerRadius
         color: Qt.rgba(root.surface.r, root.surface.g, root.surface.b, 1)   // opaque: nothing dims or shows through
         border.color: root.border
-        border.width: 1
+        border.width: root.hyprBorder > 0 ? Math.max(1, Math.round(root.hyprBorder * dpr)) / dpr : 0
 
         MouseArea { anchors.fill: parent; onClicked: {} }   // keep clicks off the scrim
 
@@ -123,7 +154,7 @@ Item {
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.display
                 anchors.verticalCenter: parent.verticalCenter
-                MouseArea { anchors.fill: parent; onClicked: root.page = "" }
+                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.page = "" }
               }
             }
 
