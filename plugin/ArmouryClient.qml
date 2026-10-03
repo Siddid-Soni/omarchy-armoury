@@ -7,13 +7,18 @@ import Quickshell.Io
 // - `requests`: one JSON request per line, answered in order, so callbacks
 //   are matched by position in `pending`.
 // Both sockets reconnect on their own; nothing here touches hardware.
+// Each Socket lives in a Loader: once a connection is refused (armouryd restarting), a
+// Quickshell Socket never connects again whatever is set on it (measured on 0.3.1), so the
+// reconnect recreates it.
 Item {
   id: root
 
   readonly property string socketPath: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/armoury.sock"
 
   property var snap: null
-  readonly property bool online: events.connected && snap !== null
+  readonly property bool eventsConnected: !!eventsLoader.item && eventsLoader.item.connected
+  readonly property bool requestsConnected: !!requestsLoader.item && requestsLoader.item.connected
+  readonly property bool online: eventsConnected && snap !== null
   readonly property bool active: !!snap && snap.control === "active"
   property string lastError: ""
 
@@ -53,14 +58,14 @@ Item {
 
   // Sends `req` (an object) and calls `cb(response)`; response is {ok, data, error}.
   function call(req, cb) {
-    if (!requests.connected) {
+    if (!root.requestsConnected) {
       root.lastError = "armouryd is not running"
       if (cb) cb({ ok: false, error: root.lastError })
       return
     }
     root.pending.push(cb || null)
-    requests.write(JSON.stringify(req) + "\n")
-    requests.flush()
+    requestsLoader.item.write(JSON.stringify(req) + "\n")
+    requestsLoader.item.flush()
   }
 
   // Fire-and-forget with error capture for the UI's error line.
@@ -71,65 +76,69 @@ Item {
     })
   }
 
-  Socket {
-    id: events
-    path: root.socketPath
-    connected: true
-    onConnectedChanged: {
-      if (connected) {
-        write(JSON.stringify({ cmd: "subscribe" }) + "\n")
-        flush()
-      } else {
-        root.snap = null
-        root.bands = []
+  Loader {
+    id: eventsLoader
+    sourceComponent: Socket {
+      path: root.socketPath
+      connected: true
+      onConnectedChanged: {
+        if (connected) {
+          write(JSON.stringify({ cmd: "subscribe" }) + "\n")
+          flush()
+        } else {
+          root.snap = null
+          root.bands = []
+        }
       }
-    }
-    parser: SplitParser {
-      onRead: function(line) {
-        var msg
-        try { msg = JSON.parse(line) } catch (e) { return }
-        if (msg.event === "snapshot") {
-          root.snap = msg.data
-          root.snapshotChanged()
-          if (!msg.data.lighting || msg.data.lighting.music !== "on") root.bands = []
-        } else if (msg.event === "music_bands") {
-          root.bands = msg.data || []
+      parser: SplitParser {
+        onRead: function(line) {
+          var msg
+          try { msg = JSON.parse(line) } catch (e) { return }
+          if (msg.event === "snapshot") {
+            root.snap = msg.data
+            root.snapshotChanged()
+            if (!msg.data.lighting || msg.data.lighting.music !== "on") root.bands = []
+          } else if (msg.event === "music_bands") {
+            root.bands = msg.data || []
+          }
         }
       }
     }
   }
 
-  Socket {
-    id: requests
-    path: root.socketPath
-    connected: true
-    onConnectedChanged: {
-      if (!connected) {
-        // fail everything still waiting; the daemon went away
-        var waiting = root.pending
-        root.pending = []
-        for (var i = 0; i < waiting.length; i++)
-          if (waiting[i]) waiting[i]({ ok: false, error: "armouryd disconnected" })
+  Loader {
+    id: requestsLoader
+    sourceComponent: Socket {
+      path: root.socketPath
+      connected: true
+      onConnectedChanged: {
+        if (!connected) {
+          // fail everything still waiting; the daemon went away
+          var waiting = root.pending
+          root.pending = []
+          for (var i = 0; i < waiting.length; i++)
+            if (waiting[i]) waiting[i]({ ok: false, error: "armouryd disconnected" })
+        }
       }
-    }
-    parser: SplitParser {
-      onRead: function(line) {
-        var cb = root.pending.shift()
-        var msg
-        try { msg = JSON.parse(line) } catch (e) { msg = { ok: false, error: "bad response" } }
-        if (cb) cb(msg)
+      parser: SplitParser {
+        onRead: function(line) {
+          var cb = root.pending.shift()
+          var msg
+          try { msg = JSON.parse(line) } catch (e) { msg = { ok: false, error: "bad response" } }
+          if (cb) cb(msg)
+        }
       }
     }
   }
 
-  // Reconnect when armouryd restarts.
+  // Reconnect when armouryd restarts: a fresh Socket each try (see the top).
   Timer {
     interval: 2000
-    running: !events.connected || !requests.connected
+    running: !root.eventsConnected || !root.requestsConnected
     repeat: true
     onTriggered: {
-      if (!events.connected) events.connected = true
-      if (!requests.connected) requests.connected = true
+      if (!root.eventsConnected) { root.snap = null; eventsLoader.active = false; eventsLoader.active = true }
+      if (!root.requestsConnected) { requestsLoader.active = false; requestsLoader.active = true }
     }
   }
 }
