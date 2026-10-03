@@ -145,7 +145,7 @@ Item {
             readonly property real before: keyRow.modelData.slice(0, index).reduce(function(s, w) { return s + w }, 0)
             width: keyRow.unitW * modelData + root.gap * (modelData - 1)
             height: root.rowH
-            radius: Math.min(3, height / 5)
+            radius: Math.min(3, height / 5, Style.cornerRadius)
             color: root.keyColor((before + modelData / 2) / keyRow.units, root.rows.length - 1 - keyRow.index, root.phase, root.bands)
           }
         }
@@ -155,7 +155,7 @@ Item {
     Rectangle {
       width: parent.width
       height: root.rowH * 0.6
-      radius: height / 2
+      radius: Style.cornerRadius > 0 ? height / 2 : 0
       color: root.musicOn && root.music
         ? root.dimmed(root.music.scheme === "gradient" ? root.mix(root.rgb(root.music.colour1), root.rgb(root.music.colour2), root.loudness)
             : root.music.scheme === "rainbow" ? root.hue(root.loudness * 0.8) : root.rgb(root.music.colour1), root.loudness)

@@ -22,7 +22,7 @@ Item {
     y: 0
     width: Math.min(parent.width * 0.62, (parent.height - rules.height - Style.space(14)) * 1.6)
     height: width / 1.6
-    radius: Style.space(6)
+    radius: Style.cornerRadius
     color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.05)
     border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.25)
     border.width: 2
@@ -47,7 +47,7 @@ Item {
       }
     }
     // stand
-    Rectangle { anchors.top: parent.bottom; anchors.horizontalCenter: parent.horizontalCenter; width: parent.width * 1.12; height: 3; radius: 2; color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.3) }
+    Rectangle { anchors.top: parent.bottom; anchors.horizontalCenter: parent.horizontalCenter; width: parent.width * 1.12; height: 3; radius: Math.min(2, Style.cornerRadius); color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.3) }
   }
 
   // AC and battery rules
@@ -64,7 +64,7 @@ Item {
         readonly property bool hasOd: !!root.sys && root.sys["panel_od_" + modelData.src] !== undefined && root.sys["panel_od_" + modelData.src] !== null
         width: (rules.width - rules.spacing) / 2
         height: Style.space(hasOd ? 64 : 52)
-        radius: Style.space(6)
+        radius: Style.cornerRadius
         color: current ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.14) : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.04)
         border.color: current ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.5) : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.12)
         Row {

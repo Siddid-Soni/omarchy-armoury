@@ -82,7 +82,7 @@ Item {
         anchors.centerIn: parent
         width: Math.min(parent.width - Style.space(48), Style.space(1040))
         height: Math.min(parent.height - Style.space(48), Style.space(720))
-        radius: Style.space(10)
+        radius: Style.cornerRadius
         color: Qt.rgba(root.surface.r, root.surface.g, root.surface.b, 1)   // opaque: nothing dims or shows through
         border.color: root.border
         border.width: 1
@@ -280,7 +280,7 @@ Item {
                     Rectangle {
                       id: battBar
                       anchors.fill: parent
-                      radius: Style.space(6)
+                      radius: Style.cornerRadius
                       color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.06)
                       border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.15)
                       Rectangle {
@@ -388,7 +388,7 @@ Item {
     default property alias content: area.data
     width: parent.tileW
     height: parent.tileH
-    radius: Style.space(8)
+    radius: Style.cornerRadius
     color: hover.containsMouse ? Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.10) : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.05)
     border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.12)
 

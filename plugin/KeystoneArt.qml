@@ -30,7 +30,7 @@ Item {
     anchors.bottomMargin: Style.space(8)
     width: root.tabW + Style.space(12)
     height: Style.space(14)
-    radius: height / 2
+    radius: Style.cornerRadius > 0 ? height / 2 : 0
     color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.08)
     border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.25)
   }
@@ -40,7 +40,7 @@ Item {
     x: key.x - Style.space(10); y: key.y - Style.space(10)
     width: key.width + Style.space(20)
     height: 29 * root.u + Style.space(20)
-    radius: height / 2
+    radius: Style.cornerRadius > 0 ? height / 2 : 0
     color: Qt.rgba(1, 0.19, 0.25, root.inserted && root.enabled_ ? 0.18 : 0)
     Behavior on color { ColorAnimation { duration: 350 } }
   }

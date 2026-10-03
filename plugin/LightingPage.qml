@@ -212,7 +212,7 @@ Flickable {
         Row {
           spacing: Style.space(6)
           Rectangle {
-            width: Style.space(34); height: Style.space(34); radius: Style.space(6)
+            width: Style.space(34); height: Style.space(34); radius: Style.cornerRadius
             color: root.valid(root[modelData.key]) ? "#" + root[modelData.key] : "transparent"
             border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.3)
           }
@@ -226,7 +226,7 @@ Flickable {
             model: root.presets
             Rectangle {
               required property var modelData
-              width: Style.space(26); height: Style.space(26); radius: width / 2
+              width: Style.space(26); height: Style.space(26); radius: Style.cornerRadius > 0 ? width / 2 : 0
               anchors.verticalCenter: parent.verticalCenter
               color: "#" + modelData
               border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.3)
@@ -248,7 +248,7 @@ Flickable {
             model: root.recent
             Rectangle {
               required property var modelData
-              width: Style.space(26); height: Style.space(26); radius: width / 2
+              width: Style.space(26); height: Style.space(26); radius: Style.cornerRadius > 0 ? width / 2 : 0
               anchors.verticalCenter: parent.verticalCenter
               color: "#" + modelData
               border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.3)

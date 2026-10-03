@@ -30,7 +30,7 @@ Item {
         Rectangle {
           width: parent.width
           height: Style.space(34)
-          radius: Style.space(6)
+          radius: Style.cornerRadius
           color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.07)
           border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.25)
           Text { anchors.centerIn: parent; text: modelData.cap; color: root.fg; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true }
@@ -54,7 +54,7 @@ Item {
     anchors.topMargin: Style.space(16)
     anchors.bottom: parent.bottom
     width: Math.min(parent.width * 0.7, height * 1.75)
-    radius: Style.space(8)
+    radius: Style.cornerRadius
     color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, root.touchpadOn ? 0.06 : 0.02)
     border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, root.touchpadOn ? 0.25 : 0.1)
     visible: height > Style.space(40)
@@ -73,7 +73,7 @@ Item {
         Rectangle {
           width: (parent.width - parent.spacing * 4) / 5
           height: (parent.height - parent.spacing * 3) / 4
-          radius: 3
+          radius: Math.min(3, Style.cornerRadius)
           color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.35)
         }
       }

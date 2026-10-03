@@ -201,7 +201,7 @@ Panel {
           visible: !root.online || root.needsUpdate
           width: parent.width
           implicitHeight: bannerRow.implicitHeight + Style.space(16)
-          radius: Style.space(6)
+          radius: Style.cornerRadius
           color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.08)
 
           Row {
