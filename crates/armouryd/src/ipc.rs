@@ -780,7 +780,13 @@ impl Daemon {
         }
         // the dashboard's lighting preview: asusd answers from its saved config (no hardware access)
         let effect = if env.0 { self.aura.info().await.ok().and_then(|(m, ..)| effect_from_raw(&m)) } else { None };
-        *self.effect.lock().unwrap() = effect;
+        let before = std::mem::replace(&mut *self.effect.lock().unwrap(), effect);
+        // an effect written behind music's back (Omarchy's theme sets the keyboard colour through
+        // asusctl) took the keyboard out of direct mode: music enters it again and carries on,
+        // and goes back to that effect when it stops
+        if before.is_some() && effect.is_some() && before != effect && self.music_on() {
+            self.music_send(music::worker::Cmd::Reenter);
+        }
         let snap = self.refresh().await;
         if self.mode.get() != ControlMode::Active {
             *st = ApplyState::default(); // re-apply after the next takeover
@@ -3127,6 +3133,7 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
                     Cmd::Lit(l) => format!("lit {}", l.lightbar),
                     Cmd::Idle(i) => format!("idle {i}"),
                     Cmd::KeystoneAnimation => "keystone".into(),
+                    Cmd::Reenter => "reenter".into(),
                     Cmd::Release(ack) => {
                         let g_helper_started = sv.calls.lock().unwrap().iter().any(|c| c.contains("handback"));
                         let _ = ack.send(());
@@ -3365,6 +3372,25 @@ percent = [0, 10, 20, 35, 55, 75, 90, 100]
         keystone_step(&r).await;
         assert_eq!(writes.lock().unwrap().len(), 2, "re-applied once");
         assert_eq!(acalls(&r), ["set_mode_data 1"], "not through asusd (it flickers)");
+    }
+
+    #[tokio::test]
+    async fn an_effect_written_behind_musics_back_makes_it_enter_direct_mode_again() {
+        async fn step(r: &LightRig) { r.d.tick().await; for _ in 0..20 { tokio::task::yield_now().await; } }
+        let reenters = |l: &Arc<std::sync::Mutex<Vec<String>>>| mlog(l).iter().filter(|c| *c == "reenter").count();
+        let (r, log, status) = music_rig(true, ""); // music On
+        step(&r).await;
+        step(&r).await;
+        assert_eq!(reenters(&log), 0, "unchanged effect: {:?}", mlog(&log));
+        r.aura.mode.lock().unwrap().2 = (0x11, 0x22, 0x33); // Omarchy's theme: asusctl aura effect static -c 112233
+        step(&r).await;
+        assert_eq!(reenters(&log), 1, "{:?}", mlog(&log));
+        step(&r).await;
+        assert_eq!(reenters(&log), 1, "once per change");
+        status.lock().unwrap().0 = armoury_proto::MusicState::Off;
+        r.aura.mode.lock().unwrap().2 = (0x44, 0x55, 0x66);
+        step(&r).await;
+        assert_eq!(reenters(&log), 1, "music off: nothing to re-enter");
     }
 
     #[tokio::test]

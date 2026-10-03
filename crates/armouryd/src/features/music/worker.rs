@@ -24,6 +24,9 @@ pub enum Cmd {
     Release(oneshot::Sender<()>),
     /// The Keystone went in: play the firmware's Keystone animation over the music frames.
     KeystoneAnimation,
+    /// Something else wrote an effect (Omarchy's theme sets the keyboard colour through
+    /// asusctl), which took the keyboard out of direct mode: enter it again.
+    Reenter,
 }
 
 /// Published state: what the snapshot shows.
@@ -119,7 +122,7 @@ pub async fn run_worker(io: Io, layout: Option<Layout>, mut cmds: mpsc::Receiver
                 Some(Cmd::Lit(l)) => lit_override = Some(l),
                 Some(Cmd::Idle(i)) => idle = i,
                 Some(Cmd::Release(ack)) => { active = false; let _ = ack.send(()); }
-                Some(Cmd::KeystoneAnimation) => {}
+                Some(Cmd::KeystoneAnimation) | Some(Cmd::Reenter) => {}
             }
             publish(&failed, active);
         }
@@ -216,6 +219,7 @@ async fn session(
                 Some(Cmd::Idle(i)) => { *idle = i; last = None; if !i { need_init = true; } }
                 Some(Cmd::Release(a)) => { *active = false; *ack = Some(a); return End::Stopped; }
                 Some(Cmd::KeystoneAnimation) => animate = true,
+                Some(Cmd::Reenter) => need_init = true,
             },
         }
     }
@@ -420,6 +424,20 @@ mod tests {
         let l = log(&r);
         assert_eq!(l[n], "init+frame", "{l:?}");
         assert!(l[n + 1..].iter().all(|l| l == "frame"), "{l:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reenter_enters_direct_mode_again() {
+        // an effect written behind music's back (Omarchy's theme) took the keyboard out of it
+        let r = start(true);
+        r.cmds.send(Cmd::Env { active: true }).await.unwrap(); settle().await;
+        play(&r, (0..3).map(tone)).await;
+        let n = log(&r).len();
+        r.cmds.send(Cmd::Reenter).await.unwrap(); settle().await;
+        play(&r, (3..6).map(tone)).await;
+        let l = log(&r);
+        assert_eq!(l[n], "init+frame", "{l:?}");
+        assert!(l[n + 1..].iter().all(|l| l == "frame"), "once: {l:?}");
     }
 
     #[test]
