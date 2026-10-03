@@ -27,7 +27,8 @@ Design notes: `docs/superpowers/specs/`. Open follow-ups: `docs/superpowers/back
 - **Dashboard**: one tile per area.
   - Live graphs of CPU temperature, fan speeds and power draw.
   - A battery bar with a marker at the charge limit, and a charge trend.
-  - A keyboard preview of the current lighting, live during Music.
+  - A drawing of the laptop's lights (keys, logo, display bar and front light bar) in the
+    current lighting, live during Music.
   - Key bindings, the touchpad and NumberPad state, the display and power-source rules,
     and the Keystone.
 - **Manual (performance)**: saved profiles, each built on a firmware mode.
@@ -43,6 +44,7 @@ Design notes: `docs/superpowers/specs/`. Open follow-ups: `docs/superpowers/back
 - **Music effect**: the keyboard reacts to whatever is playing.
   - Spectrum (bass to treble, left to right) or Pulse (everything follows loudness).
   - Gradient, rainbow or single colour, with a sensitivity setting.
+  - The logo, the front light bar and the bar under the display pulse with loudness.
   - Pick *Music* in the effect list, or reach it with Fn+F4.
 - **Battery**: charge, health, cycles, voltage, draw and time left. Charge limit, plus
   a one-shot "charge to 100%".
@@ -90,7 +92,7 @@ exists, but only the G533ZW has been tested.
 | NVIDIA clocks and GPU status | NVIDIA dGPUs (NVML) | |
 | ROG key, Fn+F4, Fn+F5 | Models whose hotkeys come through `asus-nb-wmi` | Key codes captured on the G533ZW |
 | Keystone actions | Models with `/sys/devices/platform/asus-nb-wmi/keystone` | |
-| **Music effect, Keystone light** | **G533 per-key layout only** | Other keyboards need an LED map in `features/music/perkey.rs` |
+| **Music effect, Keystone animation** | **G533 per-key layout only** | Other keyboards need an LED map in `features/music/perkey.rs` |
 | **NumberPad** | **G533 touchpad layout only** (ASUE1403 04F3:319A) | Layouts are data tables in `features/numpad/layout.rs` |
 | **asusd zone fix** | **G533Z only** | asusd's model database under-reports its lighting zones |
 | Desktop integration | **Omarchy** (Hyprland, omarchy-shell) | Uses Omarchy's OSD, lock, touchpad and lid tools |
@@ -100,12 +102,13 @@ zone fix), not code.
 
 ## Known issues
 
-- **Light bar under the display during Music.** In per-key mode it copies the F5 and
-  Delete colours. Armoury Crate on Windows controls it separately, so there's another
-  packet; a USB capture from Windows is needed (steps in the backlog).
-- **Keystone reacts within 2 s**, not instantly. The firmware sends no event, so its
-  presence is read every 2 s. Keystones can't be told apart yet: the NFC reader
-  (NXP3001) has no Linux driver bound.
+- **Keystones can't be told apart yet.** The NFC reader (NXP3001) has no Linux driver
+  bound, so the same actions run for every Keystone.
+- **A theme with the same keyboard colour interrupts Music.** Omarchy sets the keyboard
+  colour on every theme change (through asusctl), which takes the keyboard out of per-key
+  mode. armouryd notices when the colour changes and Music carries on within 2 s. When the
+  new theme has the same keyboard colour, nothing changes to notice: toggle Music to bring
+  it back.
 - **Setting an effect or cycling Fn+F4 turns Music off.** Leaving Music restores the
   previous effect.
 - **The lighting preview is an approximation** of the firmware effects, especially the
