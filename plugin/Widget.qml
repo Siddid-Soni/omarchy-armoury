@@ -145,12 +145,10 @@ Panel {
           width: parent.width
           implicitHeight: Math.max(heroIcon.implicitHeight, heroText.implicitHeight)
 
-          Text {
+          RogLogo {
             id: heroIcon
-            text: "󰢮"
             color: root.fg
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.display
+            implicitHeight: Style.font.display * 0.9
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
           }

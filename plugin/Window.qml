@@ -100,13 +100,31 @@ Item {
             width: parent.width
             spacing: Style.space(14)
 
-            Text {
-              text: root.page === "" ? "󰢮" : "‹"
-              color: root.fg
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.display
+            // one child (the spacer below sizes itself from children[0] and [1]):
+            // the logo on the dashboard, a back arrow on pages
+            Item {
               anchors.verticalCenter: parent.verticalCenter
-              MouseArea { anchors.fill: parent; enabled: root.page !== ""; onClicked: root.page = "" }
+              width: root.page === "" ? logo.width : back.width
+              height: Math.max(logo.height, back.height)
+
+              RogLogo {
+                id: logo
+                visible: root.page === ""
+                color: root.fg
+                implicitHeight: Style.font.display * 0.9
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Text {
+                id: back
+                visible: root.page !== ""
+                text: "‹"
+                color: root.fg
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.display
+                anchors.verticalCenter: parent.verticalCenter
+                MouseArea { anchors.fill: parent; onClicked: root.page = "" }
+              }
             }
 
             Column {
