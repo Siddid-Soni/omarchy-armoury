@@ -39,6 +39,7 @@ Flickable {
     return out
   }
   readonly property var modeOptions: [{ label: "Silent", value: "quiet" }, { label: "Balanced", value: "balanced" }, { label: "Turbo", value: "performance" }, { label: "Manual", value: "manual" }]
+  readonly property var odOptions: [{ label: "Leave", value: "leave" }, { label: "On", value: "on" }, { label: "Off", value: "off" }]
   function onOff(v) { return [{ label: "On", value: true }, { label: "Off", value: false }] }
 
 
@@ -88,6 +89,24 @@ Flickable {
       options: root.onOff()
       value: root.sys.panel_od
       onChosen: function(v) { root.client.run({ cmd: "set_toggle", toggle: "panel_od", on: v }) }
+    }
+    ChoiceRow {
+      fg: root.fg
+      label: "Overdrive on AC"
+      visible: root.sys.panel_od !== undefined && root.sys.panel_od !== null
+      usable: root.usable
+      options: root.odOptions
+      value: root.cfg.system && root.cfg.system.panel_od_ac === true ? "on" : (root.cfg.system && root.cfg.system.panel_od_ac === false ? "off" : "leave")
+      onChosen: function(v) { root.client.run({ cmd: "set_source_overdrive", ac: v }, function() { root.reload() }) }
+    }
+    ChoiceRow {
+      fg: root.fg
+      label: "Overdrive on battery"
+      visible: root.sys.panel_od !== undefined && root.sys.panel_od !== null
+      usable: root.usable
+      options: root.odOptions
+      value: root.cfg.system && root.cfg.system.panel_od_battery === true ? "on" : (root.cfg.system && root.cfg.system.panel_od_battery === false ? "off" : "leave")
+      onChosen: function(v) { root.client.run({ cmd: "set_source_overdrive", battery: v }, function() { root.reload() }) }
     }
     ValueSlider {
       fg: root.fg

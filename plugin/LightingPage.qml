@@ -21,6 +21,7 @@ Flickable {
   property string mColour1: "00c8ff"
   property string mColour2: "ff0040"
   property int mSensitivity: 5
+  property var lcfg: ({})          // config.toml [lighting]
 
   // effect being edited
   property string mode: "static"
@@ -56,6 +57,7 @@ Flickable {
   function reloadMusic() {
     client.call({ cmd: "config" }, function(r) {
       if (!r.ok) return
+      root.lcfg = r.data.lighting || ({})
       var m = r.data.music
       root.mStyle = m.style; root.mScheme = m.scheme
       root.mColour1 = root.hex(m.colour1); root.mColour2 = root.hex(m.colour2)
@@ -114,6 +116,31 @@ Flickable {
       width: parent.width
       wrapMode: Text.WordWrap
       text: "Remembered separately on AC and on battery (Fn keys too)."
+      color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption
+    }
+
+    Section { text: "WHEN IDLE"; fg: root.fg }
+    ChoiceRow {
+      fg: root.fg
+      label: "On AC"
+      usable: root.usable
+      options: [{ label: "Dim", value: false }, { label: "Keep on", value: true }]
+      // unset follows the battery choice (as the daemon does)
+      value: root.lcfg.keep_on_ac === undefined || root.lcfg.keep_on_ac === null ? root.lcfg.keep_on === true : root.lcfg.keep_on_ac === true
+      onChosen: function(v) { root.client.run({ cmd: "set_keep_on_ac", on: v }, function() { root.reloadMusic() }) }
+    }
+    ChoiceRow {
+      fg: root.fg
+      label: "On battery"
+      usable: root.usable
+      options: [{ label: "Dim", value: false }, { label: "Keep on", value: true }]
+      value: root.lcfg.keep_on === true
+      onChosen: function(v) { root.client.run({ cmd: "set_keep_on", on: v }, function() { root.reloadMusic() }) }
+    }
+    Text {
+      width: parent.width
+      wrapMode: Text.WordWrap
+      text: "The idle timeout is a bar widget setting (Omarchy Setup › Bar › Armoury)."
       color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption
     }
 

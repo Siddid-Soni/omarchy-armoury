@@ -193,6 +193,15 @@ pub struct DisplayInfo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum OdChoice { On, Off, Leave }
+
+impl OdChoice {
+    /// What the daemon stores: None = leave Overdrive as is.
+    pub fn setting(self) -> Option<bool> { match self { Self::On => Some(true), Self::Off => Some(false), Self::Leave => None } }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SleepMode { S2idle, Deep }
 
 impl SleepMode {
@@ -597,11 +606,15 @@ pub enum Request {
     SetSleepMode { mode: SleepMode },
     SetSourceProfile { ac: Option<ModeChoice>, battery: Option<ModeChoice> },
     SetSourceRefresh { ac: Option<f32>, battery: Option<f32> },
+    /// Panel Overdrive per power source. Each field: absent = unchanged.
+    SetSourceOverdrive { #[serde(default)] ac: Option<OdChoice>, #[serde(default)] battery: Option<OdChoice> },
     Keys,
     /// armouryd's saved settings (read-only view for the UI).
     Config,
     /// Never dim the keyboard backlight when idle.
     SetKeepOn { on: bool },
+    /// Never dim the keyboard backlight when idle while on AC.
+    SetKeepOnAc { on: bool },
     SetKeyBinding { key: HotKey, action: KeyAction, #[serde(default)] command: Option<String> },
     /// NumberPad on/off (active mode; refused while the touchpad is off unless allowed).
     SetNumpad { on: bool },

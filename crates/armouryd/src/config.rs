@@ -67,6 +67,9 @@ pub struct SystemConfig {
     /// Built-in panel refresh rate on AC / on battery.
     pub refresh_ac: Option<f32>,
     pub refresh_battery: Option<f32>,
+    /// Panel Overdrive on AC / on battery; None = leave as is.
+    pub panel_od_ac: Option<bool>,
+    pub panel_od_battery: Option<bool>,
     /// Mode asusd switches to on AC / on battery (kept here so the UI can show it while asusd is stopped).
     pub profile_ac: Option<armoury_proto::ModeChoice>,
     pub profile_battery: Option<armoury_proto::ModeChoice>,
@@ -78,8 +81,15 @@ pub struct LightingConfig {
     /// Keyboard brightness (0–3) to use on AC / on battery; None = leave as is.
     pub brightness_ac: Option<u8>,
     pub brightness_battery: Option<u8>,
-    /// Never dim the keyboard when idle.
+    /// Never dim the keyboard when idle while on battery.
     pub keep_on: bool,
+    /// Never dim the keyboard when idle while on AC; None = same as keep_on (which
+    /// covered both sources before AC got its own setting).
+    pub keep_on_ac: Option<bool>,
+}
+
+impl LightingConfig {
+    pub fn keep_on_ac(&self) -> bool { self.keep_on_ac.unwrap_or(self.keep_on) }
 }
 
 pub fn config_path(home: &Path) -> PathBuf {

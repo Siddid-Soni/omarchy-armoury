@@ -496,12 +496,24 @@ impl Daemon {
             }
             return;
         }
-        if let Some(hz) = desired {
-            if let Err(e) = self.set_refresh(hz).await {
-                eprintln!("armouryd: refresh rate: {e:#}");
-                self.sys_src.lock().unwrap().retry_at = Some(now + REFRESH_RECHECK);
-                return; // flip stays unrecorded, retried after the backoff
-            }
+        // Overdrive and refresh are independent: one failing doesn't hold back the other
+        let mut failed = false;
+        let od = if ac { cfg.panel_od_ac } else { cfg.panel_od_battery };
+        if let Some(on) = od.filter(|on| snap.system.panel_od.is_some_and(|cur| cur != *on))
+            && let Err(e) = with_retry(|| self.asusd.armoury_set_value("panel_overdrive", on as i32)).await
+        {
+            eprintln!("armouryd: panel overdrive: {e:#}");
+            failed = true;
+        }
+        if let Some(hz) = desired
+            && let Err(e) = self.set_refresh(hz).await
+        {
+            eprintln!("armouryd: refresh rate: {e:#}");
+            failed = true;
+        }
+        if failed {
+            self.sys_src.lock().unwrap().retry_at = Some(now + REFRESH_RECHECK);
+            return; // flip stays unrecorded, retried after the backoff (whatever already took is skipped then)
         }
         let mut s = self.sys_src.lock().unwrap();
         s.on_ac = Some(ac);
@@ -572,6 +584,15 @@ impl Daemon {
                     let mut cfg = self.config.lock().await;
                     if ac.is_some() { cfg.system.refresh_ac = ac; }
                     if battery.is_some() { cfg.system.refresh_battery = battery; }
+                    cfg.save(&self.config_path)?;
+                    drop(cfg);
+                    self.sys_src.lock().unwrap().on_ac = None; // apply for the current source on the next tick
+                    Ok(serde_json::json!({"ac": ac, "battery": battery}))
+                }
+                Request::SetSourceOverdrive { ac, battery } => {
+                    let mut cfg = self.config.lock().await;
+                    if let Some(c) = ac { cfg.system.panel_od_ac = c.setting(); }
+                    if let Some(c) = battery { cfg.system.panel_od_battery = c.setting(); }
                     cfg.save(&self.config_path)?;
                     drop(cfg);
                     self.sys_src.lock().unwrap().on_ac = None; // apply for the current source on the next tick
@@ -672,8 +693,11 @@ impl Daemon {
                     Ok(serde_json::to_value(power_from_raw(&new))?)
                 }
                 Request::KbdIdle => {
-                    if self.config.lock().await.lighting.keep_on { return Ok(serde_json::json!({"dimmed": false})); }
-                    let current = self.refresh().await.lighting.brightness.unwrap_or(0);
+                    let (keep, keep_ac) = { let c = self.config.lock().await; (c.lighting.keep_on, c.lighting.keep_on_ac()) };
+                    let snap = self.refresh().await;
+                    // unknown source counts as battery
+                    if if snap.lighting.on_ac == Some(true) { keep_ac } else { keep } { return Ok(serde_json::json!({"dimmed": false})); }
+                    let current = snap.lighting.brightness.unwrap_or(0);
                     if current == 0 { return Ok(serde_json::json!({"dimmed": true})); }
                     // save only the first level; dim whenever the backlight is on
                     let saved_now = {
@@ -1224,13 +1248,20 @@ impl Daemon {
             | Request::KbdIdle | Request::KbdResume => self.lighting_request(req).await,
             Request::SetChargeLimit { .. } | Request::OneShotCharge | Request::SetRefresh { .. } | Request::SetGamma { .. }
             | Request::SetToggle { .. } | Request::SetSleepMode { .. } | Request::SetSourceProfile { .. }
-            | Request::SetSourceRefresh { .. } => self.system_request(req).await,
-            Request::SetKeepOn { on } => {
+            | Request::SetSourceRefresh { .. } | Request::SetSourceOverdrive { .. } => self.system_request(req).await,
+            Request::SetKeepOn { on } | Request::SetKeepOnAc { on } => {
                 if let Err(r) = self.write_guard().await { return r; }
                 let mut cfg = self.config.lock().await;
-                cfg.lighting.keep_on = on;
+                let ac = matches!(req, Request::SetKeepOnAc { .. });
+                if ac {
+                    cfg.lighting.keep_on_ac = Some(on)
+                } else {
+                    // an unset AC choice follows keep_on: pin it first so this only changes battery
+                    cfg.lighting.keep_on_ac = Some(cfg.lighting.keep_on_ac());
+                    cfg.lighting.keep_on = on
+                }
                 match cfg.save(&self.config_path) {
-                    Ok(()) => Response::ok(serde_json::json!({"keep_on": on})),
+                    Ok(()) => Response::ok(serde_json::json!({"keep_on": on, "ac": ac})),
                     Err(e) => Response::err(format!("save config: {e}")),
                 }
             }
@@ -2194,6 +2225,8 @@ mod tests {
     #[tokio::test]
     async fn keep_on_disables_idle() {
         let r = light_rig(true, FakeAura::default(), "[lighting]\nkeep_on = true\n");
+        unplug(&r, false);
+        r.d.tick().await;
         assert!(r.d.handle(Request::KbdIdle).await.ok);
         assert!(acalls(&r).is_empty());
     }
@@ -2210,6 +2243,16 @@ mod tests {
         assert!(r.d.handle(req(serde_json::json!({"cmd":"set_brightness","level":1}))).await.error.unwrap().contains("observe"));
         assert!(r.d.handle(Request::KbdIdle).await.error.unwrap().contains("observe"));
         assert_eq!(r.d.refresh().await.lighting.brightness, Some(3), "reads still work");
+    }
+
+    #[tokio::test]
+    async fn idle_keeps_lit_on_ac_only_when_asked() {
+        let r = light_rig(true, FakeAura::default(), "[lighting]\nkeep_on_ac = true\n");
+        let v = r.d.handle(Request::KbdIdle).await;
+        assert!(v.ok && v.data.unwrap()["dimmed"] == false);
+        unplug(&r, false);
+        r.d.tick().await;
+        assert_eq!(r.d.handle(Request::KbdIdle).await.data.unwrap()["dimmed"], true);
     }
 
     fn unplug(r: &LightRig, on: bool) { r.sys.files.lock().unwrap().insert("sys/class/power_supply/ADP0/online".into(), if on { "1" } else { "0" }.into()); }
@@ -2626,6 +2669,72 @@ mod tests {
         let r = sys_rig(true, "");
         assert!(r.d.handle(Request::SetKeepOn { on: true }).await.ok);
         assert!(std::fs::read_to_string(r.dir.path().join("config.toml")).unwrap().contains("keep_on = true"));
+    }
+
+    #[tokio::test]
+    async fn idle_on_ac_follows_keep_on_until_set() {
+        let r = light_rig(true, FakeAura::default(), "[lighting]\nkeep_on = true\n");
+        assert_eq!(r.d.handle(Request::KbdIdle).await.data.unwrap()["dimmed"], false, "old configs keep AC lit");
+    }
+
+    #[tokio::test]
+    async fn keep_on_change_pins_the_ac_choice() {
+        let r = sys_rig(true, "[lighting]\nkeep_on = true\n");
+        assert!(r.d.handle(Request::SetKeepOn { on: false }).await.ok);
+        let t = std::fs::read_to_string(r.dir.path().join("config.toml")).unwrap();
+        assert!(t.contains("keep_on = false") && t.contains("keep_on_ac = true"), "{t}");
+    }
+
+    #[tokio::test]
+    async fn keep_on_ac_request_saved() {
+        let r = sys_rig(true, "");
+        assert!(r.d.handle(Request::SetKeepOnAc { on: true }).await.ok);
+        let t = std::fs::read_to_string(r.dir.path().join("config.toml")).unwrap();
+        assert!(t.contains("keep_on_ac = true") && !t.contains("keep_on = true"), "{t}");
+    }
+
+    fn set_od(r: &SysRig, on: bool) { r.sys.files.lock().unwrap().insert("sys/devices/platform/asus-nb-wmi/panel_od".into(), if on { "1" } else { "0" }.into()); }
+    fn ascalls(r: &SysRig) -> Vec<String> { r.asusd.calls.lock().unwrap().clone() }
+
+    #[tokio::test]
+    async fn source_overdrive_follows_power() {
+        let r = sys_rig(true, "[system]\npanel_od_ac = false\npanel_od_battery = true\n");
+        set_od(&r, true);
+        r.d.tick().await;
+        assert_eq!(ascalls(&r), ["armoury_set_value panel_overdrive 0"]);
+        set_od(&r, false);
+        plug(&r, false);
+        r.d.tick().await;
+        r.d.tick().await;
+        assert_eq!(ascalls(&r).last().unwrap(), "armoury_set_value panel_overdrive 1");
+        assert_eq!(ascalls(&r).len(), 2, "once per flip");
+    }
+
+    #[tokio::test]
+    async fn source_overdrive_skips_matching_or_missing_panel() {
+        let r = sys_rig(true, "[system]\npanel_od_ac = true\n");
+        r.d.tick().await;
+        assert!(ascalls(&r).is_empty(), "no panel_od attribute: nothing to write");
+        let r = sys_rig(true, "[system]\npanel_od_ac = true\n");
+        set_od(&r, true);
+        r.d.tick().await;
+        assert!(ascalls(&r).is_empty(), "already on");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_overdrive_failure_retries_and_does_not_block_refresh() {
+        let r = sys_rig(true, "[system]\npanel_od_ac = false\nrefresh_ac = 60.0\n");
+        set_od(&r, true);
+        *r.asusd.fail_on.lock().unwrap() = Some("panel_overdrive".into());
+        r.d.tick().await;
+        assert!(!r.hypr.evals.lock().unwrap().is_empty(), "refresh still applied");
+        let n = ascalls(&r).len();
+        *r.asusd.fail_on.lock().unwrap() = None;
+        r.d.tick().await;
+        assert_eq!(ascalls(&r).len(), n, "backs off");
+        tokio::time::advance(REFRESH_RECHECK).await;
+        r.d.tick().await;
+        assert_eq!(ascalls(&r).last().unwrap(), "armoury_set_value panel_overdrive 0");
     }
 
     #[tokio::test]

@@ -189,20 +189,5 @@ Flickable {
       value: root.np.allow_when_touchpad_off === true
       onChosen: function(v) { root.setNp("allow_when_touchpad_off", v) }
     }
-
-    Section { text: "KEYBOARD BACKLIGHT WHEN IDLE"; fg: root.fg }
-    ChoiceRow {
-      fg: root.fg
-      usable: root.usable
-      options: [{ label: "Dim when idle", value: false }, { label: "Keep on", value: true }]
-      value: root.cfg.lighting ? root.cfg.lighting.keep_on === true : undefined
-      onChosen: function(v) { root.client.run({ cmd: "set_keep_on", on: v }, function() { root.reload() }) }
-    }
-    Text {
-      width: parent.width
-      wrapMode: Text.WordWrap
-      text: "The idle timeout is a bar widget setting (Omarchy Setup › Bar › Armoury)."
-      color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption
-    }
   }
 }

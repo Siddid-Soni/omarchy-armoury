@@ -38,7 +38,11 @@ Item {
       Text {
         anchors.horizontalCenter: parent.horizontalCenter
         text: (root.snap && root.snap.system && root.snap.system.panel_od ? "Overdrive" : "No overdrive")
-          + " · " + (root.snap && root.snap.system ? (root.snap.system.mem_sleep || "—") : "—") + " sleep"
+        color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption
+      }
+      Text {
+        anchors.horizontalCenter: parent.horizontalCenter
+        text: (root.snap && root.snap.system ? (root.snap.system.mem_sleep || "—") : "—") + " sleep"
         color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption
       }
     }
@@ -57,8 +61,9 @@ Item {
       Rectangle {
         required property var modelData
         readonly property bool current: (modelData.src === "ac") === root.onAc
+        readonly property bool hasOd: !!root.sys && root.sys["panel_od_" + modelData.src] !== undefined && root.sys["panel_od_" + modelData.src] !== null
         width: (rules.width - rules.spacing) / 2
-        height: Style.space(52)
+        height: Style.space(hasOd ? 64 : 52)
         radius: Style.space(6)
         color: current ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.14) : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.04)
         border.color: current ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.5) : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.12)
@@ -71,6 +76,11 @@ Item {
             Text { text: modelData.label; color: root.fg; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
             Text {
               text: root.sys ? root.modeLabel(root.sys["profile_" + modelData.src]) + " · " + root.hz(root.sys["refresh_" + modelData.src]) : "—"
+              color: root.fg; opacity: 0.7; font.family: root.fontFamily; font.pixelSize: Style.font.caption
+            }
+            Text {
+              visible: hasOd
+              text: "Overdrive " + (root.sys && root.sys["panel_od_" + modelData.src] ? "on" : "off")
               color: root.fg; opacity: 0.7; font.family: root.fontFamily; font.pixelSize: Style.font.caption
             }
           }
